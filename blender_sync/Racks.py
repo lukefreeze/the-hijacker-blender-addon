@@ -462,7 +462,7 @@ class PB_AIRackSettings(bpy.types.PropertyGroup):
     # p0 = Attenuation limit (norm 0-1, maps -40..0 dB)
     # p1 = Sensitivity / voice activity threshold (0-1)
     # p2 = Post gain (norm 0-1, maps -12..+12 dB)
-    # p3-p7 reserved for Whisper/Demucs/Piper/Matchering
+    # p3-p9 reserved for Whisper/Demucs/Piper/Matchering
     p0: bpy.props.FloatProperty(default=1.0)   # Whisper model default = Base (index 1)
     p1: bpy.props.FloatProperty(default=0.75)  # Sensitivity default = 0.75
     p2: bpy.props.FloatProperty(default=0.5)   # Post gain default = 0dB
@@ -471,6 +471,14 @@ class PB_AIRackSettings(bpy.types.PropertyGroup):
     p5: bpy.props.FloatProperty(default=0.0)
     p6: bpy.props.FloatProperty(default=2.0)   # Whisper position default = BOT
     p7: bpy.props.FloatProperty(default=1.0)   # Whisper VAD default = on
+    # p8/p9 — Demucs piano/guitar out channel (0=auto). Added alongside
+    # rack_demucs.py's STEM_CH_PROPS, which already mapped piano->p8 and
+    # guitar->p9 for the 6-stem model; those two properties were never
+    # actually declared here, so getattr/setattr on them silently no-op'd
+    # (masked by the try/except in the one-time init guard) and the +/-
+    # stepper clicks for piano/guitar had nothing to write to.
+    p8: bpy.props.FloatProperty(default=0.0)   # Demucs piano out ch (0=auto)
+    p9: bpy.props.FloatProperty(default=0.0)   # Demucs guitar out ch (0=auto)
     # Processing state — updated by the processing thread
     ai_status: bpy.props.StringProperty(default="READY")
     # Text field for Piper TTS script input
@@ -4998,6 +5006,31 @@ def _draw_ai_rack_expanded(rx, ry, rw, rh, rack, ai_idx, scale):
         except Exception:
             pass
 
+    # Whisper depends on system Python + the faster-whisper pip package.
+    # Same reasoning as the RVC/VoiceFixer gating above — withhold the
+    # full-unit skin blit until _check_dep() succeeds, so the setup warning /
+    # "checking..." screens don't show the finished rack art behind them.
+    if rack.ai_type == "WHISPER" and _ai_bg_tex is not None:
+        try:
+            from ui.racks.rack_whisper import _check_dep as _wsp_deps_ready
+            if not _wsp_deps_ready():
+                _ai_bg_tex = None
+        except Exception:
+            pass
+
+    # Demucs depends on system Python + the demucs pip package. Same
+    # reasoning as the RVC/VoiceFixer/Whisper gating above — withhold the
+    # full-unit skin blit until _check_demucs() succeeds, so the "not
+    # found — requires setup" warning card doesn't show the finished rack
+    # art behind it.
+    if rack.ai_type == "DEMUCS" and _ai_bg_tex is not None:
+        try:
+            from ui.racks.rack_demucs import _check_demucs as _dm_deps_ready
+            if not _dm_deps_ready():
+                _ai_bg_tex = None
+        except Exception:
+            pass
+
     if _ai_bg_tex is not None:
         from ui.mixer.texture_cache import blit_texture as _blt_aibg
         _blt_aibg(_ai_bg_tex, rx, ry, rw, rh, key=_ai_bg_key)
@@ -6069,9 +6102,18 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             # ── COL 2: Font scroll list + scroll buttons ───────────────────
             _flist_h      = min(_work_h_w * 0.30, _fitem_h * 7)
             _scroll_btn_w = max(14 * scale, _fitem_h * 0.9)
-            _flist_w      = _col_w - _scroll_btn_w - 2 * scale
+            try:
+                from ui.racks.rack_whisper import WSP_FONT_LIST_W_SCALE as _WSP_FLW_SCALE
+            except Exception:
+                _WSP_FLW_SCALE = 1.0
+            # _flist_w_auto anchors the scroll buttons — their baked-in-art
+            # position must not move when WSP_FONT_LIST_W_SCALE narrows the
+            # box. _flist_w (scaled) is only used for the list-item click zone,
+            # matching the narrowed visible box.
+            _flist_w_auto = _col_w - _scroll_btn_w - 2 * scale
+            _flist_w      = _flist_w_auto * _WSP_FLW_SCALE
             _flist_y      = _work_top_w - _fs_l_w - 4 * scale - _flist_h - 2 * scale
-            _sbtn_x       = _col2_x + _flist_w + 2 * scale
+            _sbtn_x       = _col2_x + _flist_w_auto + 2 * scale
             _sbtn_h       = _flist_h / 2 - 1 * scale
             # Click on list items
             if _col2_x <= mouse_x <= _col2_x + _flist_w and _flist_y <= mouse_y <= _flist_y + _flist_h:
@@ -6100,21 +6142,48 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                 return {'zone': 'ai_wsp_size_inc', 'ai_idx': ai_idx}
 
             # ── COL 2: Style buttons B I U SH BOX ─────────────────────────
-            _sty_lbl_y = _sz_y - _fs_l_w - 8 * scale
-            _sty_y     = _sty_lbl_y - _row_h_w - 2 * scale
-            _sty_bw    = (_col_w - 4 * _btn_gap) / 5
+            # Geometry mirrors rack_whisper.py's draw function exactly,
+            # including its WSP_STYLE_* tuning constants, so the hitboxes
+            # track wherever those constants move or resize the buttons
+            # instead of drifting from what's drawn.
+            try:
+                from ui.racks.rack_whisper import (
+                    WSP_STYLE_X_OFFSETS as _WSP_SXS, WSP_STYLE_Y_OFFSET as _WSP_SY,
+                    WSP_STYLE_W_SCALES as _WSP_SWSS, WSP_STYLE_H_SCALE as _WSP_SHS,
+                    WSP_STYLE_GAP as _WSP_SGAP)
+            except Exception:
+                _WSP_SXS, _WSP_SY, _WSP_SWSS, _WSP_SHS, _WSP_SGAP = [0.0]*5, 0.0, [1.0]*5, 1.0, 3.0
+            _sty_lbl_y   = _sz_y - _fs_l_w - 8 * scale
+            _sty_y       = _sty_lbl_y - _row_h_w - 2 * scale
+            _sty_gap_w   = _WSP_SGAP * scale
+            _sty_base_bw = (_col_w - 4 * _sty_gap_w) / 5
+            _sty_bh      = _row_h_w * _WSP_SHS
+            _sty_y_hit   = _sty_y + _WSP_SY * scale
             for si in range(5):
-                _sbx = _col2_x + si * (_sty_bw + _btn_gap)
-                if _sbx <= mouse_x <= _sbx + _sty_bw and _sty_y <= mouse_y <= _sty_y + _row_h_w:
+                _sty_bw = _sty_base_bw * _WSP_SWSS[si]
+                _sbx = _col2_x + si * (_sty_base_bw + _sty_gap_w) + _WSP_SXS[si] * scale
+                if _sbx <= mouse_x <= _sbx + _sty_bw and _sty_y_hit <= mouse_y <= _sty_y_hit + _sty_bh:
                     return {'zone': 'ai_wsp_style_btn', 'ai_idx': ai_idx, 'style_idx': si}
 
             # ── COL 2: Position buttons TOP MID BOT ───────────────────────
-            _pos_lbl_y = _sty_y - _fs_l_w - 8 * scale
-            _pos_y     = _pos_lbl_y - _row_h_w - 2 * scale
-            _pos_bw    = (_col_w - 2 * _btn_gap) / 3
+            # Same treatment — mirrors WSP_POSITION_* from rack_whisper.py.
+            try:
+                from ui.racks.rack_whisper import (
+                    WSP_POSITION_X_OFFSETS as _WSP_PXS, WSP_POSITION_Y_OFFSET as _WSP_PY,
+                    WSP_POSITION_W_SCALES as _WSP_PWSS, WSP_POSITION_H_SCALE as _WSP_PHS,
+                    WSP_POSITION_GAP as _WSP_PGAP)
+            except Exception:
+                _WSP_PXS, _WSP_PY, _WSP_PWSS, _WSP_PHS, _WSP_PGAP = [0.0]*3, 0.0, [1.0]*3, 1.0, 3.0
+            _pos_lbl_y   = _sty_y - _fs_l_w - 8 * scale
+            _pos_y       = _pos_lbl_y - _row_h_w - 2 * scale
+            _pos_gap_w   = _WSP_PGAP * scale
+            _pos_base_bw = (_col_w - 2 * _pos_gap_w) / 3
+            _pos_bh      = _row_h_w * _WSP_PHS
+            _pos_y_hit   = _pos_y + _WSP_PY * scale
             for pi in range(3):
-                _pbx = _col2_x + pi * (_pos_bw + _btn_gap)
-                if _pbx <= mouse_x <= _pbx + _pos_bw and _pos_y <= mouse_y <= _pos_y + _row_h_w:
+                _pos_bw = _pos_base_bw * _WSP_PWSS[pi]
+                _pbx = _col2_x + pi * (_pos_base_bw + _pos_gap_w) + _WSP_PXS[pi] * scale
+                if _pbx <= mouse_x <= _pbx + _pos_bw and _pos_y_hit <= mouse_y <= _pos_y_hit + _pos_bh:
                     return {'zone': 'ai_wsp_pos_btn', 'ai_idx': ai_idx, 'pos_idx': pi}
 
             # ── COL 3: Language selector ‹ › ──────────────────────────────
@@ -6129,28 +6198,81 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                 return {'zone': 'ai_wsp_lang_next', 'ai_idx': ai_idx}
 
             # ── COL 3: Mode buttons TRANSCRIBE / TRANSLATE→EN ─────────────
-            _mode_lbl_y = _lng_sel_y - _fs_sm_w - 3 * scale - _fs_l_w - 8 * scale
-            _mode_y     = _mode_lbl_y - _row_h_w - 2 * scale
-            _mbw        = (_col_w - _btn_gap) / 2
-            if _col3_x <= mouse_x <= _col3_x + _mbw and _mode_y <= mouse_y <= _mode_y + _row_h_w:
+            # Mirrors WSP_MODE_* from rack_whisper.py so the hitboxes track
+            # wherever those constants move or resize the buttons.
+            try:
+                from ui.racks.rack_whisper import (
+                    WSP_MODE_X_OFFSETS as _WSP_MXS, WSP_MODE_Y_OFFSET as _WSP_MY,
+                    WSP_MODE_W_SCALES as _WSP_MWSS, WSP_MODE_H_SCALE as _WSP_MHS,
+                    WSP_MODE_GAP as _WSP_MGAP)
+            except Exception:
+                _WSP_MXS, _WSP_MY, _WSP_MWSS, _WSP_MHS, _WSP_MGAP = [0.0]*2, 0.0, [1.0]*2, 1.0, 3.0
+            _mode_lbl_y   = _lng_sel_y - _fs_sm_w - 3 * scale - _fs_l_w - 8 * scale
+            _mode_y       = _mode_lbl_y - _row_h_w - 2 * scale
+            _mode_gap_w   = _WSP_MGAP * scale
+            _mode_base_bw = (_col_w - _mode_gap_w) / 2
+            _mbh          = _row_h_w * _WSP_MHS
+            _mode_y_hit   = _mode_y + _WSP_MY * scale
+            _mbw0    = _mode_base_bw * _WSP_MWSS[0]
+            _mode0_x = _col3_x + _WSP_MXS[0] * scale
+            if _mode0_x <= mouse_x <= _mode0_x + _mbw0 and _mode_y_hit <= mouse_y <= _mode_y_hit + _mbh:
                 return {'zone': 'ai_wsp_mode_btn', 'ai_idx': ai_idx, 'mode_idx': 0}
-            if _col3_x + _mbw + _btn_gap <= mouse_x <= _col3_x + _col_w and _mode_y <= mouse_y <= _mode_y + _row_h_w:
+            _mbw1    = _mode_base_bw * _WSP_MWSS[1]
+            _mode1_x = _col3_x + (_mode_base_bw + _mode_gap_w) + _WSP_MXS[1] * scale
+            if _mode1_x <= mouse_x <= _mode1_x + _mbw1 and _mode_y_hit <= mouse_y <= _mode_y_hit + _mbh:
                 return {'zone': 'ai_wsp_mode_btn', 'ai_idx': ai_idx, 'mode_idx': 1}
 
             # ── COL 3: VAD toggle pill ────────────────────────────────────
+            # Mirrors rack_whisper.py's draw-side y3 chain exactly (mode note,
+            # divider, gap, VAD FILTER label reservation) — the label-row
+            # spacing is still reserved even when the label text itself is
+            # suppressed once skinned, so it must not be dropped here.
+            try:
+                from ui.racks.rack_whisper import (
+                    WSP_VAD_Y_OFFSET as _WSP_VADY,
+                    WSP_SRT_Y_OFFSET as _WSP_SRTY)
+            except Exception:
+                _WSP_VADY, _WSP_SRTY = 0.0, 0.0
             _pill_w    = 30 * scale
             _pill_h    = 14 * scale
             _pill_x    = _col3_x + _col_w - _pill_w
-            _vad_lbl_y = _mode_y - _fs_sm_w - 3 * scale - 8 * scale - 6 * scale  # note + divider
-            _vad_y     = _vad_lbl_y - 1 * scale
+            _y3_hit    = _mode_y
+            _y3_hit   -= _fs_sm_w + 3 * scale        # mode note
+            _y3_hit   -= 8 * scale                   # divider
+            _y3_hit   -= 6 * scale                   # post-divider gap
+            _y3_hit   -= _fs_l_w + 2 * scale          # VAD FILTER label reservation
+            # _y3_hit itself stays un-nudged (matches draw's y3, which the
+            # offset never touches) — only the pill's own hit rect moves, so
+            # the browse-button block below still chains off the right base.
+            _vad_y     = _y3_hit - 1 * scale + _WSP_VADY * scale
             if _pill_x <= mouse_x <= _pill_x + _pill_w and _vad_y <= mouse_y <= _vad_y + _pill_h:
                 return {'zone': 'ai_wsp_vad_toggle', 'ai_idx': ai_idx}
 
             # ── COL 3: SRT toggle pill ────────────────────────────────────
-            _srt_lbl_y = _vad_y - _pill_h - 2 * scale - _fs_l_w - 10 * scale
-            _srt_y     = _srt_lbl_y - 1 * scale
+            _y3_hit   -= _pill_h + 2 * scale          # after VAD pill
+            _y3_hit   -= _fs_l_w + 10 * scale          # SRT EXPORT label reservation
+            _srt_y     = _y3_hit - 1 * scale + _WSP_SRTY * scale
             if _pill_x <= mouse_x <= _pill_x + _pill_w and _srt_y <= mouse_y <= _srt_y + _pill_h:
                 return {'zone': 'ai_wsp_srt_toggle', 'ai_idx': ai_idx}
+
+            # ── COL 3: SRT path browse button ──────────────────────────────
+            # Only present while SRT export is on — mirrors the draw-side
+            # pbox_w/bbx/bby geometry in rack_whisper.py exactly.
+            if rack.get('wsp_srt_enabled', True):
+                try:
+                    from ui.racks.rack_whisper import (
+                        WSP_SRT_BROWSE_BTN_W as _WSP_SBW,
+                        WSP_SRT_BROWSE_X_OFFSET as _WSP_SBX,
+                        WSP_SRT_BROWSE_Y_OFFSET as _WSP_SBY)
+                except Exception:
+                    _WSP_SBW, _WSP_SBX, _WSP_SBY = 26.0, 0.0, 0.0
+                _y3_hit    -= _pill_h + 4 * scale        # after SRT pill
+                _bbw        = _WSP_SBW * scale
+                _pbox_w     = _col_w - _bbw - 2 * scale
+                _bbx        = _col3_x + _pbox_w + 2 * scale + _WSP_SBX * scale
+                _bby        = _y3_hit + _WSP_SBY * scale
+                if _bbx <= mouse_x <= _bbx + _bbw and _bby <= mouse_y <= _bby + _fitem_h:
+                    return {'zone': 'ai_wsp_srt_browse', 'ai_idx': ai_idx}
 
             # ── Status bar TRANSCRIBE button ──────────────────────────────
             _tbtn_w = min(rw * 0.22, 150 * scale)
@@ -6161,6 +6283,13 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                 return {'zone': 'ai_wsp_transcribe', 'ai_idx': ai_idx}
 
         # ── Demucs hit test ────────────────────────────────────────────────────
+        # Mirrors ui/racks/rack_demucs.py's _draw_demucs_body geometry exactly
+        # — every intermediate value below is computed the same way, in the
+        # same order, as the draw function, so the click zones always travel
+        # with what's actually on screen. (The old row-based layout and its
+        # stale Preview/Full hit zone — removed below, the draw side of it
+        # was already gone — are both replaced by the per-stem block layout:
+        # name / big ON pad / channel stepper, stacked top to bottom.)
         if rack.ai_type == "DEMUCS" and not rack.collapsed:
             from ui.racks.rack_demucs import MODELS, MODEL_STEMS, STEM_BITS, STEM_CH_PROPS
             _rail_d     = RACK_RAIL_H * scale
@@ -6168,7 +6297,10 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             _body_top_d = rack_y + rack_h - _rail_d
             _body_h_d   = _body_top_d - _body_bot_d
 
-            content_w_d = rw - 100 * scale
+            # Body now uses the full rack width (see rack_demucs.py) — the
+            # rail's own 100*scale channel-button reservation is a separate
+            # row above the body and never applied here.
+            content_w_d = rw
             left_w_d    = content_w_d * 0.24
             right_w_d   = content_w_d * 0.22
             centre_w_d  = content_w_d - left_w_d - right_w_d
@@ -6176,61 +6308,90 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             right_x_d   = centre_x_d + centre_w_d
 
             # Model buttons (left column)
+            from ui.racks.rack_demucs import (
+                MODEL_BTN_X_OFFSET, MODEL_BTN_Y_OFFSET,
+                MODEL_BTN_W_SCALE, MODEL_BTN_H_SCALE)
             mx_d = rack_x + 5 * scale
             mw_d = left_w_d - 10 * scale
             model_btn_h = max(13 * scale, (_body_h_d * 0.60 / len(MODELS)) - 3 * scale)
             models_top_d = _body_top_d - max(1, int(7 * scale)) - 8 * scale
             for mi in range(len(MODELS)):
                 by_m = models_top_d - (mi + 1) * (model_btn_h + 3 * scale)
-                if mx_d <= mouse_x <= mx_d + mw_d and by_m <= mouse_y <= by_m + model_btn_h:
+                # Per-model fine-tune — mirrors rack_demucs.py's MODEL_BTN_*
+                # offsets exactly, so the click zone matches what's drawn.
+                mbx_d = mx_d + MODEL_BTN_X_OFFSET[mi] * scale
+                mby_d = by_m + MODEL_BTN_Y_OFFSET[mi] * scale
+                mbw_d = mw_d * MODEL_BTN_W_SCALE[mi]
+                mbh_d = model_btn_h * MODEL_BTN_H_SCALE[mi]
+                if mbx_d <= mouse_x <= mbx_d + mbw_d and mby_d <= mouse_y <= mby_d + mbh_d:
                     return {'zone': 'demucs_model', 'ai_idx': ai_idx, 'model_idx': mi}
 
-            # Preview / Full buttons
-            mode_h_d = min(18 * scale, _body_h_d * 0.12)
-            mode_y_d = _body_bot_d + 24 * scale
-            half_w_d = (mw_d - 3 * scale) / 2
-            if mx_d <= mouse_x <= mx_d + half_w_d and mode_y_d <= mouse_y <= mode_y_d + mode_h_d:
-                return {'zone': 'demucs_preview', 'ai_idx': ai_idx, 'val': True}
-            if (mx_d + half_w_d + 3 * scale <= mouse_x <= mx_d + mw_d and
-                    mode_y_d <= mouse_y <= mode_y_d + mode_h_d):
-                return {'zone': 'demucs_preview', 'ai_idx': ai_idx, 'val': False}
-
-            # Stem rows (centre column)
+            # Stem blocks (centre column) — status screen + one block per
+            # stem (pad, then its stepper directly below) + free-channels
+            # strip. Only the pad and the two stepper arrows are clickable.
+            from ui.racks.rack_demucs import (
+                ALL_STEMS, STEM_PAD_X_OFFSET, STEM_PAD_Y_OFFSET,
+                STEM_PAD_W_SCALE, STEM_PAD_H_SCALE)
             model_idx_d = max(0, min(int(getattr(rack, 'p0', 1.0)), len(MODELS) - 1))
             all_stems_d = MODEL_STEMS[MODELS[model_idx_d]]
             cx_d        = centre_x_d + 5 * scale
             cw_d        = centre_w_d - 10 * scale
-            n_stems_d   = len(all_stems_d)
             fs_lbl_d    = max(1, int(7 * scale))
-            stems_area_h_d = _body_h_d - fs_lbl_d - 12 * scale - 5 * scale
-            row_h_d     = min(22 * scale, (stems_area_h_d - (n_stems_d - 1) * 3 * scale) / n_stems_d)
-            stems_top_d = _body_top_d - fs_lbl_d - 8 * scale
 
-            for si, stem in enumerate(all_stems_d):
-                row_y_d = stems_top_d - (si + 1) * (row_h_d + 3 * scale)
-                if not (row_y_d <= mouse_y <= row_y_d + row_h_d):
-                    continue
-                is_6s_only = stem in ("piano", "guitar")
-                available  = not (is_6s_only and MODELS[model_idx_d] != "htdemucs_6s")
+            scr_y_top_d = _body_top_d - fs_lbl_d - 8 * scale
+            # Matches rack_demucs.py's _draw_demucs_body: screen ~40% of the
+            # column, stem-block pad height capped rather than left to fill
+            # whatever room is left.
+            scr_h_d     = min(140 * scale, _body_h_d * 0.40)
+            scr_y_d     = scr_y_top_d - scr_h_d
+
+            free_h_d = max(14 * scale, min(_body_h_d * 0.075, 30 * scale))
+            hint_h_d = max(1, int(6 * scale)) + 6 * scale
+            gap_a_d = gap_b_d = gap_c_d = 4 * scale
+
+            stems_block_top_d = scr_y_d - gap_a_d
+            stems_block_h_d   = max(30 * scale, stems_block_top_d -
+                                     (_body_bot_d + hint_h_d + gap_c_d + free_h_d))
+
+            # All 6 stem slots are always laid out, regardless of what the
+            # current model supports — unavailable ones are skipped below so
+            # they never produce a hit zone (matches the "NA"/greyed draw).
+            n_slots_d  = len(ALL_STEMS)
+            gap_stem_d = 4 * scale
+            block_w_d  = (cw_d - (n_slots_d - 1) * gap_stem_d) / n_slots_d
+            name_h_d   = fs_lbl_d + 2 * scale
+            step_h_d   = max(14 * scale, fs_lbl_d + 8 * scale)
+            pad_h_d    = max(20 * scale, min(stems_block_h_d - name_h_d - step_h_d - 6 * scale, 60 * scale))
+
+            for si, stem in enumerate(ALL_STEMS):
+                bx2_d = cx_d + si * (block_w_d + gap_stem_d)
+                available = stem in all_stems_d
                 if not available:
                     continue
 
-                # Checkbox (left ~15px)
-                chk_s_d = min(row_h_d - 4 * scale, 10 * scale)
-                chk_x_d = cx_d + 3 * scale
-                if cx_d <= mouse_x <= cx_d + chk_s_d + 6 * scale:
+                name_y_d = stems_block_top_d - name_h_d + 1 * scale
+                pad_y_d  = name_y_d - 2 * scale - pad_h_d
+                # Per-stem fine-tune — mirrors rack_demucs.py's STEM_PAD_*
+                # offsets exactly, so the click zone always matches what's
+                # actually drawn once those are nudged to line up with the
+                # baked button art. Only the pad's own hit box moves; the
+                # stepper hit zones below stay anchored off pad_y_d.
+                pad_bx_d = bx2_d + STEM_PAD_X_OFFSET[si] * scale
+                pad_by_d = pad_y_d + STEM_PAD_Y_OFFSET[si] * scale
+                pad_bw_d = block_w_d * STEM_PAD_W_SCALE[si]
+                pad_bh_d = pad_h_d * STEM_PAD_H_SCALE[si]
+                if pad_bx_d <= mouse_x <= pad_bx_d + pad_bw_d and pad_by_d <= mouse_y <= pad_by_d + pad_bh_d:
                     return {'zone': 'demucs_stem_toggle', 'ai_idx': ai_idx,
                             'stem': stem, 'bit': STEM_BITS[stem]}
 
-                # Channel stepper (right ~54px)
-                st_w_d = 50 * scale
-                st_x_d = cx_d + cw_d - st_w_d
-                if st_x_d <= mouse_x <= cx_d + cw_d:
-                    third_d = st_w_d / 3.0
-                    if mouse_x <= st_x_d + third_d:
+                st_y_d  = pad_y_d - 2 * scale - step_h_d
+                arr_w_d = min(16 * scale, block_w_d * 0.28)
+                val_w_d = block_w_d - arr_w_d * 2
+                if st_y_d <= mouse_y <= st_y_d + step_h_d:
+                    if bx2_d <= mouse_x <= bx2_d + arr_w_d:
                         return {'zone': 'demucs_stem_ch_minus', 'ai_idx': ai_idx,
                                 'stem': stem}
-                    elif mouse_x >= st_x_d + st_w_d - third_d:
+                    if bx2_d + arr_w_d + val_w_d <= mouse_x <= bx2_d + block_w_d:
                         return {'zone': 'demucs_stem_ch_plus', 'ai_idx': ai_idx,
                                 'stem': stem}
 
@@ -6417,13 +6578,6 @@ def handle_ai_rack_click(hit, context):
         if i < len(ai_racks):
             ai_racks[i].p0 = float(hit['model_idx'])
             ai_racks[i].ai_status = 'READY'
-        return True
-
-    if zone == 'demucs_preview':
-        ai_racks = getattr(context.scene, "pb_ai_racks", [])
-        i = hit['ai_idx']
-        if i < len(ai_racks):
-            ai_racks[i].p1 = 1.0 if hit['val'] else 0.0
         return True
 
     if zone == 'demucs_mute_toggle':
@@ -7045,6 +7199,14 @@ def handle_ai_rack_click(hit, context):
                 ai_racks[i].ai_status = "ERROR"
         return True
 
+    if zone == 'ai_wsp_srt_browse':
+        i = hit['ai_idx']
+        try:
+            bpy.ops.vse.whisper_browse_srt('INVOKE_DEFAULT', ai_idx=i)
+        except Exception as e:
+            print(f"[WHISPER] SRT browse error: {e}")
+        return True
+
     if zone == 'ai_wsp_setup_guide':
         import webbrowser
         webbrowser.open("https://github.com/SYSTRAN/faster-whisper")
@@ -7060,7 +7222,54 @@ def register_ai_racks():
     bpy.utils.register_class(PB_AIRackSettings)
     bpy.types.Scene.pb_ai_racks = bpy.props.CollectionProperty(
         type=PB_AIRackSettings)
+    _register_whisper_operators()
     print("[AI RACKS] registered")
+
+
+def _register_whisper_operators():
+    """Register file browser operator for the Whisper rack's SRT output path."""
+    import bpy
+
+    class VSE_OT_WhisperBrowseSrt(bpy.types.Operator):
+        """Open save-as file browser for the Whisper SRT export path."""
+        bl_idname   = "vse.whisper_browse_srt"
+        bl_label    = "Set SRT Output Path"
+        ai_idx: bpy.props.IntProperty(default=0)
+        filepath: bpy.props.StringProperty(subtype='FILE_PATH', default="")
+        filter_glob: bpy.props.StringProperty(
+            default="*.srt", options={'HIDDEN'})
+
+        def invoke(self, context, event):
+            ai_racks = getattr(context.scene, "pb_ai_racks", [])
+            if self.ai_idx < len(ai_racks):
+                cur = getattr(ai_racks[self.ai_idx], 'wsp_srt_path', '')
+                if cur:
+                    self.filepath = cur
+                else:
+                    import os
+                    base = os.path.splitext(os.path.basename(
+                                bpy.data.filepath))[0] if bpy.data.filepath \
+                                else 'untitled'
+                    self.filepath = os.path.join(
+                        os.path.dirname(bpy.data.filepath) if bpy.data.filepath
+                        else bpy.app.tempdir,
+                        f"{base}.srt")
+            context.window_manager.fileselect_add(self)
+            return {'RUNNING_MODAL'}
+
+        def execute(self, context):
+            ai_racks = getattr(context.scene, "pb_ai_racks", [])
+            if self.ai_idx < len(ai_racks):
+                ai_racks[self.ai_idx].wsp_srt_path = self.filepath
+                print(f"[WHISPER] SRT output path set: {self.filepath}")
+            return {'FINISHED'}
+
+    for cls in [VSE_OT_WhisperBrowseSrt]:
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+        bpy.utils.register_class(cls)
 
 
 def unregister_ai_racks():

@@ -132,6 +132,10 @@ SKIN_MAP = {
     "rack_collapsed_ch_led_on":  "rack_collapsed_ch_led_on.png",
     "rack_knnvc_bg":       "rack_knnvc_bg.png",
     "rack_demucs_bg":      "rack_demucs_bg.png",
+    # Demucs stem-pad ON glow overlay — off-state is baked into rack_demucs_bg.png
+    # above; this blits on top of whichever stem pads are currently enabled
+    # (same convention as rack_booster_btn_on / mixdown_*_btn_on above).
+    "rack_demucs_stem_on": "rack_demucs_stem_on.png",
     # AI rack full-unit skins (rail + body baked into one image, same
     # convention as the DSP rack "_bg" skins above). Drop the PNG in with
     # this exact filename and _draw_ai_rack_expanded picks it up automatically
