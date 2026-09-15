@@ -16,6 +16,10 @@ A professional audio mixing and processing suite for Blender's Video Sequence Ed
 
 > **Alpha:** Core features are complete and working. UI polish is the final remaining step before release.
 
+<p align="center">
+  <strong><a href="../../releases/latest">⬇ Download the latest beta</a></strong> — see <a href="../../releases">all releases</a> for notes and older builds
+</p>
+
 ---
 
 ## What Is The Hijacker?
@@ -130,17 +134,19 @@ build.bat                       ← Windows build script (MSVC + vcpkg PortAudio
 
 ### Requirements
 - Blender 4.5
-- Windows x64 (macOS and Linux builds available — testing in progress)
+- Windows x64 (macOS and Linux builds included — real-world testing in progress)
 
-### Install from release
-1. Download the latest release zip from the [Releases](../../releases) page
-2. In Blender: `Edit → Preferences → Add-ons → Install`
-3. Select the zip and enable **The Hijacker**
-4. Open a Node Editor area and click **The Hijacker** button in the header
+### Install the beta (for testers)
+1. Download `TheHijacker-beta.zip` from the [latest release](../../releases/latest)
+2. In Blender: `Edit → Preferences → Add-ons`, then click the **▼ dropdown** in the top-right of the Add-ons panel and choose **Install from Disk...** (or just drag the zip into the panel)
+3. Select the zip as downloaded — don't unzip it first
+4. Enable the checkbox next to **The Hijacker**
+5. Open a Node Editor area and click **The Hijacker** button in the header
 
-### Install from source
+### Build from source (for contributors)
+Only needed if you're working on the addon itself — testers should use the beta zip above.
 1. Clone the repo
-2. In Blender: `Edit → Preferences → Add-ons → Install`
+2. In Blender: `Edit → Preferences → Add-ons`, dropdown → **Install from Disk...**
 3. Point Blender at `blender_sync/Loader.py`
 4. Enable **The Hijacker**
 
