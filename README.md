@@ -17,7 +17,7 @@ A professional audio mixing and processing suite for Blender's Video Sequence Ed
 > **Alpha:** Core features are complete and working. UI polish is the final remaining step before release.
 
 <p align="center">
-  <strong><a href="../../releases">⬇ Download the latest beta</a></strong>
+  <strong><a href="https://github.com/lukefreeze/the-hijacker-blender-addon/releases">⬇ Download the latest beta</a></strong>
 </p>
 
 ---
@@ -137,7 +137,7 @@ build.bat                       ← Windows build script (MSVC + vcpkg PortAudio
 - Windows x64 (macOS and Linux builds included — real-world testing in progress)
 
 ### Install the beta (for testers)
-1. Download `TheHijacker-beta.zip` from the [Releases](../../releases) page
+1. Download `TheHijacker-beta.zip` from the [Releases](https://github.com/lukefreeze/the-hijacker-blender-addon/releases) page
 2. In Blender: `Edit → Preferences → Add-ons`, then click the **▼ dropdown** in the top-right of the Add-ons panel and choose **Install from Disk...** (or just drag the zip into the panel)
 3. Select the zip as downloaded — don't unzip it first
 4. Enable the checkbox next to **The Hijacker**
@@ -162,7 +162,7 @@ build.bat
 
 Requires MSVC, Python 3.11 headers, pybind11, and PortAudio static lib. See `build.bat` for full dependency list.
 
-Cross-platform builds (Windows / macOS / Linux) run automatically on every push to `feature/hijacker-engine` via `.github/workflows/build.yml`. Download artifacts from the [Actions](../../actions) tab.
+Cross-platform builds (Windows / macOS / Linux) run automatically on every push to `feature/hijacker-engine` via `.github/workflows/build.yml`. Download artifacts from the [Actions](https://github.com/lukefreeze/the-hijacker-blender-addon/actions) tab.
 
 ---
 
