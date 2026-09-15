@@ -69,6 +69,24 @@ def _engine_active():
     return _a._pb_engine_active
 
 
+def _pb_push_undo(message="Hijacker: change"):
+    """Mark the file as modified and add an undo step for a Hijacker edit.
+
+    Ordinary Blender operators do this automatically. Hijacker's GPU-drawn
+    HUD instead writes scene properties directly from Python inside this
+    one long-running modal operator, which never participated in that
+    system — so closing Blender never offered to save a mixing session,
+    and Ctrl+Z never undid a fader move or rack change. Called after each
+    discrete edit finishes (drag release, rack add/remove, mute/solo, a
+    preset applied) — never per-frame during a drag, which would flood the
+    undo stack.
+    """
+    try:
+        bpy.ops.ed.undo_push(message=message)
+    except Exception as e:
+        print(f"[HIJACKER] undo_push failed: {e}")
+
+
 # Module-level drag / interaction state
 # These were globals in the original Loader.py — kept here so the modal
 # operator can reference them without importing from another module.
@@ -430,6 +448,7 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                             context.scene.pb_sync_tracks[i].pan = 0.5
                             _last_click_time  = 0.0
                             _last_click_track = -1
+                            _pb_push_undo("Hijacker: pan reset to centre")
                             context.area.tag_redraw()
                             return {"RUNNING_MODAL"}
                         _last_click_time  = now
@@ -447,6 +466,7 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                             track.volume      = 1.0
                             _last_click_time  = 0.0
                             _last_click_track = -1
+                            _pb_push_undo("Hijacker: fader reset to unity")
                             context.area.tag_redraw()
                             return {"RUNNING_MODAL"}
                         _last_click_time  = now
@@ -464,6 +484,7 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                             track.volume = 1.0
                             _last_click_time  = 0.0
                             _last_click_track = -1
+                            _pb_push_undo("Hijacker: fader reset to unity")
                         else:
                             # Single click: open value entry popup
                             _last_click_time  = now
@@ -479,9 +500,11 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                         if rx < sx+60*UI_SCALE:
                             track.mute = not track.mute
                             sync_vse_mute(i, track.mute)
+                            _pb_push_undo("Hijacker: mute toggled")
                         else:
                             track.solo = not track.solo
                             sync_vse_solo(i, track.solo)
+                            _pb_push_undo("Hijacker: solo toggled")
                         context.area.tag_redraw()
                         return {"RUNNING_MODAL"}
 
@@ -524,6 +547,7 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                                      SCROLL_X, SCROLL_Y, UI_SCALE)
                 if hit:
                     if racks_handle_click(hit, context):
+                        _pb_push_undo("Hijacker: rack changed")
                         context.area.tag_redraw()
                     return {"RUNNING_MODAL"}
 
@@ -626,12 +650,20 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                             # while the button stays down.
                             is_dragging_text = True
                         if ai_handle_click(ai_hit, context):
+                            _pb_push_undo("Hijacker: AI rack changed")
                             context.area.tag_redraw()
                         return {"RUNNING_MODAL"}
                 except Exception as _ai_e:
                     print(f"[AI RACKS] hit test error: {_ai_e}")
 
             elif event.value == "RELEASE":
+                _had_active_drag = (
+                    active_knob_track  != -1 or
+                    active_fader_track != -1 or
+                    active_rack_knob   is not None or
+                    active_ai_knob     is not None or
+                    is_dragging_h or is_dragging_v
+                )
                 active_knob_track  = -1
                 active_knob_type   = ""
                 active_fader_track = -1
@@ -640,6 +672,8 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                 is_dragging_h      = False
                 is_dragging_v      = False
                 is_dragging_text   = False
+                if _had_active_drag:
+                    _pb_push_undo("Hijacker: parameter changed")
 
         if event.type == "MIDDLEMOUSE":
             if event.value == "PRESS":

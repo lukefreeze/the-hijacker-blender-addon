@@ -51,7 +51,7 @@ from ui.mixer.channel_strip import send_section_height as _send_section_height
 # circular imports at module load time
 # ---------------------------------------------------------------------------
 from core.audio import (
-    _pb_engine_enable, _pb_engine_disable,
+    _pb_engine_enable, _pb_engine_disable, _pb_recover_stuck_audio,
     _fft_timeline, _fft_timeline_full, _gr_timeline,
 )
 
@@ -209,7 +209,9 @@ def draw_header_buttons(self, context):
 def on_load_post(filepath, *args):
     from core.engine import reset_engine
     from core.audio  import _pb_engine_disable as _disable
+    from core.audio  import _pb_recover_stuck_audio as _recover
     _disable()
+    _recover()
     clear_texture_cache()
     reset_engine()
     load_ui_state()
@@ -256,6 +258,11 @@ _handle = None
 def register():
     global _handle
     import importlib, sys
+
+    # Startup self-heal: if a previous Blender crash left the system audio
+    # device stuck disabled (see _pb_recover_stuck_audio's docstring), fix it
+    # now, before anything else, so this session isn't silent by default.
+    _pb_recover_stuck_audio()
 
     # Force Python to re-read all addon modules from disk on every register.
     # Without this, editing .py files has no effect until Blender fully restarts

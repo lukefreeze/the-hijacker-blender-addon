@@ -1086,6 +1086,94 @@ _pb_eq_timer_registered = False
 # Engine enable / disable
 # ---------------------------------------------------------------------------
 
+def _pb_guess_audio_device():
+    """Best-effort guess at the platform's real audio backend.
+
+    Only used when Blender's audio_device is already 'None' at enable-time
+    (e.g. recovering from a previous crash) and we have no recorded value to
+    restore. Prefers asking Blender directly for the backends actually
+    available on this build/platform — more robust than a hardcoded guess,
+    and stays correct if Blender adds or reorders backends. Falls back to a
+    per-OS guess only if that introspection itself fails.
+    """
+    import sys as _sys
+
+    preferred_by_platform = {
+        'win32':  'WASAPI',
+        'darwin': 'CoreAudio',
+    }
+    preferred = preferred_by_platform.get(_sys.platform, 'PulseAudio')
+
+    try:
+        prop = bpy.context.preferences.system.bl_rna.properties['audio_device']
+        available = [item.identifier for item in prop.enum_items
+                     if item.identifier != 'None']
+        if available:
+            if preferred in available:
+                return preferred
+            # Blender lists backends in preference order for this platform —
+            # take its top choice over our own guess.
+            return available[0]
+    except Exception as e:
+        print(f"[HIJACKER] audio_device enum introspection failed: {e}")
+
+    return preferred
+
+
+def _pb_deferred_save_userpref():
+    """One-shot timer callback: save preferences a moment after registration.
+
+    register() can run with bpy.context as a _RestrictContext (notably at
+    Blender startup), and operators like wm.save_userpref need a full
+    context (view_layer, window, etc.) to run — calling it synchronously
+    from register() raises. Deferring via bpy.app.timers runs this on the
+    next event-loop tick, by which point context is no longer restricted.
+    """
+    try:
+        bpy.ops.wm.save_userpref()
+        print("[HIJACKER] preferences saved after audio device recovery")
+    except Exception as e:
+        print(f"[HIJACKER] could not save preferences after recovery: {e}")
+    return None  # don't repeat
+
+
+def _pb_recover_stuck_audio():
+    """Startup self-heal: if the audio device is already 'None' before we've
+    enabled the engine ourselves this session, it's almost certainly left
+    over from Blender crashing or being force-closed while Hijacker was
+    active last time — _pb_engine_disable() never got the chance to restore
+    it. Left alone, Blender would stay silent by default on every future
+    launch. Fix it immediately and save so it doesn't stick around.
+    """
+    if _pb_engine_active:
+        return  # we're actively using it right now — leave it alone
+
+    try:
+        current = bpy.context.preferences.system.audio_device
+    except Exception as e:
+        print(f"[HIJACKER] could not read audio_device during startup check: {e}")
+        return
+
+    if current != 'None':
+        return  # nothing to recover
+
+    restored = _pb_guess_audio_device()
+    try:
+        bpy.context.preferences.system.audio_device = restored
+        print(f"[HIJACKER] recovered a stuck 'None' audio device (likely a "
+              f"previous crash while Hijacker was active) — restored to "
+              f"'{restored}'")
+    except Exception as e:
+        print(f"[HIJACKER] failed to recover stuck audio device: {e}")
+        return
+
+    # Defer the actual save — see _pb_deferred_save_userpref's docstring.
+    try:
+        bpy.app.timers.register(_pb_deferred_save_userpref, first_interval=0.2)
+    except Exception as e:
+        print(f"[HIJACKER] could not schedule preferences save after recovery: {e}")
+
+
 def _pb_engine_enable():
     """Disable Blender's audio, start Hijacker engine, register handlers."""
     global _pb_engine_active, _pb_original_device, _pb_eq_timer_registered
@@ -1098,8 +1186,7 @@ def _pb_engine_enable():
         if current_device and current_device != 'None':
             _pb_original_device = current_device
         else:
-            import sys as _sys
-            _pb_original_device = 'WASAPI' if _sys.platform == 'win32' else 'OpenAL'
+            _pb_original_device = _pb_guess_audio_device()
         bpy.context.preferences.system.audio_device = 'None'
         print(f"[HIJACKER] Blender audio disabled (was '{current_device}', "
               f"will restore to '{_pb_original_device}')")
@@ -1309,4 +1396,3 @@ def sync_vse_solo(channel_idx, solo_state):
                 hj.set_mute(idx, effective_mute)
                 hj.set_solo(idx, soloed_ch)
                 hj.set_volume(idx, _pb_channel_volume(idx))
-
