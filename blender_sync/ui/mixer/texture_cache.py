@@ -130,6 +130,20 @@ SKIN_MAP = {
     # ---------------------------------------------------------------------------
     "rack_collapsed_ch_led_off": "rack_collapsed_ch_led_off.png",
     "rack_collapsed_ch_led_on":  "rack_collapsed_ch_led_on.png",
+    # ---------------------------------------------------------------------------
+    # AI rack collapsed backgrounds — same convention as the DSP racks'
+    # collapsed "_bg" skins above (_COLLAPSED_BG_KEY in rack_base.py). The AI
+    # racks' collapsed row now uses that identical shared layout (badge, the
+    # universal channel LED strip above, ON/OFF+close below) instead of its
+    # own one-off flat chrome. Title/logo/expand-arrow bake into the art;
+    # missing files fall back to the old flat rect + border so nothing
+    # disappears before art exists for a given type.
+    # ---------------------------------------------------------------------------
+    "rack_piper_collapsed_bg":      "rack_piper_collapsed_bg.png",
+    "rack_knnvc_collapsed_bg":      "rack_knnvc_collapsed_bg.png",
+    "rack_voicefixer_collapsed_bg": "rack_voicefixer_collapsed_bg.png",
+    "rack_whisper_collapsed_bg":    "rack_whisper_collapsed_bg.png",
+    "rack_demucs_collapsed_bg":     "rack_demucs_collapsed_bg.png",
     "rack_knnvc_bg":       "rack_knnvc_bg.png",
     "rack_demucs_bg":      "rack_demucs_bg.png",
     # Demucs stem-pad ON glow overlay — off-state is baked into rack_demucs_bg.png

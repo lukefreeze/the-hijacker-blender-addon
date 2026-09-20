@@ -25,6 +25,12 @@ Everything else lives in:
 import sys
 import os
 
+# bpy.utils.previews isn't always pulled in by a bare "import bpy" — needed
+# to load a custom PNG as a usable icon_value for UI buttons (native
+# layout.operator()/layout.label() icons only accept Blender's own built-in
+# icon enum via icon=, or a loaded custom image via icon_value=).
+import bpy.utils.previews
+
 # ---------------------------------------------------------------------------
 # Path bootstrap — must happen before any other import
 # Only add blender_sync/ itself to sys.path, NOT subdirectories.
@@ -195,11 +201,33 @@ class VSE_PT_Pedalboard_Panel(bpy.types.Panel):
 
     def draw(self, context):
         self.layout.operator("vse.refresh_pb_tracks")
-        self.layout.operator("vse.toggle_pb_gui")
+        icon_id = _get_hijacker_icon_id()
+        if icon_id:
+            self.layout.operator("vse.toggle_pb_gui", icon_value=icon_id)
+        else:
+            self.layout.operator("vse.toggle_pb_gui")
+
+
+def _get_hijacker_icon_id():
+    """Best-effort lookup of the loaded header-logo icon's id.
+    Never raises — a bad/missing icon should fall back to text-only
+    buttons, not break the header draw every frame."""
+    try:
+        if _icons and "hijacker_logo" in _icons:
+            return _icons["hijacker_logo"].icon_id
+    except Exception as e:
+        print(f"[HIJACKER] header icon lookup failed: {e}")
+    return 0
 
 
 def draw_header_buttons(self, context):
-    self.layout.operator("vse.toggle_pb_gui", text="The Hijacker")
+    icon_id = _get_hijacker_icon_id()
+    if icon_id:
+        self.layout.operator("vse.toggle_pb_gui", text="The Hijacker", icon_value=icon_id)
+    else:
+        # Icon failed to load (e.g. missing file) — fall back to text-only
+        # so the button is never silently lost.
+        self.layout.operator("vse.toggle_pb_gui", text="The Hijacker")
 
 
 # ---------------------------------------------------------------------------
@@ -253,11 +281,25 @@ classes = (
 )
 
 _handle = None
+_icons  = None  # bpy.utils.previews.ImagePreviewCollection holding the header-button logo
 
 
 def register():
-    global _handle
+    global _handle, _icons
     import importlib, sys
+
+    # Load the header-button logo as a custom icon. This is separate from
+    # the PNG->gpu.texture skin system in ui/mixer/texture_cache.py — that
+    # system is for textures drawn by hand inside the GPU HUD, while a
+    # native layout.operator() button icon has to be registered through
+    # bpy.utils.previews and referenced by icon_value instead.
+    try:
+        _icons = bpy.utils.previews.new()
+        _icon_path = os.path.join(_ADDON_DIR, "ui", "assets", "icons", "hijacker_icon.png")
+        _icons.load("hijacker_logo", _icon_path, 'IMAGE')
+    except Exception as _ie:
+        print(f"[HIJACKER] could not load header icon: {_ie}")
+        _icons = None
 
     # Startup self-heal: if a previous Blender crash left the system audio
     # device stuck disabled (see _pb_recover_stuck_audio's docstring), fix it
@@ -343,7 +385,7 @@ def register():
 
 
 def unregister():
-    global _handle
+    global _handle, _icons
     _cancel_meter_timer()
     _pb_engine_disable()
     unregister_racks()
@@ -355,6 +397,13 @@ def unregister():
         bpy.types.SpaceNodeEditor.draw_handler_remove(_handle, "WINDOW")
 
     bpy.types.NODE_HT_header.remove(draw_header_buttons)
+
+    if _icons:
+        try:
+            bpy.utils.previews.remove(_icons)
+        except Exception as e:
+            print(f"[HIJACKER] could not free header icon: {e}")
+        _icons = None
 
     for cls in reversed(classes):
         try:

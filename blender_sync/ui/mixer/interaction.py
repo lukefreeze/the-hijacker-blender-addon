@@ -640,7 +640,7 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                         # Inject scale and region width so popup can clamp its x
                         ai_hit['scale']    = UI_SCALE
                         ai_hit['region_w'] = region.width
-                        if ai_hit.get('zone') in ('ai_dnf_knob', 'ai_piper_knob', 'ai_rvc_knob'):
+                        if ai_hit.get('zone') in ('ai_piper_knob', 'ai_rvc_knob'):
                             active_ai_knob = (ai_hit['ai_idx'], ai_hit['knob_idx'])
                             return {"RUNNING_MODAL"}
                         if ai_hit.get('zone') == 'ai_piper_text':

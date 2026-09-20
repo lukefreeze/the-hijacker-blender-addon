@@ -3,10 +3,10 @@
 # THE BOOSTER!! backend — export/boost/reimport.
 #
 # Called from Racks.py handle_click when the APPLY BOOST button is clicked.
-# Runs in a background thread exactly like ai_deepfilternet.py.
+# Runs in a background thread, same pattern as the other AI/processing racks.
 #
 # Steps:
-#   1. Extract channel audio to temp WAV using aud (same as DeepFilterNet)
+#   1. Extract channel audio to temp WAV using aud
 #   2. Run booster_runner.py subprocess to apply gain + soft limiter
 #   3. Save boosted WAV as <original>_boosted_+NdB.wav alongside the original
 #   4. Place new strip on next free VSE channel, strip.volume = 1.0
@@ -49,7 +49,7 @@ def is_processing(rack_idx):
 
 
 # ---------------------------------------------------------------------------
-# Audio extraction — reuse DeepFilterNet's proven _extract_channel_wav
+# Audio extraction
 # ---------------------------------------------------------------------------
 def _extract_channel_wav(channel_idx, out_path):
     """Extract all audio from VSE channel to a WAV file using aud."""
@@ -131,7 +131,7 @@ def _extract_channel_wav(channel_idx, out_path):
 
 
 # ---------------------------------------------------------------------------
-# VSE output placement — same strategy as DeepFilterNet
+# VSE output placement
 # ---------------------------------------------------------------------------
 def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack):
     """Place boosted WAV on next free VSE channel, mute original."""

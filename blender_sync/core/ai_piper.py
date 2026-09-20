@@ -31,6 +31,50 @@ _PIPER_DIR    = os.path.join(_ADDON_DIR, "ai_engines", "piper")
 _VOICES_DIR   = os.path.join(_PIPER_DIR, "voices")
 
 
+def _ensure_executable(path):
+    """Make sure the piper binary actually has its +x bit set, and return it.
+
+    macOS/Linux binaries lose their Unix executable permission whenever
+    they pass through a non-Unix-aware step — most relevantly, a beta zip
+    built/packaged on Windows never preserves it at all, so a binary that
+    was perfectly executable when we downloaded it can still land on a
+    tester's Mac/Linux machine as a plain non-executable file, which fails
+    with a permission error that looks a lot like "piper isn't installed"
+    even though the file is right there. Self-healing this here means one
+    less manual `chmod +x` step for every tester on every platform.
+    Windows ignores the Unix mode bits entirely, so this is a harmless
+    no-op there.
+    """
+    if platform.system().lower() != "windows":
+        try:
+            import stat as _stat
+            mode = os.stat(path).st_mode
+            want = mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH
+            if mode != want:
+                os.chmod(path, want)
+                print(f"[PIPER] restored +x permission on {path}")
+        except Exception as e:
+            print(f"[PIPER] could not verify/set +x on {path}: {e}")
+
+        # piper shells out to its own bundled helper binaries at runtime
+        # (piper_phonemize, espeak-ng) — they need +x too, or piper itself
+        # fails even though the main "piper" binary launched fine.
+        exe_dir = os.path.dirname(path)
+        for helper in ("piper_phonemize", "espeak-ng"):
+            helper_path = os.path.join(exe_dir, helper)
+            if os.path.exists(helper_path):
+                try:
+                    import stat as _stat
+                    hmode = os.stat(helper_path).st_mode
+                    hwant = hmode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH
+                    if hmode != hwant:
+                        os.chmod(helper_path, hwant)
+                        print(f"[PIPER] restored +x permission on {helper_path}")
+                except Exception as e:
+                    print(f"[PIPER] could not verify/set +x on {helper_path}: {e}")
+    return path
+
+
 def _get_piper_exe():
     """Return path to piper executable for this platform, or None.
 
@@ -54,7 +98,7 @@ def _get_piper_exe():
     # 1. Preferred platform subfolder
     path = os.path.join(_PIPER_DIR, preferred_sub, exe_name)
     if os.path.exists(path):
-        return path
+        return _ensure_executable(path)
 
     # 2. Scan all subfolders for the exe (handles any naming convention)
     if os.path.isdir(_PIPER_DIR):
@@ -64,13 +108,13 @@ def _get_piper_exe():
                 candidate = os.path.join(sub_path, exe_name)
                 if os.path.exists(candidate):
                     print(f"[PIPER] found exe in non-standard folder: {entry}/")
-                    return candidate
+                    return _ensure_executable(candidate)
 
     # 3. Exe placed directly in piper/ folder
     flat = os.path.join(_PIPER_DIR, exe_name)
     if os.path.exists(flat):
         print(f"[PIPER] found exe in piper/ root")
-        return flat
+        return _ensure_executable(flat)
 
     print(f"[PIPER] searched: {_PIPER_DIR}")
     if os.path.isdir(_PIPER_DIR):
@@ -118,6 +162,175 @@ def _discover_voices():
 def get_voices():
     """Public accessor — returns list of (name, onnx_path, json_path)."""
     return _discover_voices()
+
+
+def is_voice_installed(voice_key):
+    """Cheap already-downloaded check for the voice browser — matches by
+    the .onnx filename Piper's own catalog uses for that key, against
+    whatever _discover_voices() finds on disk right now."""
+    target = f"{voice_key}.onnx"
+    for _, onnx_path, _j in _discover_voices():
+        if os.path.basename(onnx_path) == target:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Voice catalog — browse & download more voices from Piper's public catalog
+# (huggingface.co/rhasspy/piper-voices) instead of shipping every voice in
+# the beta zip. See rack_piper.py's "+ ADD VOICE" button and browse mode.
+# ---------------------------------------------------------------------------
+_VOICES_JSON_URL  = "https://huggingface.co/rhasspy/piper-voices/raw/main/voices.json"
+_VOICE_FILES_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+_HTTP_USER_AGENT  = "TheHijacker-Blender-Addon"
+
+_voice_catalog  = []     # list of dicts, see fetch_voice_catalog()
+_catalog_status = "IDLE" # IDLE, LOADING, LOADED, ERROR, BLOCKED
+_catalog_error  = ""
+_download_state = {}     # voice_key -> {'status': DOWNLOADING/DONE/ERROR, 'pct': 0-100, 'error': str}
+
+
+def is_online_access_allowed():
+    """Blender 4.2+ gates ALL addon network access behind a user-controlled
+    preference (in 4.5: Preferences > Get Extensions > Allow Online Access)
+    and expects addons to check it before making any request. Older Blender
+    (pre-4.2) has no such property at all — treat that as always-allowed
+    rather than erroring, since there's nothing to respect there."""
+    try:
+        return bool(bpy.app.online_access)
+    except Exception:
+        return True
+
+
+def get_catalog_status():
+    """Returns (status, error_message) for the UI to draw."""
+    return _catalog_status, _catalog_error
+
+
+def get_voice_catalog():
+    """Returns the currently-loaded catalog list (empty until LOADED)."""
+    return _voice_catalog
+
+
+def fetch_voice_catalog(force=False):
+    """Kick off a background fetch of Piper's public voice catalog.
+    Safe to call repeatedly (e.g. once per button click) — no-ops once a
+    fetch is already in flight or already succeeded, unless force=True."""
+    global _catalog_status, _catalog_error
+    if not force and _catalog_status in ("LOADING", "LOADED"):
+        return
+    if not is_online_access_allowed():
+        _catalog_status = "BLOCKED"
+        return
+
+    _catalog_status = "LOADING"
+    _catalog_error  = ""
+
+    def _worker():
+        global _voice_catalog, _catalog_status, _catalog_error
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                _VOICES_JSON_URL, headers={"User-Agent": _HTTP_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+
+            catalog = []
+            for key, entry in raw.items():
+                files = entry.get("files", {}) or {}
+                onnx_path = onnx_size = json_path = None
+                for path, meta in files.items():
+                    if path.endswith(".onnx.json"):
+                        json_path = path
+                    elif path.endswith(".onnx"):
+                        onnx_path = path
+                        onnx_size = (meta or {}).get("size_bytes", 0)
+                if not onnx_path or not json_path:
+                    continue  # incomplete catalog entry — skip rather than crash
+                lang = entry.get("language", {}) or {}
+                catalog.append({
+                    "key":       key,
+                    "name":      entry.get("name", key),
+                    "lang_code": lang.get("code", ""),
+                    "lang_name": lang.get("name_english") or lang.get("code", "?"),
+                    "quality":   entry.get("quality", ""),
+                    "onnx_path": onnx_path,
+                    "onnx_size": onnx_size or 0,
+                    "json_path": json_path,
+                })
+            catalog.sort(key=lambda v: (v["lang_name"], v["name"], v["quality"]))
+            _voice_catalog  = catalog
+            _catalog_status = "LOADED"
+            print(f"[PIPER] voice catalog loaded — {len(catalog)} voices")
+        except Exception as e:
+            _catalog_error  = str(e)
+            _catalog_status = "ERROR"
+            print(f"[PIPER] voice catalog fetch failed: {e}")
+
+    threading.Thread(target=_worker, name="PiperCatalogFetch", daemon=True).start()
+    _ensure_redraw_timer()
+
+
+def get_download_state(voice_key):
+    return _download_state.get(voice_key)
+
+
+def download_voice(voice_key):
+    """Download one catalog voice's .onnx + .onnx.json into voices/, in a
+    background thread, reporting progress via _download_state so the rack
+    can draw a live percentage without blocking Blender's UI thread."""
+    if not is_online_access_allowed():
+        _download_state[voice_key] = {"status": "ERROR", "pct": 0,
+                                       "error": "Online access is disabled"}
+        return
+
+    existing = _download_state.get(voice_key)
+    if existing and existing.get("status") == "DOWNLOADING":
+        return  # already in progress — don't start a second thread for it
+
+    entry = next((v for v in _voice_catalog if v["key"] == voice_key), None)
+    if not entry:
+        _download_state[voice_key] = {"status": "ERROR", "pct": 0,
+                                       "error": "voice not found in catalog"}
+        return
+
+    _download_state[voice_key] = {"status": "DOWNLOADING", "pct": 0.0, "error": ""}
+
+    def _dl_one(url, dest, pct_lo, pct_hi):
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": _HTTP_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total = int(resp.headers.get("Content-Length", 0)) or 1
+            done  = 0
+            tmp   = dest + ".part"
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(1 << 16)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    frac = min(1.0, done / total)
+                    pct  = pct_lo + frac * (pct_hi - pct_lo)
+                    _download_state[voice_key] = {"status": "DOWNLOADING",
+                                                   "pct": pct, "error": ""}
+            os.replace(tmp, dest)
+
+    def _worker():
+        try:
+            os.makedirs(_VOICES_DIR, exist_ok=True)
+            onnx_dest = os.path.join(_VOICES_DIR, os.path.basename(entry["onnx_path"]))
+            json_dest = onnx_dest + ".json"
+            _dl_one(_VOICE_FILES_BASE + entry["onnx_path"], onnx_dest, 0, 90)
+            _dl_one(_VOICE_FILES_BASE + entry["json_path"], json_dest, 90, 100)
+            _download_state[voice_key] = {"status": "DONE", "pct": 100.0, "error": ""}
+            print(f"[PIPER] downloaded voice: {voice_key}")
+        except Exception as e:
+            _download_state[voice_key] = {"status": "ERROR", "pct": 0, "error": str(e)}
+            print(f"[PIPER] voice download failed ({voice_key}): {e}")
+
+    threading.Thread(target=_worker, name=f"PiperVoiceDL_{voice_key}", daemon=True).start()
+    _ensure_redraw_timer()
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +416,8 @@ def preview_piper(ai_idx, context):
             rack.ai_status = "PREVIEWING"
             print(f"[PIPER] rack {ai_idx} replaying preview (no changes)")
         except Exception as e:
+            rack.ai_status    = "ERROR"
+            rack.ai_error_msg = f"replay failed: {e}"
             print(f"[PIPER] replay error: {e}")
     else:
         # Settings changed or no cached file — regenerate
@@ -237,21 +452,24 @@ def generate_piper(ai_idx, context, preview_only=False):
     # ── Pre-flight ────────────────────────────────────────────────────────
     piper_exe = _get_piper_exe()
     if piper_exe is None:
-        rack.ai_status = "ERROR"
+        rack.ai_status    = "ERROR"
+        rack.ai_error_msg = "piper executable not found for this platform"
         print(f"[PIPER] ERROR: piper executable not found")
         print(f"[PIPER] Expected at: {os.path.join(_PIPER_DIR, '<platform>', 'piper[.exe]')}")
         return
 
     text = (getattr(rack, 'ai_text', '') or '').strip()
     if not text:
-        rack.ai_status = "ERROR"
+        rack.ai_status    = "ERROR"
+        rack.ai_error_msg = "no script text — click the script field and type something"
         print("[PIPER] ERROR: no text to synthesise — type something in the script field")
         return
 
     # ── Voice selection ───────────────────────────────────────────────────
     voices = _discover_voices()
     if not voices:
-        rack.ai_status = "ERROR"
+        rack.ai_status    = "ERROR"
+        rack.ai_error_msg = "no voice models found — add .onnx voices to ai_engines/piper/voices/"
         print(f"[PIPER] ERROR: no voice models found in {_VOICES_DIR}")
         return
 
@@ -284,6 +502,7 @@ def generate_piper(ai_idx, context, preview_only=False):
     scene_name = scene.name
 
     rack.ai_status    = "PROCESSING"
+    rack.ai_error_msg = ""
     _cancel_flags[ai_idx] = False
 
     def _worker():
@@ -480,8 +699,19 @@ def _redraw_timer():
     except Exception:
         pass
     any_active = (any(t.is_alive() for t in _active_jobs.values()) or
-                  bool(_pending_finish))
+                  bool(_pending_finish) or
+                  _catalog_status == "LOADING" or
+                  any(s.get("status") == "DOWNLOADING" for s in _download_state.values()))
     return 0.25 if any_active else None
+
+
+def _ensure_redraw_timer():
+    """Shared by generate_piper(), fetch_voice_catalog() and download_voice()
+    — anything that changes state in a background thread needs the HUD to
+    keep redrawing (region draw callbacks don't re-run on their own just
+    because a dict value changed on another thread) until it settles."""
+    if not bpy.app.timers.is_registered(_redraw_timer):
+        bpy.app.timers.register(_redraw_timer, first_interval=0.25)
 
 
 def _apply_finish(ai_idx, info):
@@ -496,6 +726,7 @@ def _apply_finish(ai_idx, info):
         rack.ai_status = info['status']
 
         if info['status'] == "ERROR":
+            rack.ai_error_msg = info.get('error_msg', 'unknown error') or 'unknown error'
             print(f"[PIPER] rack {ai_idx} ERROR: {info.get('error_msg', 'unknown')}")
 
         elif info['status'] == "DONE":

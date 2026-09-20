@@ -328,11 +328,9 @@ PRESET_DATA['BOOSTER'] = [
     ('+12 Raw', [12/40, 0.0]),
 ]
 
-# AI rack presets — keyed by ai_type
-# DeepFilterNet params: [p0=atten(0-1), p1=sensitiv(0-1), p2=postgain_norm(0-1)]
-# p0: 0=no attenuation, 1=max attenuation (-40dB limit)
-# p1: 0=always process, 1=only process silence gaps
-# p2: 0.5=0dB post gain, 0=−12dB, 1=+12dB
+# AI rack presets — keyed by ai_type. Each entry maps a preset name to a
+# list of param values (p0, p1, p2, ...) whose meaning is defined per rack
+# type by that rack's own UI/backend code.
 AI_PRESET_DATA = {}
 # Piper TTS presets are voice names — discovered at runtime from voices/ folder
 # These are fallback display names if the folder can't be scanned
@@ -354,7 +352,9 @@ AI_PRESETS = {k: [p[0] for p in v] for k, v in AI_PRESET_DATA.items()}
 
 
 def _load_ai_preset(rack, preset_idx):
-    """Load a DeepFilterNet preset by index into rack params."""
+    """Load an AI-rack preset by index into rack params — presets are
+    looked up from AI_PRESET_DATA by rack.ai_type, so this is shared by
+    every AI rack (Piper, etc.), not any one rack type in particular."""
     atype   = rack.ai_type
     presets = AI_PRESET_DATA.get(atype)
     if presets and 0 <= preset_idx < len(presets):
@@ -485,6 +485,11 @@ class PB_AIRackSettings(bpy.types.PropertyGroup):
     ai_text: bpy.props.StringProperty(default="", maxlen=4096)
     # Path to last processed output file (for reload/bypass)
     ai_output_path:    bpy.props.StringProperty(default="", subtype='FILE_PATH')
+    # Last error message (Piper/Demucs/etc.) — so the rack UI can show
+    # WHY ai_status went to "ERROR" instead of the button just silently
+    # looking the same as READY. See rack_piper.py's GENERATE/PREVIEW
+    # button ERROR-state styling.
+    ai_error_msg:      bpy.props.StringProperty(default="")
     preset_idx:        bpy.props.IntProperty(default=0)
     # Whisper-specific properties
     wsp_font_path:     bpy.props.StringProperty(default="", subtype='FILE_PATH')
@@ -4774,7 +4779,13 @@ def unregister_racks():
 def _get_ai_rack_height(rack, scale):
     """Return the pixel height of an AI rack at given scale."""
     if rack.collapsed:
-        return RACK_COLLAPSED_H * scale
+        # Local shadow of the stale module-level RACK_COLLAPSED_H (=36) —
+        # the AI racks' collapsed row now uses the same shared layout as the
+        # DSP racks' collapsed row (rack_base._draw_rack_collapsed), so it
+        # needs rack_base's live value (=48) to match, same reasoning as the
+        # DSP hit_test()/draw_racks() shadow-imports of this constant.
+        from ui.racks.rack_base import RACK_COLLAPSED_H as _RCH_AI
+        return _RCH_AI * scale
     heights = {
         "WHISPER":       280,
         "DEMUCS":        300,
@@ -4829,8 +4840,30 @@ def _draw_ai_channel_buttons(rx, ry, rw, rh, rack, scale):
         _draw_text(label, bx+btn_s/2-tw/2, by+btn_s/2-fs/2, fs, bc)
 
 
+# AI rack collapsed row — per-type background skin, same convention as
+# _COLLAPSED_BG_KEY in rack_base.py (one PNG per type, title/logo/expand-
+# arrow baked into the art). Falls back to the old flat red-tinted chrome
+# for any type without its collapsed art yet — see texture_cache.py's
+# SKIN_MAP for the matching filenames. Drop a PNG in with the exact
+# filename and this just lights up, no code changes needed.
+_AI_COLLAPSED_BG_KEY = {
+    "PIPER_TTS": "rack_piper_collapsed_bg",
+    "RVC":       "rack_knnvc_collapsed_bg",
+    "RESEMBLE":  "rack_voicefixer_collapsed_bg",
+    "WHISPER":   "rack_whisper_collapsed_bg",
+    "DEMUCS":    "rack_demucs_collapsed_bg",
+}
+
+
 def _draw_ai_rack_collapsed(rx, ry, rw, rh, rack, ai_idx, scale):
-    """Draw AI rack in collapsed single-row form."""
+    """Draw AI rack in collapsed single-row form.
+
+    Now shares the exact same layout convention as the DSP racks' collapsed
+    row (rack_base._draw_rack_collapsed): a per-type baked background, the
+    universal 9-channel LED strip, and the shared ON/OFF+close PNG buttons —
+    replacing the old one-off flat-chrome X/ON-OFF boxes, per-assigned-
+    channel coloured squares, and centre status dot.
+    """
     try:
         from ui.mixer.draw_utils import (
             draw_rect   as _draw_rect,
@@ -4848,91 +4881,141 @@ def _draw_ai_rack_collapsed(rx, ry, rw, rh, rack, ai_idx, scale):
     HAL_BORDER = (0.20, 0.08, 0.08, 1.0)
     HAL_TEXT   = (0.80, 0.22, 0.14, 1.0)
 
-    cy = ry + rh / 2
-    _draw_rect(rx, ry, rw, rh, HAL_BG)
+    cy     = ry + rh / 2
     shader = _get_shader()
-    bv = [(rx,ry),(rx+rw,ry),(rx+rw,ry+rh),(rx,ry+rh),(rx,ry)]
-    batch = batch_for_shader(shader, "LINE_STRIP", {"pos": bv})
-    shader.bind(); shader.uniform_float("color", HAL_BORDER); batch.draw(shader)
 
-    for sx, sy in [(rx+12*scale, cy), (rx+rw-12*scale, cy)]:
-        _draw_circle(sx, sy, 3*scale, (0.07, 0.03, 0.03, 1.0))
-        _draw_circle(sx, sy, 3*scale, (0.25, 0.10, 0.08, 1.0), filled=False)
-        _draw_line(sx-2*scale, sy, sx+2*scale, sy, (0.25, 0.10, 0.08, 0.8))
-        _draw_line(sx, sy-2*scale, sx, sy+2*scale, (0.25, 0.10, 0.08, 0.8))
+    # Background — per-type PNG skin, falls back to the old flat red chrome
+    # (screws + expand arrow included) for any type without art yet.
+    _collapsed_bg_drawn = False
+    try:
+        from ui.mixer.texture_cache import get_texture as _gtc_acbg
+        from ui.mixer.texture_cache import blit_texture as _blt_acbg
+        _acbg_key = _AI_COLLAPSED_BG_KEY.get(rack.ai_type)
+        _acbg_tex = _gtc_acbg(_acbg_key) if _acbg_key else None
+        if _acbg_tex:
+            _blt_acbg(_acbg_tex, rx, ry, rw, rh, key=_acbg_key)
+            _collapsed_bg_drawn = True
+    except Exception:
+        _collapsed_bg_drawn = False
+    if not _collapsed_bg_drawn:
+        _draw_rect(rx, ry, rw, rh, HAL_BG)
+        bv = [(rx,ry),(rx+rw,ry),(rx+rw,ry+rh),(rx,ry+rh),(rx,ry)]
+        batch = batch_for_shader(shader, "LINE_STRIP", {"pos": bv})
+        shader.bind(); shader.uniform_float("color", HAL_BORDER); batch.draw(shader)
 
-    ax = rx + 26*scale
-    arrow = [(ax-5*scale, cy+5*scale), (ax-5*scale, cy-5*scale), (ax+5*scale, cy)]
-    abat = batch_for_shader(shader, "TRIS", {"pos": arrow})
-    shader.uniform_float("color", (0.50, 0.18, 0.12, 1.0)); abat.draw(shader)
+        for sx, sy in [(rx+12*scale, cy), (rx+rw-12*scale, cy)]:
+            _draw_circle(sx, sy, 3*scale, (0.07, 0.03, 0.03, 1.0))
+            _draw_circle(sx, sy, 3*scale, (0.25, 0.10, 0.08, 1.0), filled=False)
+            _draw_line(sx-2*scale, sy, sx+2*scale, sy, (0.25, 0.10, 0.08, 0.8))
+            _draw_line(sx, sy-2*scale, sx, sy+2*scale, (0.25, 0.10, 0.08, 0.8))
 
-    ai_type_names = dict(AI_RACK_TYPES)
-    aname    = ai_type_names.get(rack.ai_type, rack.ai_type).split("—")[0].strip()
+        ax = rx + 26*scale
+        arrow = [(ax-5*scale, cy+5*scale), (ax-5*scale, cy-5*scale), (ax+5*scale, cy)]
+        abat = batch_for_shader(shader, "TRIS", {"pos": arrow})
+        shader.uniform_float("color", (0.50, 0.18, 0.12, 1.0)); abat.draw(shader)
+
+    # Badge number — always drawn on top, same as every other numbered rack
+    # badge in the addon (never baked into any skin).
     badge_fs = max(1, int(12*scale))
-    name_fs  = max(1, int(10*scale))
     badge_x  = rx + 38*scale
     _draw_text(str(ai_idx+1), badge_x, cy - badge_fs/2, badge_fs, HAL_TEXT)
-    bw = _text_width(str(ai_idx+1), badge_fs) + 5*scale
-    _draw_text(aname.upper(), badge_x+bw, cy-name_fs/2, name_fs,
-               (0.55, 0.22, 0.16, 1.0))
 
-    status = getattr(rack, 'ai_status', 'READY')
-    dot_cols = {
-        'READY':      (0.1, 0.7, 0.3, 1.0),
-        'PROCESSING': (0.9, 0.5, 0.1, 1.0),
-        'DONE':       (0.1, 0.9, 0.4, 1.0),
-        'ERROR':      (0.9, 0.1, 0.1, 1.0),
-    }
-    _draw_circle(rx + rw/2, cy, 4*scale, dot_cols.get(status, (0.3, 0.3, 0.3, 1.0)))
+    # AI type name — suppressed once skinned (baked into the art); only
+    # needed to label the unskinned fallback.
+    if not _collapsed_bg_drawn:
+        ai_type_names = dict(AI_RACK_TYPES)
+        aname   = ai_type_names.get(rack.ai_type, rack.ai_type).split("—")[0].strip()
+        name_fs = max(1, int(10*scale))
+        bw      = _text_width(str(ai_idx+1), badge_fs) + 5*scale
+        _draw_text(aname.upper(), badge_x+bw, cy-name_fs/2, name_fs,
+                   (0.55, 0.22, 0.16, 1.0))
 
-    btn_h  = 16*scale
-    btn_y  = cy - btn_h / 2
-    del_w  = 18*scale
-    del_x  = rx + rw - 22*scale
-    _draw_rect(del_x, btn_y, del_w, btn_h, (0.18, 0.04, 0.04, 1.0))
-    dvs = [(del_x,btn_y),(del_x+del_w,btn_y),(del_x+del_w,btn_y+btn_h),
-           (del_x,btn_y+btn_h),(del_x,btn_y)]
-    db2 = batch_for_shader(shader, "LINE_STRIP", {"pos": dvs})
-    shader.bind(); shader.uniform_float("color", (0.6, 0.1, 0.1, 1.0)); db2.draw(shader)
-    fs_x = max(1, int(9*scale))
-    tw_x = _text_width("X", fs_x)
-    _draw_text("X", del_x+del_w/2-tw_x/2, btn_y+btn_h/2-fs_x/2+1,
-               fs_x, (0.8, 0.15, 0.15, 1.0))
+    # ON/OFF + close — the shared rack_btn_off/rack_btn_on PNG pair, same
+    # RACK_BTN_* geometry as every DSP rack and this rack's own expanded
+    # form. Centred on the whole collapsed row, exactly matching
+    # rack_base._draw_rack_collapsed's button block.
+    from ui.racks.rack_base import (
+        RACK_BTN_W as _RBW_C, RACK_BTN_H as _RBH_C,
+        RACK_BTN_X_OFFSET as _RBXO_C, RACK_BTN_Y_OFFSET as _RBYO_C,
+    )
+    _btn_w = _RBW_C * scale
+    _btn_h = _RBH_C * scale
+    _btn_x = rx + rw - _btn_w + _RBXO_C * scale
+    _btn_y = cy - _btn_h / 2 + _RBYO_C * scale
+    try:
+        from ui.mixer.texture_cache import get_texture as _gtc_acbtn
+        from ui.mixer.texture_cache import blit_texture as _blt_acbtn
+        _tex_coff = _gtc_acbtn("rack_btn_off")
+        if _tex_coff:
+            _blt_acbtn(_tex_coff, _btn_x, _btn_y, _btn_w, _btn_h, key="rack_btn_off")
+        else:
+            # GPU fallback — same red-tinted chrome this row always used.
+            _fx = rx+rw-22*scale
+            _draw_rect(_fx, cy-8*scale, 18*scale, 16*scale, (0.18,0.04,0.04,1.0))
+            fs_xf = max(1, int(9*scale)); tw_xf = _text_width("X", fs_xf)
+            _draw_text("X", _fx+9*scale-tw_xf/2, cy-fs_xf/2+1, fs_xf, (0.8,0.15,0.15,1.0))
+            _onx = rx+rw-66*scale
+            _draw_rect(_onx, cy-8*scale, 40*scale, 16*scale,
+                       (0.0,0.13,0.0,1.0) if rack.enabled else (0.13,0.0,0.0,1.0))
+        if rack.enabled:
+            _tex_con = _gtc_acbtn("rack_btn_on")
+            if _tex_con:
+                _blt_acbtn(_tex_con, _btn_x, _btn_y, _btn_w, _btn_h, key="rack_btn_on")
+    except Exception:
+        pass
 
-    onoff_w = 40*scale
-    onoff_x = del_x - onoff_w - 4*scale
-    if rack.enabled:
-        _draw_rect(onoff_x, btn_y, onoff_w, btn_h, (0.0, 0.12, 0.0, 1.0))
-        oc = (0.0, 0.65, 0.3, 1.0); ot = "ON"
-    else:
-        _draw_rect(onoff_x, btn_y, onoff_w, btn_h, (0.12, 0.0, 0.0, 1.0))
-        oc = (0.65, 0.0, 0.0, 1.0); ot = "OFF"
-    ovs = [(onoff_x,btn_y),(onoff_x+onoff_w,btn_y),
-           (onoff_x+onoff_w,btn_y+btn_h),(onoff_x,btn_y+btn_h),(onoff_x,btn_y)]
-    obat = batch_for_shader(shader, "LINE_STRIP", {"pos": ovs})
-    shader.bind(); shader.uniform_float("color", oc); obat.draw(shader)
-    fs_oo = max(1, int(9*scale))
-    tw_oo = _text_width(ot, fs_oo)
-    _draw_text(ot, onoff_x+onoff_w/2-tw_oo/2, btn_y+btn_h/2-fs_oo/2+1, fs_oo, oc)
+    # Channel LED strip — universal across every rack type (DSP or AI), same
+    # PNGs/constants as rack_base._draw_rack_collapsed. Replaces the old
+    # per-assigned-channel coloured squares: now all 9 channels in this
+    # rack's group show a small numbered LED, lit/blinking for whichever
+    # ones are actually routed to this rack.
+    from ui.racks.rack_base import (
+        RACK_COLLAPSED_LED_W as _LW_C, RACK_COLLAPSED_LED_H as _LH_C,
+        RACK_COLLAPSED_LED_GAP as _LG_C, RACK_COLLAPSED_LED_NUM_GAP as _LNG_C,
+        RACK_COLLAPSED_LED_FLASH_HZ as _LHZ_C,
+    )
+    import time as _time_led
+    _flash_on = (_time_led.time() * _LHZ_C) % 1.0 < 0.5
 
-    assigned = get_ai_rack_channels(rack)
-    ch_size  = CH_BTN_SIZE * scale
-    ch_gap   = 4 * scale
-    fs_b     = max(1, int(10*scale))
-    ch_right = onoff_x - 6*scale
-    for i, ch_idx in enumerate(sorted(assigned)):
-        bx   = ch_right - (i+1) * (ch_size+ch_gap)
-        ch_y = cy - ch_size/2
-        is_on = getattr(rack, f'ch{ch_idx}', False)
-        bg = (0.0, 0.18, 0.10, 1.0) if is_on else (0.07, 0.07, 0.07, 1.0)
-        bc = (0.0, 0.75, 0.45, 1.0) if is_on else (0.2, 0.2, 0.2, 1.0)
-        _draw_rect(bx, ch_y, ch_size, ch_size, bg)
-        csv = [(bx,ch_y),(bx+ch_size,ch_y),(bx+ch_size,ch_y+ch_size),
-               (bx,ch_y+ch_size),(bx,ch_y)]
-        cbat = batch_for_shader(shader, "LINE_STRIP", {"pos": csv})
-        shader.bind(); shader.uniform_float("color", bc); cbat.draw(shader)
-        tw = _text_width(str(ch_idx+1), fs_b)
-        _draw_text(str(ch_idx+1), bx+ch_size/2-tw/2, ch_y+ch_size/2-fs_b/2, fs_b, bc)
+    fs_led  = max(1, int(9*scale))
+    led_w   = _LW_C * scale
+    led_h   = _LH_C * scale
+    led_gap = _LG_C * scale
+    num_gap = _LNG_C * scale
+
+    unit_h = fs_led + num_gap + led_h
+    led_y  = cy - unit_h / 2
+    num_y  = led_y + led_h + num_gap
+
+    group_offset = getattr(rack, 'group_idx', 0) * 9
+    ch_right = _btn_x - 6*scale
+    strip_w  = 9*led_w + 8*led_gap
+    strip_x0 = ch_right - strip_w
+
+    try:
+        from ui.mixer.texture_cache import get_texture as _gtc_aled
+        from ui.mixer.texture_cache import blit_texture as _blt_aled
+    except Exception:
+        _gtc_aled = None
+        _blt_aled = None
+
+    for local_idx in range(9):
+        led_x   = strip_x0 + local_idx * (led_w + led_gap)
+        is_used = getattr(rack, f'ch{local_idx}', False)
+        show_on = is_used and _flash_on
+        led_key = "rack_collapsed_ch_led_on" if show_on else "rack_collapsed_ch_led_off"
+
+        _led_tex = _gtc_aled(led_key) if _gtc_aled else None
+        if _led_tex:
+            _blt_aled(_led_tex, led_x, led_y, led_w, led_h, key=led_key)
+        else:
+            fb_col = (0.0, 0.9, 0.4, 1.0) if show_on else (0.15, 0.15, 0.15, 1.0)
+            _draw_circle(led_x + led_w/2, led_y + led_h/2, led_w/2, fb_col)
+
+        label   = str(group_offset + local_idx + 1)
+        tw      = _text_width(label, fs_led)
+        num_col = (0.75, 0.75, 0.75, 1.0) if is_used else (0.35, 0.35, 0.35, 1.0)
+        _draw_text(label, led_x + led_w/2 - tw/2, num_y, fs_led, num_col)
 
 
 def _draw_ai_rack_expanded(rx, ry, rw, rh, rack, ai_idx, scale):
@@ -5542,7 +5625,13 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
         if col_x <= mouse_x <= col_x+24*scale and col_y <= mouse_y <= col_y+20*scale:
             return {'zone': 'ai_collapse', 'ai_idx': ai_idx}
 
-        # Delete / ON-OFF hitboxes — derived from PNG blit geometry
+        # Delete / ON-OFF hitboxes — derived from PNG blit geometry. Centred
+        # differently depending on which draw function actually ran:
+        # _draw_ai_rack_expanded centres on the rail (top of the rack),
+        # _draw_ai_rack_collapsed now centres on the whole collapsed row
+        # (see that function's own _btn_y) — must branch the same way or
+        # clicks drift off the visible button once the row height differs
+        # from the rail height.
         try:
             from ui.racks.rack_base import (RACK_BTN_W as _RBW3, RACK_BTN_H as _RBH3,
                                             RACK_BTN_X_OFFSET as _RBXO3, RACK_BTN_Y_OFFSET as _RBYO3,
@@ -5552,7 +5641,10 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
         _rbw3 = _RBW3 * scale
         _rbh3 = _RBH3 * scale
         _rbx3 = rack_x + rw - _rbw3 + _RBXO3 * scale
-        _rby3 = rack_top - (RACK_RAIL_H * scale + _rbh3) / 2 + _RBYO3 * scale
+        if rack.collapsed:
+            _rby3 = (rack_y + rack_h / 2) - _rbh3 / 2 + _RBYO3 * scale
+        else:
+            _rby3 = rack_top - (RACK_RAIL_H * scale + _rbh3) / 2 + _RBYO3 * scale
         del_x = _rbx3 + _rbw3 * _RBSP3
         del_y = _rby3
         if del_x <= mouse_x <= _rbx3 + _rbw3 and del_y <= mouse_y <= _rby3 + _rbh3:
@@ -5610,9 +5702,10 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                     PIPER_CL_BTN_W_SCALE as _PCWS,
                     PIPER_VOICE_PANEL_X_OFFSET as _PVPXO,
                     PIPER_VOICE_PANEL_W_SCALE as _PVPWS,
+                    PIPER_ADD_VOICE_BTN_Y_OFFSET as _PAVYO,
                 )
             except Exception:
-                _PGXO = _PGYO = _PPXO = _PPYO = _PCXO = _PCYO = _PVPXO = 0.0
+                _PGXO = _PGYO = _PPXO = _PPYO = _PCXO = _PCYO = _PVPXO = _PAVYO = 0.0
                 _PGWS = _PGHS = _PPWS = _PCWS = _PVPWS = 1.0
 
             _gen_w_base = min(80*scale, _sp_w_p*0.48)
@@ -5646,7 +5739,10 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             if _clx_p <= mouse_x <= _clx_p+_clw_p and _cly_p <= mouse_y <= _cly_p+_gh_p:
                 return {'zone': 'ai_piper_clear', 'ai_idx': ai_idx}
 
-            # Voice panel geometry
+            # Voice panel geometry — mirrors rack_piper.py's _draw_piper_body()
+            # VOICE SELECTOR block exactly, including the "+ ADD VOICE" /
+            # "← BACK TO VOICES" toggle reserved at the top of the panel,
+            # which both modes (browse / installed-voices) must shift below.
             _spl_x_p  = rack_x + rw * 0.52
             _vp_x_p   = _spl_x_p + _marg_p*0.5 + _PVPXO*scale
             _vp_w_p   = (rack_x + rw - _spl_x_p - _marg_p*1.5) * _PVPWS
@@ -5655,39 +5751,102 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             _fs_lbl_p = max(1, int(8*scale))
             _arr_h_p  = 14*scale
 
+            try:
+                from ui.racks.rack_piper import (_browse_mode as _PBM,
+                                                  _browse_scroll as _PBS)
+            except Exception:
+                _PBM, _PBS = {}, {}
+            _browsing_p = _PBM.get(ai_idx, False)
+
+            # "+ ADD VOICE" / "← BACK TO VOICES" button — always the topmost
+            # element of the voice panel, in both modes.
+            _addh_p = 14*scale
+            _addg_p = 3*scale
+            _addx_p = _vp_x_p + 4*scale
+            _addw_p = _vp_w_p - 8*scale
+            _addy_p = _vp_y_p + _vp_h_p - _addh_p + _PAVYO*scale
+            if _addx_p <= mouse_x <= _addx_p+_addw_p and _addy_p <= mouse_y <= _addy_p+_addh_p:
+                return {'zone': 'ai_piper_add_voice_toggle', 'ai_idx': ai_idx}
+
+            # Space reserved for the button above pushes the arrows/cards
+            # down in BOTH modes — must match rack_piper.py's _top_reserve.
+            _top_reserve_p = _addh_p + _addg_p + _fs_lbl_p + 8*scale
+            _arr_top_y_p   = _vp_y_p + _vp_h_p - _top_reserve_p - _arr_h_p
+
             # ▲ up arrow
-            _arr_top_y_p = _vp_y_p + _vp_h_p - _fs_lbl_p - 8*scale - _arr_h_p
             if (_vp_x_p <= mouse_x <= _vp_x_p+_vp_w_p and
                     _arr_top_y_p <= mouse_y <= _arr_top_y_p+_arr_h_p):
-                return {'zone': 'ai_piper_scroll', 'ai_idx': ai_idx, 'dir': -1}
+                return {'zone': 'ai_piper_catalog_scroll' if _browsing_p else 'ai_piper_scroll',
+                        'ai_idx': ai_idx, 'dir': -1}
 
             # ▼ down arrow
             _arr_bot_y_p = _vp_y_p + 2*scale
             if (_vp_x_p <= mouse_x <= _vp_x_p+_vp_w_p and
                     _arr_bot_y_p <= mouse_y <= _arr_bot_y_p+_arr_h_p):
-                return {'zone': 'ai_piper_scroll', 'ai_idx': ai_idx, 'dir': 1}
+                return {'zone': 'ai_piper_catalog_scroll' if _browsing_p else 'ai_piper_scroll',
+                        'ai_idx': ai_idx, 'dir': 1}
 
-            # Voice cards (with scroll offset from p5)
+            # Cards — catalog entries (browse mode, click = download/retry)
+            # or installed voices (normal mode, click = select), same slots.
             _cd_h_p   = max(22*scale, _vp_h_p * 0.20)
             _cg_p     = 2*scale
-            _cards_area_p = _vp_h_p - _fs_lbl_p - 8*scale - _arr_h_p*2 - 4*scale
+            _cards_area_p = _vp_h_p - _top_reserve_p - _arr_h_p*2 - 4*scale
             _max_vis_p    = max(1, int(_cards_area_p / (_cd_h_p + _cg_p)))
-            _v_scroll_p   = int(getattr(rack, 'p5', 0.0))
-            try:
-                from core.ai_piper import get_voices as _gv_p
-                _vlist_p = _gv_p()
-            except Exception:
-                _vlist_p = []
-            _v_start_y_p = _arr_top_y_p - _cg_p
-            for _slot in range(_max_vis_p):
-                _vi = _v_scroll_p + _slot
-                if _vi >= len(_vlist_p): break
-                _cy_c = _v_start_y_p - _slot*(_cd_h_p+_cg_p) - _cd_h_p
-                if _cy_c < _vp_y_p + _arr_h_p + 2*scale: break
-                if (_vp_x_p+4*scale <= mouse_x <= _vp_x_p+_vp_w_p-4*scale and
-                        _cy_c <= mouse_y <= _cy_c+_cd_h_p):
-                    return {'zone': 'ai_piper_voice', 'ai_idx': ai_idx,
-                            'voice_idx': _vi}
+            _v_start_y_p  = _arr_top_y_p - _cg_p
+
+            if _browsing_p:
+                try:
+                    from core.ai_piper import (get_voice_catalog as _gvc_p,
+                                                is_voice_installed as _ivi_p,
+                                                get_download_state as _gds_p)
+                    _cat_p = _gvc_p()
+                except Exception:
+                    _cat_p, _ivi_p, _gds_p = [], (lambda k: False), (lambda k: None)
+                _b_scroll_p = int(_PBS.get(ai_idx, 0))
+                for _slot in range(_max_vis_p):
+                    _vi = _b_scroll_p + _slot
+                    if _vi >= len(_cat_p): break
+                    _cy_c = _v_start_y_p - _slot*(_cd_h_p+_cg_p) - _cd_h_p
+                    if _cy_c < _vp_y_p + _arr_h_p + 2*scale: break
+
+                    # Only the DOWNLOAD/RETRY button is clickable — not the
+                    # whole card — mirroring rack_piper.py's show_dl_btn
+                    # rect exactly, so an accidental card click never starts
+                    # a download. Installed/downloading entries have no
+                    # button at all, so they fall through with no hit here.
+                    try:
+                        _inst_p = _ivi_p(_cat_p[_vi]['key'])
+                        _dls_p  = _gds_p(_cat_p[_vi]['key'])
+                    except Exception:
+                        _inst_p, _dls_p = False, None
+                    _dling_p = bool(_dls_p and _dls_p.get('status') == 'DOWNLOADING')
+                    if _inst_p or _dling_p:
+                        continue
+
+                    _dlbw_p = min(50*scale, _vp_w_p*0.34)
+                    _dlbh_p = min(_cd_h_p - 6*scale, 14*scale)
+                    _dlbx_p = _vp_x_p + _vp_w_p - 4*scale - _dlbw_p
+                    _dlby_p = _cy_c + (_cd_h_p - _dlbh_p) / 2
+                    if (_dlbx_p <= mouse_x <= _dlbx_p+_dlbw_p and
+                            _dlby_p <= mouse_y <= _dlby_p+_dlbh_p):
+                        return {'zone': 'ai_piper_catalog_click', 'ai_idx': ai_idx,
+                                'voice_key': _cat_p[_vi]['key']}
+            else:
+                _v_scroll_p = int(getattr(rack, 'p5', 0.0))
+                try:
+                    from core.ai_piper import get_voices as _gv_p
+                    _vlist_p = _gv_p()
+                except Exception:
+                    _vlist_p = []
+                for _slot in range(_max_vis_p):
+                    _vi = _v_scroll_p + _slot
+                    if _vi >= len(_vlist_p): break
+                    _cy_c = _v_start_y_p - _slot*(_cd_h_p+_cg_p) - _cd_h_p
+                    if _cy_c < _vp_y_p + _arr_h_p + 2*scale: break
+                    if (_vp_x_p+4*scale <= mouse_x <= _vp_x_p+_vp_w_p-4*scale and
+                            _cy_c <= mouse_y <= _cy_c+_cd_h_p):
+                        return {'zone': 'ai_piper_voice', 'ai_idx': ai_idx,
+                                'voice_idx': _vi}
 
             # Piper knobs
             import math as _math_p
@@ -6465,9 +6624,15 @@ def handle_ai_rack_click(hit, context):
             print(f"[AI RACKS] rack {i} enabled={rack.enabled}")
             # Toggle A/B: update both VSE strip.mute (visual) AND engine handle
             # volume via pb_sync_tracks.mute (what the engine actually reads).
+            # NOTE: this only does anything once a rack actually places its
+            # processed output on its own VSE channel and records that via
+            # rack['ai_output_channel']/rack['ai_source_channel'] — no current
+            # rack type sets those yet, so this whole block is a no-op today.
+            # Left in place (renamed from the old dnf_*/DeepFilterNet-era
+            # names) as the intended hook for whichever rack wires it up.
             try:
-                out_ch = rack.get('dnf_output_channel')   # 1-based VSE channel
-                src_ch = rack.get('dnf_source_channel')   # 1-based VSE channel
+                out_ch = rack.get('ai_output_channel')   # 1-based VSE channel
+                src_ch = rack.get('ai_source_channel')   # 1-based VSE channel
                 seq    = context.scene.sequence_editor
                 tracks = getattr(context.scene, "pb_sync_tracks", [])
 
@@ -6505,7 +6670,7 @@ def handle_ai_rack_click(hit, context):
                 else:
                     # No processed output yet — just toggle the source channel mute
                     # so the button still does something useful
-                    src_idx = rack.get('dnf_source_channel', 0)
+                    src_idx = rack.get('ai_source_channel', 0)
                     if src_idx and src_idx - 1 < len(tracks):
                         # Don't mute if no output exists yet
                         pass
@@ -6724,6 +6889,51 @@ def handle_ai_rack_click(hit, context):
             current = int(getattr(ai_racks[i], 'p5', 0.0))
             ai_racks[i].p5 = float(max(0, current + hit['dir']))
             print(f"[PIPER] rack {i} scroll → {int(ai_racks[i].p5)}")
+        return True
+
+    # "+ ADD VOICE" / "← BACK TO VOICES" toggle — flips browse mode for this
+    # rack's voice panel. Entering browse mode kicks off a catalog fetch
+    # (fetch_voice_catalog() itself no-ops if a fetch already succeeded, so
+    # this is safe to call on every toggle rather than tracking "have we
+    # already fetched" state separately here).
+    if zone == 'ai_piper_add_voice_toggle':
+        i = hit['ai_idx']
+        try:
+            from ui.racks.rack_piper import _browse_mode
+            now_browsing = not _browse_mode.get(i, False)
+            _browse_mode[i] = now_browsing
+            if now_browsing:
+                from core.ai_piper import fetch_voice_catalog
+                fetch_voice_catalog()
+            print(f"[PIPER] rack {i} voice browse → {now_browsing}")
+        except Exception as e:
+            print(f"[PIPER] add-voice toggle failed: {e}")
+        return True
+
+    # Catalog scroll arrows (browse mode) — separate scroll position from
+    # the installed-voice list's, kept in rack_piper's own dict rather than
+    # a rack property since it's purely a transient UI/browse concern.
+    if zone == 'ai_piper_catalog_scroll':
+        i = hit['ai_idx']
+        try:
+            from ui.racks.rack_piper import _browse_scroll
+            current = int(_browse_scroll.get(i, 0))
+            _browse_scroll[i] = max(0, current + hit['dir'])
+            print(f"[PIPER] rack {i} catalog scroll → {_browse_scroll[i]}")
+        except Exception as e:
+            print(f"[PIPER] catalog scroll failed: {e}")
+        return True
+
+    # Catalog entry click (browse mode) — start/retry a download. Already-
+    # installed or already-downloading entries are harmless no-ops inside
+    # download_voice() itself, so no need to duplicate that state check here.
+    if zone == 'ai_piper_catalog_click':
+        try:
+            from core.ai_piper import download_voice
+            download_voice(hit['voice_key'])
+            print(f"[PIPER] rack {hit['ai_idx']} download requested → {hit['voice_key']}")
+        except Exception as e:
+            print(f"[PIPER] voice download click failed: {e}")
         return True
 
     # Piper knob drag handled in interaction.py — consume here

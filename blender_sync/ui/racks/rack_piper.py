@@ -41,20 +41,25 @@ except ImportError:
     pass
 
 # ---------------------------------------------------------------------------
-# Colour palette — pink/magenta theme to distinguish from DNF red
+# Colour palette — pink/magenta theme to distinguish from DNF red.
+# Brightened (Sept 2026 pass) for a neon-glow look — Luke reported the
+# original values read as dim/washed-out against the dark panels, especially
+# _TEXT_DIM and _BORDER. Backgrounds (_BG/_PANEL) stay dark on purpose —
+# that's what makes the text/borders pop — everything drawn ON TOP of them
+# (text, box edges, selection states) got a real brightness bump.
 # ---------------------------------------------------------------------------
 _BG         = (0.05,  0.02,  0.04,  1.0)
-_BORDER     = (0.22,  0.06,  0.14,  1.0)
+_BORDER     = (0.42,  0.10,  0.24,  1.0)   # was (0.22,0.06,0.14) — box edges
 _PANEL      = (0.03,  0.01,  0.02,  1.0)
-_PANEL_SEL  = (0.12,  0.03,  0.07,  1.0)   # selected voice card bg
-_TEXT       = (0.85,  0.20,  0.45,  1.0)   # bright pink label
-_TEXT_DIM   = (0.38,  0.08,  0.18,  1.0)   # dim pink
-_TEXT_VOICE = (0.70,  0.16,  0.35,  1.0)   # voice name text
-_ACCENT     = (0.75,  0.12,  0.32,  1.0)   # borders, highlights
-_WAVE_COL   = (0.80,  0.25,  0.55)          # (r,g,b) no alpha — output wave
-_GREEN      = (0.05,  0.80,  0.30,  1.0)
-_GRID       = (0.18,  0.05,  0.10,  0.5)
-_CH_NUM_OFF = (0.55,  0.20,  0.32,  1.0)   # channel number text, unassigned state — brighter than the old (0.25,0.06,0.12) so it reads against the baked button art
+_PANEL_SEL  = (0.16,  0.04,  0.10,  1.0)   # selected voice card bg — was (0.12,0.03,0.07)
+_TEXT       = (1.00,  0.28,  0.60,  1.0)   # neon pink label — was (0.85,0.20,0.45)
+_TEXT_DIM   = (0.62,  0.16,  0.32,  1.0)   # "dim" text, still readable — was (0.38,0.08,0.18)
+_TEXT_VOICE = (0.95,  0.30,  0.55,  1.0)   # voice name text — was (0.70,0.16,0.35)
+_ACCENT     = (1.00,  0.22,  0.50,  1.0)   # borders, highlights — was (0.75,0.12,0.32)
+_WAVE_COL   = (1.00,  0.40,  0.75)          # (r,g,b) no alpha — was (0.80,0.25,0.55)
+_GREEN      = (0.20,  0.95,  0.45,  1.0)   # was (0.05,0.80,0.30)
+_GRID       = (0.30,  0.09,  0.18,  0.5)   # was (0.18,0.05,0.10,0.5)
+_CH_NUM_OFF = (0.75,  0.30,  0.48,  1.0)   # channel number text, unassigned state — was (0.55,0.20,0.32)
 
 RACK_RAIL_H = 32
 
@@ -92,6 +97,29 @@ PIPER_CL_BTN_W_SCALE   = 1.225    # CLEAR width multiplier
 # =============================================================================
 PIPER_VOICE_PANEL_X_OFFSET = 5.0
 PIPER_VOICE_PANEL_W_SCALE  = 0.98
+
+# "+ ADD VOICE" / "← BACK TO VOICES" button — unscaled px, down(-)/up(+).
+# It sits flush against the top of the voice panel at 0.0; there's a fair
+# amount of dead space already reserved below it (before the scroll arrows/
+# card list), so nudging this down a bit is safe without clipping anything.
+# Mirrored in Racks.py's hit_test_ai_racks() Piper block (_addy_p) so clicks
+# stay aligned with the art.
+PIPER_ADD_VOICE_BTN_Y_OFFSET = -6.0
+
+# ---------------------------------------------------------------------------
+# Voice panel browse mode — per-rack UI state (not persisted; purely a draw
+# concern, so it lives here rather than as a bpy.props field). "+ ADD VOICE"
+# swaps the same card-list area over to Piper's public voice catalog
+# (core/ai_piper.py: fetch_voice_catalog/download_voice) instead of the
+# installed-voices list; "← BACK" swaps it back. See hit_test_ai_racks()'s
+# PIPER_TTS block in Racks.py, which reads _browse_mode directly (same
+# pattern ui.mixer.interaction uses for _active_text_field) so a click
+# routed through there stays in sync with what's actually drawn here.
+# ---------------------------------------------------------------------------
+_browse_mode   = {}   # ai_idx -> bool
+_browse_scroll = {}   # ai_idx -> int (separate from the installed-voice
+                       # scroll in rack.p5, so switching modes doesn't
+                       # jump either list to a confusing position)
 
 # =============================================================================
 # KNOB TUNING
@@ -489,8 +517,18 @@ def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
 
     if status == "PROCESSING":
         g_bg  = (0.16, 0.04, 0.08, 1.0)
-        g_col = (0.80, 0.25, 0.50, 1.0)
+        g_col = (1.00, 0.35, 0.65, 1.0)   # was (0.80,0.25,0.50) — brighter neon pink
         g_lbl = "GENERATING…"
+    elif status == "ERROR":
+        # Previously ERROR rendered identically to READY — a failed click
+        # (no script text, missing voice models, piper.exe not found, a
+        # subprocess crash) was completely invisible in the UI, so a click
+        # that silently failed looked exactly like a click that did nothing.
+        # See rack.ai_error_msg (set alongside ai_status in core/ai_piper.py)
+        # for the actual reason, also always printed to the console.
+        g_bg  = (0.22, 0.03, 0.03, 1.0)
+        g_col = (1.00, 0.25, 0.20, 1.0)
+        g_lbl = "⚠ ERROR — RETRY"
     else:
         g_bg  = (0.14, 0.03, 0.07, 1.0)
         g_col = _TEXT
@@ -511,11 +549,15 @@ def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
     pv_y = _row_y_base + PIPER_PV_BTN_Y_OFFSET*scale
     if status == "PREVIEWING":
         pv_bg  = (0.12, 0.04, 0.08, 1.0)
-        pv_col = (0.80, 0.25, 0.50, 1.0)
+        pv_col = (1.00, 0.35, 0.65, 1.0)   # was (0.80,0.25,0.50)
         pv_lbl = "▶ …"
+    elif status == "ERROR":
+        pv_bg  = (0.18, 0.03, 0.03, 1.0)
+        pv_col = (1.00, 0.25, 0.20, 1.0)
+        pv_lbl = "⚠ ERROR"
     else:
         pv_bg  = (0.08, 0.02, 0.06, 1.0)
-        pv_col = (0.60, 0.15, 0.35, 1.0)
+        pv_col = (0.85, 0.28, 0.50, 1.0)   # was (0.60,0.15,0.35) — was too dim to read
         pv_lbl = "▶ PREVIEW"
     _draw_rect(pv_x, pv_y, pv_w, gen_h, pv_bg)
     pvvs = [(pv_x,pv_y),(pv_x+pv_w,pv_y),(pv_x+pv_w,pv_y+gen_h),
@@ -566,18 +608,181 @@ def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
     card_gap = 2*scale
     fs_vn    = max(1, int(8*scale))
     fs_vs    = max(1, int(7*scale))
+    no_fs    = max(1, int(7*scale))
 
-    # How many cards fit vertically (reserve space for label + scroll arrows)
-    arrow_h   = 14*scale
-    cards_area = vp_h - fs_lbl - 8*scale - arrow_h*2 - 4*scale
-    max_visible = max(1, int(cards_area / (card_h + card_gap)))
+    browsing = _browse_mode.get(ai_idx, False)
 
-    if voices:
+    # ── "+ ADD VOICE" / "← BACK TO VOICES" button — always the topmost
+    # element of this panel, in both modes. Click routed via Racks.py's
+    # 'ai_piper_add_voice_toggle' zone, which flips _browse_mode and (when
+    # entering browse mode) kicks off fetch_voice_catalog().
+    add_btn_h   = 14*scale
+    add_btn_gap = 3*scale
+    add_btn_x   = vp_x + 4*scale
+    add_btn_w   = vp_w - 8*scale
+    add_btn_y   = vp_y + vp_h - add_btn_h + PIPER_ADD_VOICE_BTN_Y_OFFSET*scale
+    btn_label   = "← BACK TO VOICES" if browsing else "+ ADD VOICE"
+    _draw_rect(add_btn_x, add_btn_y, add_btn_w, add_btn_h, (0.10, 0.03, 0.06, 1.0))
+    _abv = [(add_btn_x,add_btn_y),(add_btn_x+add_btn_w,add_btn_y),
+            (add_btn_x+add_btn_w,add_btn_y+add_btn_h),
+            (add_btn_x,add_btn_y+add_btn_h),(add_btn_x,add_btn_y)]
+    _abb = batch_for_shader(sh, "LINE_STRIP", {"pos": _abv})
+    sh.bind(); sh.uniform_float("color", _ACCENT); _abb.draw(sh)
+    fs_ab = max(1, int(7*scale))
+    tw_ab = _text_width(btn_label, fs_ab)
+    _draw_text(btn_label, add_btn_x+add_btn_w/2-tw_ab/2,
+               add_btn_y+add_btn_h/2-fs_ab/2, fs_ab, _ACCENT)
+
+    # How many cards fit vertically (reserve space for the add-voice button,
+    # label, and scroll arrows) — shared by both modes below.
+    arrow_h      = 14*scale
+    _top_reserve = add_btn_h + add_btn_gap + fs_lbl + 8*scale
+    cards_area   = vp_h - _top_reserve - arrow_h*2 - 4*scale
+    max_visible  = max(1, int(cards_area / (card_h + card_gap)))
+    arr_top_y    = vp_y + vp_h - _top_reserve - arrow_h
+
+    if browsing:
+        # ── CATALOG BROWSE MODE ─────────────────────────────────────────
+        try:
+            from core.ai_piper import (get_voice_catalog, get_catalog_status,
+                                        is_voice_installed, get_download_state)
+            catalog            = get_voice_catalog()
+            cat_status, cat_err = get_catalog_status()
+        except Exception as _ce:
+            catalog, cat_status, cat_err = [], "ERROR", str(_ce)
+
+        if cat_status == "LOADING":
+            _draw_text("Loading voice catalog…", vp_x+6*scale, vp_y+vp_h*0.5, no_fs, _TEXT_DIM)
+        elif cat_status == "BLOCKED":
+            _draw_text("Online access is disabled.", vp_x+6*scale, vp_y+vp_h*0.58,
+                       no_fs, (1.0, 0.35, 0.3, 1.0))
+            _draw_text("Enable it in Preferences >", vp_x+6*scale, vp_y+vp_h*0.48, no_fs, _TEXT_DIM)
+            _draw_text("Get Extensions > Allow Online Access.",
+                       vp_x+6*scale, vp_y+vp_h*0.40, no_fs, _TEXT_DIM)
+        elif cat_status == "ERROR":
+            _draw_text("Could not load catalog:", vp_x+6*scale, vp_y+vp_h*0.55,
+                       no_fs, (1.0, 0.35, 0.3, 1.0))
+            _draw_text((cat_err or "unknown error")[:44], vp_x+6*scale, vp_y+vp_h*0.45,
+                       no_fs, _TEXT_DIM)
+        elif not catalog:
+            _draw_text("Catalog is empty.", vp_x+6*scale, vp_y+vp_h*0.5, no_fs, _TEXT_DIM)
+        else:
+            n_cat   = len(catalog)
+            b_scroll = _browse_scroll.get(ai_idx, 0)
+            b_scroll = max(0, min(b_scroll, max(0, n_cat - max_visible)))
+            _browse_scroll[ai_idx] = b_scroll
+
+            # ▲ up arrow
+            sh.bind(); sh.uniform_float("color", _TEXT_DIM if b_scroll > 0 else _BORDER)
+            b_arr_up = [(vp_x + vp_w/2, arr_top_y+arrow_h-2*scale),
+                        (vp_x + vp_w/2 - 8*scale, arr_top_y+2*scale),
+                        (vp_x + vp_w/2 + 8*scale, arr_top_y+2*scale)]
+            batch_for_shader(sh, "TRIS", {"pos": b_arr_up}).draw(sh)
+
+            v_start_y = arr_top_y - card_gap
+            for slot in range(max_visible):
+                vi = b_scroll + slot
+                if vi >= n_cat:
+                    break
+                entry   = catalog[vi]
+                cy_card = v_start_y - slot*(card_h+card_gap) - card_h
+                if cy_card < vp_y + arrow_h + 2*scale:
+                    break
+
+                try:
+                    installed = is_voice_installed(entry['key'])
+                    dl_state  = get_download_state(entry['key'])
+                except Exception:
+                    installed, dl_state = False, None
+
+                downloading = bool(dl_state and dl_state.get('status') == 'DOWNLOADING')
+                is_error    = bool(dl_state and dl_state.get('status') == 'ERROR')
+
+                if installed:
+                    bg, bc, tc, status_txt = _PANEL_SEL, _GREEN, _GREEN, "✓ INSTALLED"
+                elif downloading:
+                    bg, bc, tc = _PANEL, _ACCENT, _ACCENT
+                    status_txt = f"DOWNLOADING {dl_state.get('pct', 0):.0f}%"
+                elif is_error:
+                    bg, bc, tc = _PANEL, (1.0, 0.25, 0.2, 1.0), (1.0, 0.4, 0.35, 1.0)
+                    status_txt = "ERROR"
+                else:
+                    bg, bc, tc = _PANEL, _BORDER, _TEXT_VOICE
+                    status_txt = ""
+
+                _draw_rect(vp_x+4*scale, cy_card, vp_w-8*scale, card_h, bg)
+                cvb = [(vp_x+4*scale,cy_card),(vp_x+vp_w-4*scale,cy_card),
+                       (vp_x+vp_w-4*scale,cy_card+card_h),
+                       (vp_x+4*scale,cy_card+card_h),(vp_x+4*scale,cy_card)]
+                cbb = batch_for_shader(sh, "LINE_STRIP", {"pos": cvb})
+                sh.bind(); sh.uniform_float("color", bc); cbb.draw(sh)
+
+                # A dedicated DOWNLOAD/RETRY button — NOT the whole card —
+                # is the only clickable target for starting a download.
+                # Luke flagged that "click anywhere on the card" made it too
+                # easy to accidentally start a download you didn't want and
+                # eat disk space; an explicit button fixes that. Installed/
+                # downloading entries get no button (nothing to click).
+                # Racks.py's hit_test_ai_racks() mirrors this exact rect.
+                show_dl_btn = not installed and not downloading
+                if show_dl_btn:
+                    dl_btn_w = min(50*scale, vp_w*0.34)
+                    dl_btn_h = min(card_h - 6*scale, 14*scale)
+                    dl_btn_x = vp_x + vp_w - 4*scale - dl_btn_w
+                    dl_btn_y = cy_card + (card_h - dl_btn_h) / 2
+                    dl_label = "RETRY" if is_error else "DOWNLOAD"
+                    dl_bg    = (0.22, 0.03, 0.03, 1.0) if is_error else (0.04, 0.16, 0.09, 1.0)
+                    dl_edge  = (1.0, 0.35, 0.3, 1.0)    if is_error else _GREEN
+                    _draw_rect(dl_btn_x, dl_btn_y, dl_btn_w, dl_btn_h, dl_bg)
+                    _dlv = [(dl_btn_x,dl_btn_y),(dl_btn_x+dl_btn_w,dl_btn_y),
+                            (dl_btn_x+dl_btn_w,dl_btn_y+dl_btn_h),
+                            (dl_btn_x,dl_btn_y+dl_btn_h),(dl_btn_x,dl_btn_y)]
+                    _dlb = batch_for_shader(sh, "LINE_STRIP", {"pos": _dlv})
+                    sh.bind(); sh.uniform_float("color", dl_edge); _dlb.draw(sh)
+                    fs_dl = max(1, int(6.5*scale))
+                    tw_dl = _text_width(dl_label, fs_dl)
+                    _draw_text(dl_label, dl_btn_x+dl_btn_w/2-tw_dl/2,
+                               dl_btn_y+dl_btn_h/2-fs_dl/2, fs_dl, dl_edge)
+                    name_w_max = dl_btn_x - (vp_x+8*scale) - 4*scale
+                else:
+                    name_w_max = vp_w - 16*scale
+
+                name_line = f"{entry.get('lang_name','')} — {entry.get('name','')} ({entry.get('quality','')})"
+                if show_dl_btn:
+                    # Keep the name from running under the DOWNLOAD/RETRY
+                    # button — trim to fit the space actually left for it.
+                    while len(name_line) > 4 and _text_width(name_line, fs_vn) > name_w_max:
+                        name_line = name_line[:-1]
+                    if name_line != f"{entry.get('lang_name','')} — {entry.get('name','')} ({entry.get('quality','')})":
+                        name_line = name_line[:-1] + "…"
+                _draw_text(name_line, vp_x+8*scale, cy_card+card_h-fs_vn-3*scale, fs_vn, tc)
+                size_mb  = (entry.get('onnx_size', 0) or 0) / (1024*1024)
+                sub_line = f"{size_mb:.0f} MB" + (f"   {status_txt}" if status_txt else "")
+                _draw_text(sub_line, vp_x+8*scale, cy_card+3*scale, fs_vs, _TEXT_DIM)
+
+            # ▼ down arrow
+            arr_bot_y = vp_y + 2*scale
+            can_scroll_down = (b_scroll + max_visible) < n_cat
+            sh.bind(); sh.uniform_float("color", _TEXT_DIM if can_scroll_down else _BORDER)
+            b_arr_dn = [(vp_x + vp_w/2, arr_bot_y+2*scale),
+                        (vp_x + vp_w/2 - 8*scale, arr_bot_y+arrow_h-2*scale),
+                        (vp_x + vp_w/2 + 8*scale, arr_bot_y+arrow_h-2*scale)]
+            batch_for_shader(sh, "TRIS", {"pos": b_arr_dn}).draw(sh)
+
+            if n_cat > max_visible:
+                pg_fs  = max(1, int(6*scale))
+                pg_txt = f"{b_scroll+1}-{min(b_scroll+max_visible, n_cat)} / {n_cat}"
+                pg_tw  = _text_width(pg_txt, pg_fs)
+                _draw_text(pg_txt, vp_x+vp_w/2-pg_tw/2, arr_bot_y+arrow_h+1*scale,
+                           pg_fs, _TEXT_DIM)
+
+    elif voices:
+        # ── INSTALLED VOICES (unchanged from before, just shifted down to
+        # make room for the add-voice button above) ─────────────────────
         n_voices     = len(voices)
         voice_scroll = max(0, min(voice_scroll, max(0, n_voices - max_visible)))
 
         # ▲ up arrow (scroll up)
-        arr_top_y = vp_y + vp_h - fs_lbl - 8*scale - arrow_h
         sh.bind(); sh.uniform_float("color", _TEXT_DIM if voice_scroll > 0 else _BORDER)
         arr_up = [(vp_x + vp_w/2, arr_top_y+arrow_h-2*scale),
                   (vp_x + vp_w/2 - 8*scale, arr_top_y+2*scale),
@@ -627,9 +832,9 @@ def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
             _draw_text(pg_txt, vp_x+vp_w/2-pg_tw/2, arr_bot_y+arrow_h+1*scale,
                        pg_fs, _TEXT_DIM)
     else:
-        no_fs = max(1, int(7*scale))
         _draw_text("No voices found in", vp_x+6*scale, vp_y+vp_h*0.6, no_fs, _TEXT_DIM)
         _draw_text("ai_engines/piper/voices/", vp_x+6*scale, vp_y+vp_h*0.45, no_fs, _TEXT_DIM)
+        _draw_text("Click + ADD VOICE above.", vp_x+6*scale, vp_y+vp_h*0.35, no_fs, _TEXT_DIM)
 
     # ── OUTPUT WAVEFORM ───────────────────────────────────────────────────────
     try:
