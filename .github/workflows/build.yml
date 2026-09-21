@@ -102,11 +102,25 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y portaudio19-dev
+          sudo apt-get install -y cmake libasound2-dev
           pip install pybind11
+
+      - name: Build static PortAudio
+        # Built from source instead of `apt install portaudio19-dev` so the
+        # end user never needs PortAudio installed on their own machine —
+        # it gets baked directly into hijacker_engine.so.
+        run: |
+          git clone --depth 1 https://github.com/PortAudio/portaudio.git /tmp/portaudio
+          cmake -S /tmp/portaudio -B /tmp/portaudio/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPA_BUILD_SHARED=OFF \
+            -DPA_BUILD_STATIC=ON \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          cmake --build /tmp/portaudio/build --config Release -j
+          find /tmp/portaudio/build -name "libportaudio.a"
 
       - name: Create audaspace stubs
         run: |
@@ -119,6 +133,8 @@ jobs:
           PY_INC=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
           PY_LIB=$(python -c "import sysconfig; print(sysconfig.get_config_var('LDLIBRARY'))")
           PY_LIBDIR=$(python -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+          PA_INC=/tmp/portaudio/include
+          PA_LIB=$(find /tmp/portaudio/build -name "libportaudio.a" | head -1)
 
           g++ -O2 -shared -fPIC -std=c++17 \
             -I include \
@@ -126,7 +142,7 @@ jobs:
             -I src/imgui \
             -I "$PY_INC" \
             -I "$PYBIND11_INC" \
-            -I /usr/include \
+            -I "$PA_INC" \
             src/wrapper.cpp \
             src/hijacker_processor.cpp \
             src/hijacker_audio_engine.cpp \
@@ -137,8 +153,16 @@ jobs:
             src/imgui/imgui_tables.cpp \
             -o blender_sync/hijacker_engine.so \
             -L"$PY_LIBDIR" -l:"$PY_LIB" \
-            -lportaudio \
-            -lpthread -ldl -lm
+            "$PA_LIB" \
+            -lasound -lpthread -ldl -lm
+
+      - name: Verify no PortAudio system dependency
+        run: |
+          ldd blender_sync/hijacker_engine.so
+          if ldd blender_sync/hijacker_engine.so | grep -qi "portaudio"; then
+            echo "ERROR: hijacker_engine.so still dynamically depends on PortAudio!"
+            exit 1
+          fi
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -162,10 +186,24 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install pybind11
+        run: pip install pybind11
+
+      - name: Build static PortAudio
+        # Built from source instead of `brew install portaudio` so end users
+        # never need Homebrew or PortAudio installed on their own Mac — it
+        # gets baked directly into hijacker_engine.so. This is what was
+        # missing before: the old brew-linked build only worked on machines
+        # that happened to have `brew install portaudio` already run.
         run: |
-          brew install portaudio
-          pip install pybind11
+          git clone --depth 1 https://github.com/PortAudio/portaudio.git /tmp/portaudio
+          cmake -S /tmp/portaudio -B /tmp/portaudio/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPA_BUILD_SHARED=OFF \
+            -DPA_BUILD_STATIC=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build /tmp/portaudio/build --config Release -j
+          find /tmp/portaudio/build -name "libportaudio.a"
 
       - name: Create audaspace stubs
         run: |
@@ -176,8 +214,8 @@ jobs:
         run: |
           PYBIND11_INC=$(python -c "import pybind11; print(pybind11.get_include())")
           PY_INC=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
-          PA_INC=$(brew --prefix portaudio)/include
-          PA_LIBDIR=$(brew --prefix portaudio)/lib
+          PA_INC=/tmp/portaudio/include
+          PA_LIB=$(find /tmp/portaudio/build -name "libportaudio.a" | head -1)
 
           g++ -O2 -shared -fPIC -std=c++17 \
             -undefined dynamic_lookup \
@@ -196,11 +234,20 @@ jobs:
             src/imgui/imgui_widgets.cpp \
             src/imgui/imgui_tables.cpp \
             -o blender_sync/hijacker_engine.so \
-            -L"$PA_LIBDIR" -lportaudio \
+            "$PA_LIB" \
             -framework CoreAudio \
             -framework AudioToolbox \
             -framework AudioUnit \
-            -framework CoreServices
+            -framework CoreServices \
+            -framework CoreFoundation
+
+      - name: Verify no Homebrew dependency
+        run: |
+          otool -L blender_sync/hijacker_engine.so
+          if otool -L blender_sync/hijacker_engine.so | grep -Eqi "homebrew|/usr/local/opt|/opt/homebrew"; then
+            echo "ERROR: hijacker_engine.so still depends on a Homebrew-installed library!"
+            exit 1
+          fi
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
