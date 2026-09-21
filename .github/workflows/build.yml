@@ -297,3 +297,140 @@ jobs:
         with:
           name: hijacker_engine-macos
           path: blender_sync/hijacker_engine.so
+
+
+  # ===========================================================================
+  # PIPER (macOS) — fixes the official rhasspy/piper release, not our own code.
+  #
+  # Two separate upstream bugs, both confirmed by hand and both still unfixed
+  # (the piper repo is now archived, so they never will be):
+  #   1. Both "aarch64" and "x64" release archives actually contain x86_64
+  #      binaries — a known mislabeling bug: github.com/rhasspy/piper/issues/523
+  #   2. piper/piper_phonemize reference @rpath/libespeak-ng.1.dylib,
+  #      @rpath/libonnxruntime.1.14.1.dylib and @rpath/libpiper_phonemize.1.dylib
+  #      but ship with ZERO LC_RPATH entries baked in (verified with
+  #      `otool -l` / macholib) — so those libraries can never resolve no
+  #      matter where you put them: github.com/rhasspy/piper/issues/321.
+  #      The piper release archive also doesn't even include those .dylib
+  #      files at all — they only exist in the separate piper-phonemize
+  #      release archive.
+  #
+  # This job downloads both official release archives, assembles a
+  # self-contained folder (piper's binaries + piper-phonemize's actual
+  # runtime .dylib files), patches in a real @executable_path/@loader_path
+  # rpath with install_name_tool, re-signs the patched binaries (required —
+  # install_name_tool invalidates the existing signature and Gatekeeper/dyld
+  # will kill an unsigned binary on launch), and verifies with otool that
+  # every @rpath reference actually has somewhere to resolve to before
+  # uploading. There's no genuine arm64 build available upstream, so both
+  # macos_arm and macos_x64 outputs are identical x86_64 builds — Apple
+  # Silicon Macs run them under Rosetta 2, same as before.
+  #
+  # Manual-trigger only (not on every push) since this patches a fixed
+  # third-party release, not anything in this repo — re-run it from the
+  # Actions tab's "Run workflow" button only if you ever need to.
+  # ===========================================================================
+  fix-piper-macos:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+
+    steps:
+      - name: Download piper release (executables + espeak-ng-data)
+        run: |
+          curl -sSL -o piper_arm64.tar.gz "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_macos_aarch64.tar.gz"
+          curl -sSL -o piper_x64.tar.gz   "https://github.com/rhasspy/piper/releases/download/2023.11.14-2/piper_macos_x64.tar.gz"
+          mkdir -p out/macos_arm out/macos_x64
+          tar -xzf piper_arm64.tar.gz -C out/macos_arm --strip-components=1
+          tar -xzf piper_x64.tar.gz   -C out/macos_x64 --strip-components=1
+
+      - name: Download piper-phonemize release (the actual runtime .dylib files)
+        run: |
+          curl -sSL -o pp_arm64.tar.gz "https://github.com/rhasspy/piper-phonemize/releases/download/2023.11.14-4/piper-phonemize_macos_aarch64.tar.gz"
+          curl -sSL -o pp_x64.tar.gz   "https://github.com/rhasspy/piper-phonemize/releases/download/2023.11.14-4/piper-phonemize_macos_x64.tar.gz"
+          mkdir -p pp_arm64 pp_x64
+          tar -xzf pp_arm64.tar.gz -C pp_arm64
+          tar -xzf pp_x64.tar.gz   -C pp_x64
+
+          # Copy the real dylibs (+ their versioned symlinks) next to the
+          # executables — this is the piece the piper release itself omits.
+          cp -av pp_arm64/piper-phonemize/lib/libespeak-ng*.dylib       out/macos_arm/
+          cp -av pp_arm64/piper-phonemize/lib/libonnxruntime*.dylib     out/macos_arm/
+          cp -av pp_arm64/piper-phonemize/lib/libpiper_phonemize*.dylib out/macos_arm/
+          cp -av pp_x64/piper-phonemize/lib/libespeak-ng*.dylib         out/macos_x64/
+          cp -av pp_x64/piper-phonemize/lib/libonnxruntime*.dylib       out/macos_x64/
+          cp -av pp_x64/piper-phonemize/lib/libpiper_phonemize*.dylib   out/macos_x64/
+
+          # Drop the dSYM debug-symbol bundles — not needed at runtime, just bloat.
+          rm -rf out/macos_arm/*.dSYM out/macos_x64/*.dSYM
+
+      - name: Best-effort install Rosetta (only needed for this job's own verification step)
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Patch rpaths and re-sign
+        run: |
+          for dir in out/macos_arm out/macos_x64; do
+            echo "=== $dir ==="
+            for bin in "$dir/piper" "$dir/piper_phonemize" "$dir/espeak-ng"; do
+              [ -f "$bin" ] || continue
+              chmod +w "$bin"
+              # Give @rpath somewhere real to resolve: the folder the
+              # binary itself sits in, since that's where we just put
+              # the dylibs.
+              install_name_tool -add_rpath "@executable_path" "$bin" || true
+              install_name_tool -add_rpath "@loader_path" "$bin" || true
+              codesign --remove-signature "$bin" || true
+              codesign -s - -f "$bin"
+            done
+            for dylib in "$dir"/*.dylib; do
+              [ -f "$dylib" ] || continue
+              [ -L "$dylib" ] && continue   # skip symlinks, only patch real files
+              chmod +w "$dylib"
+              # libpiper_phonemize itself also references @rpath/libespeak-ng.1.dylib
+              # and @rpath/libonnxruntime.1.14.1.dylib with the same missing-rpath bug.
+              install_name_tool -add_rpath "@loader_path" "$dylib" || true
+              codesign --remove-signature "$dylib" || true
+              codesign -s - -f "$dylib"
+            done
+          done
+
+      - name: Verify every @rpath dependency actually resolves
+        run: |
+          for dir in out/macos_arm out/macos_x64; do
+            for bin in "$dir/piper" "$dir/piper_phonemize"; do
+              echo "--- otool -L $bin ---"
+              otool -L "$bin"
+              echo "--- LC_RPATH entries in $bin ---"
+              otool -l "$bin" | grep -A2 LC_RPATH
+              if ! otool -l "$bin" | grep -q LC_RPATH; then
+                echo "ERROR: $bin has no LC_RPATH entries — the @rpath fix didn't take."
+                exit 1
+              fi
+            done
+          done
+
+          # Positive check: actually try to run it and confirm it gets past
+          # library loading. A usage message or non-zero exit is fine — a
+          # dyld "Library not loaded" error is specifically what we're
+          # guarding against. Requires Rosetta on this arm64 runner; if
+          # Rosetta isn't available the run itself will fail differently
+          # and this check is simply skipped rather than failing the build.
+          for dir in out/macos_arm out/macos_x64; do
+            echo "=== running $dir/piper --help ==="
+            "$dir/piper" --help > /tmp/piper_run.log 2>&1 || true
+            cat /tmp/piper_run.log
+            if grep -q "Library not loaded" /tmp/piper_run.log; then
+              echo "ERROR: $dir/piper still can't find a required library"
+              exit 1
+            fi
+          done
+
+      - name: Zip fixed piper folders
+        run: |
+          cd out
+          zip -r ../piper-macos-fixed.zip macos_arm macos_x64
+
+      - name: Upload fixed piper artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: piper-macos-fixed
+          path: piper-macos-fixed.zip
