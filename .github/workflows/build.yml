@@ -351,14 +351,20 @@ jobs:
           tar -xzf pp_arm64.tar.gz -C pp_arm64
           tar -xzf pp_x64.tar.gz   -C pp_x64
 
-          # Copy the real dylibs (+ their versioned symlinks) next to the
-          # executables — this is the piece the piper release itself omits.
-          cp -av pp_arm64/piper-phonemize/lib/libespeak-ng*.dylib       out/macos_arm/
-          cp -av pp_arm64/piper-phonemize/lib/libonnxruntime*.dylib     out/macos_arm/
-          cp -av pp_arm64/piper-phonemize/lib/libpiper_phonemize*.dylib out/macos_arm/
-          cp -av pp_x64/piper-phonemize/lib/libespeak-ng*.dylib         out/macos_x64/
-          cp -av pp_x64/piper-phonemize/lib/libonnxruntime*.dylib       out/macos_x64/
-          cp -av pp_x64/piper-phonemize/lib/libpiper_phonemize*.dylib   out/macos_x64/
+          # Copy the real dylibs next to the executables — this is the piece
+          # the piper release itself omits. -L dereferences the versioned
+          # symlinks (libespeak-ng.1.dylib -> libespeak-ng.1.52.0.1.dylib
+          # etc.) into real independent files rather than copying the
+          # symlinks themselves: this artifact gets downloaded on Windows,
+          # re-zipped, and unzipped on a Mac later, and POSIX symlinks
+          # don't reliably survive that round trip — better to just not
+          # depend on them at all.
+          cp -avL pp_arm64/piper-phonemize/lib/libespeak-ng*.dylib       out/macos_arm/
+          cp -avL pp_arm64/piper-phonemize/lib/libonnxruntime*.dylib     out/macos_arm/
+          cp -avL pp_arm64/piper-phonemize/lib/libpiper_phonemize*.dylib out/macos_arm/
+          cp -avL pp_x64/piper-phonemize/lib/libespeak-ng*.dylib         out/macos_x64/
+          cp -avL pp_x64/piper-phonemize/lib/libonnxruntime*.dylib       out/macos_x64/
+          cp -avL pp_x64/piper-phonemize/lib/libpiper_phonemize*.dylib   out/macos_x64/
 
           # Drop the dSYM debug-symbol bundles — not needed at runtime, just bloat.
           rm -rf out/macos_arm/*.dSYM out/macos_x64/*.dSYM
