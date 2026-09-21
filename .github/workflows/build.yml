@@ -114,13 +114,24 @@ jobs:
         # it gets baked directly into hijacker_engine.so.
         run: |
           git clone --depth 1 https://github.com/PortAudio/portaudio.git /tmp/portaudio
+          # PortAudio's CMakeLists.txt uses a single PA_BUILD_SHARED_LIBS
+          # switch (ON=shared/OFF=static) — NOT separate PA_BUILD_SHARED /
+          # PA_BUILD_STATIC flags. Those don't exist in this project, so
+          # CMake silently ignored them and built its default (shared)
+          # config the first time this ran — verified against the real
+          # CMakeLists.txt after the fact.
           cmake -S /tmp/portaudio -B /tmp/portaudio/build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPA_BUILD_SHARED=OFF \
-            -DPA_BUILD_STATIC=ON \
+            -DPA_BUILD_SHARED_LIBS=OFF \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           cmake --build /tmp/portaudio/build --config Release -j
-          find /tmp/portaudio/build -name "libportaudio.a"
+          PA_STATIC_LIB=$(find /tmp/portaudio/build -name "libportaudio.a" | head -1)
+          if [ -z "$PA_STATIC_LIB" ]; then
+            echo "ERROR: libportaudio.a was not produced — static build failed."
+            find /tmp/portaudio/build -name "libportaudio*"
+            exit 1
+          fi
+          echo "Built: $PA_STATIC_LIB"
 
       - name: Create audaspace stubs
         run: |
@@ -156,12 +167,22 @@ jobs:
             "$PA_LIB" \
             -lasound -lpthread -ldl -lm
 
-      - name: Verify no PortAudio system dependency
+      - name: Verify PortAudio is actually linked in (statically, not via system lib)
         run: |
           ldd blender_sync/hijacker_engine.so
           if ldd blender_sync/hijacker_engine.so | grep -qi "portaudio"; then
             echo "ERROR: hijacker_engine.so still dynamically depends on PortAudio!"
             exit 1
+          fi
+          # Positive check, not just absence-of-dependency: confirm
+          # PortAudio's own symbols actually made it into the binary. A
+          # bad/no-op static-lib build can otherwise "succeed" while
+          # silently producing a binary with no PortAudio code in it at all.
+          if ! nm -D blender_sync/hijacker_engine.so 2>/dev/null | grep -q Pa_Initialize; then
+            if ! nm blender_sync/hijacker_engine.so 2>/dev/null | grep -q Pa_Initialize; then
+              echo "ERROR: Pa_Initialize symbol not found in hijacker_engine.so — PortAudio wasn't actually linked in."
+              exit 1
+            fi
           fi
 
       - name: Upload Linux artifact
@@ -197,13 +218,25 @@ jobs:
         # that happened to have `brew install portaudio` already run.
         run: |
           git clone --depth 1 https://github.com/PortAudio/portaudio.git /tmp/portaudio
+          # PortAudio's CMakeLists.txt uses a single PA_BUILD_SHARED_LIBS
+          # switch (ON=shared/OFF=static) — NOT separate PA_BUILD_SHARED /
+          # PA_BUILD_STATIC flags. Those don't exist in this project, so
+          # CMake silently ignored them and built its default (shared)
+          # config the first time this ran — verified against the real
+          # CMakeLists.txt after the fact.
           cmake -S /tmp/portaudio -B /tmp/portaudio/build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DPA_BUILD_SHARED=OFF \
-            -DPA_BUILD_STATIC=ON \
+            -DPA_BUILD_SHARED_LIBS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DCMAKE_OSX_ARCHITECTURES=arm64
           cmake --build /tmp/portaudio/build --config Release -j
-          find /tmp/portaudio/build -name "libportaudio.a"
+          PA_STATIC_LIB=$(find /tmp/portaudio/build -name "libportaudio.a" | head -1)
+          if [ -z "$PA_STATIC_LIB" ]; then
+            echo "ERROR: libportaudio.a was not produced — static build failed."
+            find /tmp/portaudio/build -name "libportaudio*"
+            exit 1
+          fi
+          echo "Built: $PA_STATIC_LIB"
 
       - name: Create audaspace stubs
         run: |
@@ -241,11 +274,21 @@ jobs:
             -framework CoreServices \
             -framework CoreFoundation
 
-      - name: Verify no Homebrew dependency
+      - name: Verify PortAudio is actually linked in (statically, not via Homebrew)
         run: |
           otool -L blender_sync/hijacker_engine.so
           if otool -L blender_sync/hijacker_engine.so | grep -Eqi "homebrew|/usr/local/opt|/opt/homebrew"; then
             echo "ERROR: hijacker_engine.so still depends on a Homebrew-installed library!"
+            exit 1
+          fi
+          # Positive check, not just absence-of-dependency: confirm
+          # PortAudio's own symbols actually made it into the binary. A
+          # bad/no-op static-lib build can otherwise "succeed" (thanks to
+          # -undefined dynamic_lookup tolerating missing symbols at link
+          # time) while silently producing a binary with no PortAudio code
+          # in it at all — exactly what happened the first time this ran.
+          if ! nm blender_sync/hijacker_engine.so 2>/dev/null | grep -q Pa_Initialize; then
+            echo "ERROR: Pa_Initialize symbol not found in hijacker_engine.so — PortAudio wasn't actually linked in."
             exit 1
           fi
 
