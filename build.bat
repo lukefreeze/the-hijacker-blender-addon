@@ -18,8 +18,10 @@ set PA_INC=%DEPS%\portaudio\include
 set PA_LIB=%DEPS%\portaudio\lib\portaudio_static_x64.lib
 
 if not exist "%NATIVE_OUT%" mkdir "%NATIVE_OUT%"
+if not exist "%TOOL_DIR%\build" mkdir "%TOOL_DIR%\build"
 
 cl /O2 /LD /EHsc /std:c++17 ^
+    /Fo"%TOOL_DIR%\build\\" ^
     /I "%INC%" ^
     /I "%INC%\blender-4.5\extern\audaspace\include" ^
     /I "%INC%\blender-4.5\extern\audaspace\include\fx" ^

@@ -13,6 +13,8 @@ from core.constants import (
     METER_DECAY, PEAK_HOLD_TIME,
 )
 from core.engine import get_engine
+from core import vse_compat as _vse
+from core import perf_monitor as _perf_mod
 
 
 # Module-level meter state (read by ui/mixer/mixer_hud.py for drawing)
@@ -37,6 +39,11 @@ def _meter_timer():
         _engine_levels = [0.0] * MAX_CHANNELS
         return METER_POLL_INTERVAL
 
+    # Sustained-slow-redraw check — see core/perf_monitor.py. Cheap (just
+    # compares a couple of numbers most ticks), so it's fine to run on
+    # every meter-timer tick rather than needing its own timer.
+    _perf_mod.check_and_maybe_warn()
+
     try:
         scene = bpy.context.scene
         if not scene or not scene.sequence_editor:
@@ -52,7 +59,7 @@ def _meter_timer():
         # Only call sync once per detection — if len(tracks) still doesn't
         # match after sync, wait for next timer tick rather than looping.
         if scene.sequence_editor:
-            highest = max((s.channel for s in scene.sequence_editor.sequences_all
+            highest = max((s.channel for s in _vse.get_all_strips(scene.sequence_editor)
                            if s.type == "SOUND" and s.sound), default=0)
             needed  = max(DEFAULT_CHANNELS, ((highest + 8) // 9) * 9)
             if needed > len(tracks):

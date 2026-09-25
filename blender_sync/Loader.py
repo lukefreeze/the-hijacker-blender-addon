@@ -46,6 +46,7 @@ if _ADDON_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 from core.engine import get_engine, reset_engine, PEDALBOARD_AVAILABLE, HIJACKER_AVAILABLE
 from core.properties import register_properties, unregister_properties
+import core.perf_monitor as _perf_mod
 
 # Re-export constants that Racks.py imports from Loader
 from core.constants import FADER_TRACK_BOTTOM, NUMBOX_H, NUMBOX_Y_OFFSET
@@ -137,6 +138,7 @@ class VSE_OT_TogglePBGui(bpy.types.Operator):
             _set_hud('HUD_AREA_PTR', best_ptr)
             print(f"[TOGGLE] HUD area ptr={best_ptr} "
                   f"NODE_EDITOR WINDOW={best_w}x{best_h}")
+            _perf_mod.reset()
 
             # Auto-fit: scale + centre
             try:
@@ -319,6 +321,7 @@ def register():
         "core.meters",
         "core.constants",
         "core.properties",
+        "core.perf_monitor",
         "Racks",
         "ui.racks.rack_base",
         "ui.racks.rack_comp",
@@ -366,6 +369,7 @@ def register():
 
     register_properties()
     register_racks()
+    _perf_mod.register()
     for cls in classes:
         # Safely unregister first in case of hot-reload or double-registration
         try:
@@ -389,6 +393,7 @@ def unregister():
     _cancel_meter_timer()
     _pb_engine_disable()
     unregister_racks()
+    _perf_mod.unregister()
 
     if on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(on_load_post)

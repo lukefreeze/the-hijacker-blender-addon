@@ -33,6 +33,7 @@ from core.audio import (
     sync_vse_mute, sync_vse_solo,
 )
 from core.meters import _meter_timer
+from core import vse_compat as _vse
 
 def _get_racks_funcs():
     """Lazy import of Racks functions to avoid circular import at load time."""
@@ -116,6 +117,48 @@ active_fader_track = -1
 _last_click_time   = 0.0
 _last_click_track  = -1
 
+# ---------------------------------------------------------------------------
+# Anchor-based drag state
+# ---------------------------------------------------------------------------
+# Captured once, at the moment each drag begins (the button-press handler),
+# and used to recompute the dragged value fresh from that fixed reference
+# point on every subsequent MOUSEMOVE — instead of accumulating per-event
+# deltas (value += mouse_y - mouse_prev_y) the way this file used to.
+#
+# This is the same approach Blender's own native widgets use internally
+# (interface_handlers.c keeps a dragstartx/dragstarty anchor alongside the
+# previous-event position for exactly this reason). Incremental
+# accumulation is fragile: if any single MOUSEMOVE event's reported delta
+# is imperfect, that slice of motion is permanently lost from the running
+# total. Anchor-based recomputation only depends on the CURRENT event's
+# absolute mouse position — which is always correct, since the OS cursor
+# itself always visually tracks right — so it self-corrects every frame
+# instead of drifting or lagging behind the physical mouse. This was the
+# root cause of fader/pan/scrollbar drags tracking noticeably behind an
+# external mouse on macOS while feeling perfect via trackpad and while
+# Blender's own sliders felt perfect with the same mouse.
+_pan_anchor_mouse_x   = 0.0
+_pan_anchor_mouse_y   = 0.0
+_pan_anchor_scroll_x  = 0.0
+_pan_anchor_scroll_y  = 0.0
+
+_hdrag_anchor_mouse_x  = 0.0
+_hdrag_anchor_scroll_x = 0.0
+_vdrag_anchor_mouse_y  = 0.0
+_vdrag_anchor_scroll_y = 0.0
+
+_fader_anchor_mouse_y = 0.0
+_fader_anchor_value   = 0.0
+
+_knob_anchor_mouse_y = 0.0
+_knob_anchor_value   = 0.0
+
+_rack_knob_anchor_mouse_y = 0.0
+_rack_knob_anchor_value   = 0.0
+
+_ai_knob_anchor_mouse_y = 0.0
+_ai_knob_anchor_value   = 0.0
+
 class VSE_OT_SetFaderValue(bpy.types.Operator):
     bl_idname      = "vse.set_fader_value"
     bl_label       = "Set Fader Value"
@@ -169,7 +212,15 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                active_ai_knob, \
                _active_text_field, \
                is_dragging_h, is_dragging_v, is_dragging_text, \
-               _last_click_time, _last_click_track
+               _last_click_time, _last_click_track, \
+               _pan_anchor_mouse_x, _pan_anchor_mouse_y, \
+               _pan_anchor_scroll_x, _pan_anchor_scroll_y, \
+               _hdrag_anchor_mouse_x, _hdrag_anchor_scroll_x, \
+               _vdrag_anchor_mouse_y, _vdrag_anchor_scroll_y, \
+               _fader_anchor_mouse_y, _fader_anchor_value, \
+               _knob_anchor_mouse_y, _knob_anchor_value, \
+               _rack_knob_anchor_mouse_y, _rack_knob_anchor_value, \
+               _ai_knob_anchor_mouse_y, _ai_knob_anchor_value
 
         import ui.mixer.mixer_hud as _hud
         pb_ui_enabled = _hud.pb_ui_enabled
@@ -205,7 +256,22 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
         if not (is_inside or mid_drag or widget_drag):
             return {"PASS_THROUGH"}
 
+        if event.type == "RIGHTMOUSE":
+            # Hijacker fully repurposes this NODE_EDITOR area as its own
+            # canvas while enabled, so Blender's native right-click menu
+            # (the node "Add" search) has no meaning here — it only shows
+            # up as a confusing surprise when someone right-clicks the HUD
+            # by accident. Swallow it outright instead of letting it
+            # PASS_THROUGH to Blender's default keymap.
+            return {"RUNNING_MODAL"}
+
         if event.type == "MOUSEMOVE":
+            # Only used by the still-incremental zoom branch below now —
+            # every position-tracking drag (pan, scrollbars, fader, knobs)
+            # is anchor-based and reads event.mouse_x/y directly instead.
+            _dx = event.mouse_x - event.mouse_prev_x
+            _dy = event.mouse_y - event.mouse_prev_y
+
             if is_dragging_text and _active_text_field is not None:
                 try:
                     from ui.racks.rack_piper import cursor_index_from_xy
@@ -232,16 +298,17 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                 return {"RUNNING_MODAL"}
             if is_zooming:
                 old_s    = UI_SCALE
-                UI_SCALE = max(0.1, min(5.0, UI_SCALE +
-                               (event.mouse_x-event.mouse_prev_x)*0.01))
+                UI_SCALE = max(0.1, min(5.0, UI_SCALE + _dx*0.01))
                 r        = UI_SCALE/old_s
                 SCROLL_X = rx-(rx-SCROLL_X)*r
                 SCROLL_Y = ry_top-(ry_top-SCROLL_Y)*r
                 save_ui_state(); context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
             if is_panning:
-                SCROLL_X += (event.mouse_x-event.mouse_prev_x)*2
-                SCROLL_Y -= (event.mouse_y-event.mouse_prev_y)*2
+                # Anchor-based — see the module-level comment on the anchor
+                # state near the top of this file for why.
+                SCROLL_X = _pan_anchor_scroll_x + (event.mouse_x - _pan_anchor_mouse_x)*2
+                SCROLL_Y = _pan_anchor_scroll_y - (event.mouse_y - _pan_anchor_mouse_y)*2
                 save_ui_state(); context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
             if is_dragging_h:
@@ -249,25 +316,26 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                 # Horizontal: thumb=150px wide, range=5000 content px over (width-150) track px.
                 _h_track = max(1, region.width - 150)
                 _h_ratio = 5000.0 / _h_track
-                SCROLL_X -= (event.mouse_x - event.mouse_prev_x) * _h_ratio
+                SCROLL_X = _hdrag_anchor_scroll_x - (event.mouse_x - _hdrag_anchor_mouse_x) * _h_ratio
                 save_ui_state(); context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
             if is_dragging_v:
                 # Vertical: thumb=100px tall, range=2000 content px over (height-100) track px.
                 _v_track = max(1, region.height - 100)
                 _v_ratio = 2000.0 / _v_track
-                SCROLL_Y += (event.mouse_y - event.mouse_prev_y) * _v_ratio
+                SCROLL_Y = _vdrag_anchor_scroll_y + (event.mouse_y - _vdrag_anchor_mouse_y) * _v_ratio
                 save_ui_state(); context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
 
             if active_fader_track != -1:
                 tracks = context.scene.pb_sync_tracks
                 track  = tracks[active_fader_track]
-                delta  = (event.mouse_y-event.mouse_prev_y) / ((FADER_HEIGHT - 2*FADER_VISUAL_BOTTOM_PAD)*UI_SCALE)
+                delta  = (event.mouse_y - _fader_anchor_mouse_y) / (
+                    (FADER_HEIGHT - 2*FADER_VISUAL_BOTTOM_PAD)*UI_SCALE)
                 fader_delta = delta * (FADER_MAX - FADER_MIN)
                 old_fader   = track.volume
                 new_fader   = max(FADER_MIN, min(FADER_MAX,
-                                                  track.volume + fader_delta))
+                                                  _fader_anchor_value + fader_delta))
                 apply_fader_to_channel(active_fader_track, old_fader, new_fader)
                 track.volume = new_fader
                 # Force meter to recalculate immediately so the level updates
@@ -279,16 +347,17 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
 
             if active_knob_track != -1:
                 track = context.scene.pb_sync_tracks[active_knob_track]
-                delta = (event.mouse_y-event.mouse_prev_y)*0.005
+                delta = (event.mouse_y - _knob_anchor_mouse_y) * 0.005
                 if   active_knob_type == "GAIN":
                     old_gain = track.gain
-                    new_gain = max(GAIN_MIN, min(GAIN_MAX, track.gain + delta * (GAIN_MAX - GAIN_MIN)))
+                    new_gain = max(GAIN_MIN, min(GAIN_MAX,
+                                                  _knob_anchor_value + delta * (GAIN_MAX - GAIN_MIN)))
                     apply_gain_to_channel(active_knob_track, old_gain, new_gain)
                     track.gain = new_gain
                     _meter_timer._last_frame = None
                     _meter_timer()
                 elif active_knob_type == "PAN":
-                    track.pan = max(0.0, min(1.0, track.pan + delta))
+                    track.pan = max(0.0, min(1.0, _knob_anchor_value + delta))
                     if _engine_active():
                         try:
                             from core.engine import get_engine as _get_eng
@@ -298,13 +367,13 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                                 if _hj: _hj.set_pan(active_knob_track, track.pan)
                         except Exception: pass
                 elif active_knob_type == "HIGH":
-                    track.eq_high = max(-24.0, min(24.0, track.eq_high+delta*100))
+                    track.eq_high = max(-24.0, min(24.0, _knob_anchor_value+delta*100))
                     if _engine_active(): _pb_rebuild_eq(active_knob_track)
                 elif active_knob_type == "MID":
-                    track.eq_mid  = max(-24.0, min(24.0, track.eq_mid+delta*100))
+                    track.eq_mid  = max(-24.0, min(24.0, _knob_anchor_value+delta*100))
                     if _engine_active(): _pb_rebuild_eq(active_knob_track)
                 elif active_knob_type == "LOW":
-                    track.eq_low  = max(-24.0, min(24.0, track.eq_low+delta*100))
+                    track.eq_low  = max(-24.0, min(24.0, _knob_anchor_value+delta*100))
                     if _engine_active(): _pb_rebuild_eq(active_knob_track)
                 context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
@@ -315,7 +384,8 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                 if rack_idx < len(racks):
                     rack   = racks[rack_idx]
                     from Racks import EFFECT_PARAMS, set_rack_param
-                    delta  = (event.mouse_y - event.mouse_prev_y) * 0.004
+                    _rk_dy = event.mouse_y - _rack_knob_anchor_mouse_y
+                    delta  = _rk_dy * 0.004
                     if rack.effect_type == "COMP_MULTI":
                         if param_idx >= 16:
                             # Gain fader — larger delta so handle tracks mouse
@@ -323,27 +393,23 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                             rh_mb   = RACK_EXPANDED_H_MB * UI_SCALE
                             body_h  = rh_mb - RACK_RAIL_H * UI_SCALE
                             fdr_h   = max((body_h*0.52 - 8*UI_SCALE - 26*UI_SCALE - 26*UI_SCALE - 2*UI_SCALE), 40*UI_SCALE)
-                            fdr_delta = (event.mouse_y - event.mouse_prev_y) / max(fdr_h, 1)
-                            old_v = getattr(rack, f'p{param_idx}', 0.5)
-                            new_v = max(0.0, min(1.0, old_v + fdr_delta))
+                            fdr_delta = _rk_dy / max(fdr_h, 1)
+                            new_v = max(0.0, min(1.0, _rack_knob_anchor_value + fdr_delta))
                             set_rack_param(rack, param_idx, new_v)
                         else:
                             # Knobs — relative delta
-                            old_v = getattr(rack, f'p{param_idx}', 0.0)
-                            new_v = max(0.0, min(1.0, old_v + delta))
+                            new_v = max(0.0, min(1.0, _rack_knob_anchor_value + delta))
                             set_rack_param(rack, param_idx, new_v)
                     else:
                         if rack.effect_type == "EQ":
                             # EQ knobs: p0-p6=gain, p7-p13=freq, p14-p20=Q (7 bands)
                             # All stored 0-1 normalised, just clamp and set
-                            old_v = getattr(rack, f'p{param_idx}', 0.0)
-                            new_v = max(0.0, min(1.0, old_v + delta))
+                            new_v = max(0.0, min(1.0, _rack_knob_anchor_value + delta))
                             set_rack_param(rack, param_idx, new_v)
                         else:
                             params = EFFECT_PARAMS.get(rack.effect_type, [])
                             if param_idx < len(params):
-                                old_v = getattr(rack, f'p{param_idx}', 0.0)
-                                new_v = max(0.0, min(1.0, old_v + delta))
+                                new_v = max(0.0, min(1.0, _rack_knob_anchor_value + delta))
                                 set_rack_param(rack, param_idx, new_v)
                     # Update engine with new params — takes effect next buffer
                     if _engine_active():
@@ -367,9 +433,8 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                     if ai_idx < len(ai_racks):
                         rack_ai = ai_racks[ai_idx]
                         attr    = f'p{knob_idx}'
-                        delta   = (event.mouse_y - event.mouse_prev_y) * 0.005
-                        old_v   = getattr(rack_ai, attr, 0.5)
-                        new_v   = max(0.0, min(1.0, old_v + delta))
+                        delta   = (event.mouse_y - _ai_knob_anchor_mouse_y) * 0.005
+                        new_v   = max(0.0, min(1.0, _ai_knob_anchor_value + delta))
                         setattr(rack_ai, attr, new_v)
                         context.area.tag_redraw()
                 except Exception as _ae:
@@ -385,9 +450,15 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                     context.area.tag_redraw()
                     # Don't return — let the click be processed normally below
                 if ry < 14:   # horizontal scrollbar hit zone (8px track + margin)
-                    is_dragging_h = True; return {"RUNNING_MODAL"}
+                    is_dragging_h = True
+                    _hdrag_anchor_mouse_x  = event.mouse_x
+                    _hdrag_anchor_scroll_x = SCROLL_X
+                    return {"RUNNING_MODAL"}
                 if rx > region.width - 14:   # vertical scrollbar hit zone
-                    is_dragging_v = True; return {"RUNNING_MODAL"}
+                    is_dragging_v = True
+                    _vdrag_anchor_mouse_y  = event.mouse_y
+                    _vdrag_anchor_scroll_y = SCROLL_Y
+                    return {"RUNNING_MODAL"}
 
                 import time
                 now    = time.time()
@@ -433,13 +504,25 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                     eq_low_k   = eq_top_k - 2.5 * eq_sp_k
                     pan_ky_k   = eq_top_k - 175*UI_SCALE - 120*UI_SCALE + 120*UI_SCALE*0.55
                     if math.dist((rx,ry),(kx,base_y-100*UI_SCALE))<20*UI_SCALE:
-                        active_knob_track,active_knob_type=i,"GAIN"; return {"RUNNING_MODAL"}
+                        active_knob_track,active_knob_type=i,"GAIN"
+                        _knob_anchor_mouse_y = event.mouse_y
+                        _knob_anchor_value   = track.gain
+                        return {"RUNNING_MODAL"}
                     if math.dist((rx,ry),(kx,eq_high_k))<16*UI_SCALE:
-                        active_knob_track,active_knob_type=i,"HIGH"; return {"RUNNING_MODAL"}
+                        active_knob_track,active_knob_type=i,"HIGH"
+                        _knob_anchor_mouse_y = event.mouse_y
+                        _knob_anchor_value   = track.eq_high
+                        return {"RUNNING_MODAL"}
                     if math.dist((rx,ry),(kx,eq_mid_k))<16*UI_SCALE:
-                        active_knob_track,active_knob_type=i,"MID";  return {"RUNNING_MODAL"}
+                        active_knob_track,active_knob_type=i,"MID"
+                        _knob_anchor_mouse_y = event.mouse_y
+                        _knob_anchor_value   = track.eq_mid
+                        return {"RUNNING_MODAL"}
                     if math.dist((rx,ry),(kx,eq_low_k))<16*UI_SCALE:
-                        active_knob_track,active_knob_type=i,"LOW";  return {"RUNNING_MODAL"}
+                        active_knob_track,active_knob_type=i,"LOW"
+                        _knob_anchor_mouse_y = event.mouse_y
+                        _knob_anchor_value   = track.eq_low
+                        return {"RUNNING_MODAL"}
                     # Pan knob
                     if math.dist((rx,ry),(kx, pan_ky_k)) < 18*UI_SCALE:
                         # Double-click snaps pan to centre
@@ -453,7 +536,10 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                             return {"RUNNING_MODAL"}
                         _last_click_time  = now
                         _last_click_track = i
-                        active_knob_track,active_knob_type=i,"PAN"; return {"RUNNING_MODAL"}
+                        active_knob_track,active_knob_type=i,"PAN"
+                        _knob_anchor_mouse_y = event.mouse_y
+                        _knob_anchor_value   = track.pan
+                        return {"RUNNING_MODAL"}
 
                     # Fader track — checked BEFORE numbox so handle at
                     # bottom position is always reachable
@@ -472,6 +558,8 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                         _last_click_time  = now
                         _last_click_track = i
                         active_fader_track = i
+                        _fader_anchor_mouse_y = event.mouse_y
+                        _fader_anchor_value   = track.volume
                         return {"RUNNING_MODAL"}
 
                     # Number box — single click opens popup, double-click snaps to 1.0
@@ -540,6 +628,13 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                                             SCROLL_X, SCROLL_Y, UI_SCALE)
                 if rk_hit is not None:
                     active_rack_knob = rk_hit
+                    _rack_knob_anchor_mouse_y = event.mouse_y
+                    _rack_knob_anchor_value   = 0.0
+                    _rk_idx, _rk_param = rk_hit
+                    _rk_racks = getattr(context.scene, "pb_racks", [])
+                    if _rk_idx < len(_rk_racks):
+                        _rack_knob_anchor_value = getattr(
+                            _rk_racks[_rk_idx], f'p{_rk_param}', 0.0)
                     return {"RUNNING_MODAL"}
 
                 # Check rack clicks (below fader section)
@@ -642,6 +737,16 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                         ai_hit['region_w'] = region.width
                         if ai_hit.get('zone') in ('ai_piper_knob', 'ai_rvc_knob'):
                             active_ai_knob = (ai_hit['ai_idx'], ai_hit['knob_idx'])
+                            _ai_knob_anchor_mouse_y = event.mouse_y
+                            _ai_knob_anchor_value   = 0.5
+                            try:
+                                _ai_racks_p = getattr(context.scene, "pb_ai_racks", [])
+                                if ai_hit['ai_idx'] < len(_ai_racks_p):
+                                    _ai_knob_anchor_value = getattr(
+                                        _ai_racks_p[ai_hit['ai_idx']],
+                                        f"p{ai_hit['knob_idx']}", 0.5)
+                            except Exception:
+                                pass
                             return {"RUNNING_MODAL"}
                         if ai_hit.get('zone') == 'ai_piper_text':
                             # Arm drag-select — handle_ai_rack_click() below
@@ -678,6 +783,11 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
         if event.type == "MIDDLEMOUSE":
             if event.value == "PRESS":
                 is_zooming = event.ctrl; is_panning = not event.ctrl
+                if is_panning:
+                    _pan_anchor_mouse_x  = event.mouse_x
+                    _pan_anchor_mouse_y  = event.mouse_y
+                    _pan_anchor_scroll_x = SCROLL_X
+                    _pan_anchor_scroll_y = SCROLL_Y
             else:
                 is_zooming = is_panning = False; save_ui_state()
             return {"RUNNING_MODAL"}
@@ -993,7 +1103,7 @@ def _sync_tracks_to_vse(scene, reset_values=False):
     # Find the highest channel that has a sound strip (non-meta, top-level)
     highest_strip_channel = 0
     if scene.sequence_editor:
-        for s in scene.sequence_editor.sequences_all:
+        for s in _vse.get_all_strips(scene.sequence_editor):
             if s.type == "SOUND" and s.sound:
                 highest_strip_channel = max(highest_strip_channel, s.channel)
 
@@ -1007,7 +1117,7 @@ def _sync_tracks_to_vse(scene, reset_values=False):
         track = scene.pb_sync_tracks.add()
         track.volume = 1.0
         if scene.sequence_editor:
-            for s in scene.sequence_editor.sequences_all:
+            for s in _vse.get_all_strips(scene.sequence_editor):
                 if s.channel == (i + 1) and s.type == "SOUND":
                     track.mute = s.mute
                     break
@@ -1019,12 +1129,12 @@ def _sync_tracks_to_vse(scene, reset_values=False):
             track.gain   = 1.0
             track.eq_low = track.eq_mid = track.eq_high = 0.0
             if scene.sequence_editor:
-                for s in scene.sequence_editor.sequences_all:
+                for s in _vse.get_all_strips(scene.sequence_editor):
                     if s.channel == (i + 1) and s.type == "SOUND":
                         track.mute = s.mute
                         break
 
-    active = [s.channel for s in scene.sequence_editor.sequences_all
+    active = [s.channel for s in _vse.get_all_strips(scene.sequence_editor)
               if s.type == "SOUND" and s.sound] if scene.sequence_editor else []
     print(f"[TRACKS] {len(scene.pb_sync_tracks)} tracks "
           f"(default={DEFAULT_CHANNELS}, "
@@ -1038,7 +1148,7 @@ def _get_active_channel_count(scene):
         return 0
     return len(set(
         s.channel - 1
-        for s in scene.sequence_editor.sequences_all
+        for s in _vse.get_all_strips(scene.sequence_editor)
         if s.type == "SOUND" and s.sound
     ))
 

@@ -8,6 +8,7 @@
 import bpy
 import gpu
 import blf
+import time
 
 from ui.mixer.draw_utils import draw_rect, draw_rounded_rect
 from ui.mixer.channel_strip import (
@@ -21,6 +22,7 @@ from core.constants import (
     SB_H_RANGE, SB_V_RANGE,
 )
 import core.meters as _meters_mod  # import module not values — avoids stale refs after reload
+import core.perf_monitor as _perf_mod
 
 # ---------------------------------------------------------------------------
 # UI state — imported by interaction.py and Loader.py
@@ -116,6 +118,7 @@ def draw_callback_px(self, context) -> None:
         return
     width, height = region.width, region.height
 
+    _draw_start = time.perf_counter()
     try:
         gpu.state.blend_set("ALPHA")
 
@@ -280,6 +283,7 @@ def draw_callback_px(self, context) -> None:
             gpu.state.blend_set("NONE")
         except Exception:
             pass
+        _perf_mod.record_draw_time(time.perf_counter() - _draw_start)
 
 
 # ---------------------------------------------------------------------------
