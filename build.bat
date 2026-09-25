@@ -9,12 +9,15 @@ set SRC=%TOOL_DIR%\src
 set INC=%TOOL_DIR%\include
 set DEPS=%TOOL_DIR%\deps
 set OUT=%TOOL_DIR%\blender_sync
+set NATIVE_OUT=%OUT%\hijacker_native\win_amd64_py311
 
 REM PortAudio — download from https://www.portaudio.com/download.html
 REM Build as static lib and place portaudio_static_x64.lib in deps\portaudio\lib
 REM Place portaudio.h in deps\portaudio\include
 set PA_INC=%DEPS%\portaudio\include
 set PA_LIB=%DEPS%\portaudio\lib\portaudio_static_x64.lib
+
+if not exist "%NATIVE_OUT%" mkdir "%NATIVE_OUT%"
 
 cl /O2 /LD /EHsc /std:c++17 ^
     /I "%INC%" ^
@@ -39,7 +42,7 @@ cl /O2 /LD /EHsc /std:c++17 ^
     "%SRC%\imgui\imgui_widgets.cpp" ^
     "%SRC%\imgui\imgui_tables.cpp" ^
     /link ^
-    /OUT:"%OUT%\hijacker_engine.pyd" ^
+    /OUT:"%NATIVE_OUT%\hijacker_engine.pyd" ^
     /LIBPATH:"%DEPS%\python\libs" ^
     "%PA_LIB%" ^
     winmm.lib ^
@@ -48,4 +51,4 @@ cl /O2 /LD /EHsc /std:c++17 ^
     advapi32.lib
 
 echo.
-echo Build complete: %OUT%\hijacker_engine.pyd
+echo Build complete: %NATIVE_OUT%\hijacker_engine.pyd
