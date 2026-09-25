@@ -110,25 +110,32 @@ def _run_dep_check():
     global _dm_check_running
     ok = False
     try:
-        import subprocess, platform
-        from core.ai_python_finder import (
-            _win_python_paths, _mac_python_paths, _linux_python_paths)
-        sys_name = platform.system()
-        candidates = (_win_python_paths() if sys_name == "Windows"
-                      else _mac_python_paths() if sys_name == "Darwin"
-                      else _linux_python_paths())
-        for cmd in candidates:
-            try:
-                r = subprocess.run(
-                    cmd + ["-m", "pip", "show", "demucs"],
-                    capture_output=True, timeout=5)
-                if r.returncode == 0:
-                    ok = True
-                    break
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[DEMUCS] dep check error: {e}")
+        from core import ai_pydeps as _pydeps
+        if _pydeps.venv_has_pip_package("demucs"):
+            ok = True
+    except Exception:
+        pass
+    if not ok:
+        try:
+            import subprocess, platform
+            from core.ai_python_finder import (
+                _win_python_paths, _mac_python_paths, _linux_python_paths)
+            sys_name = platform.system()
+            candidates = (_win_python_paths() if sys_name == "Windows"
+                          else _mac_python_paths() if sys_name == "Darwin"
+                          else _linux_python_paths())
+            for cmd in candidates:
+                try:
+                    r = subprocess.run(
+                        cmd + ["-m", "pip", "show", "demucs"],
+                        capture_output=True, timeout=5)
+                    if r.returncode == 0:
+                        ok = True
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[DEMUCS] dep check error: {e}")
     _dm_dep_cache["ok"]       = ok
     _dm_dep_cache["checked"]  = True
     _dm_dep_cache["checking"] = False
@@ -217,29 +224,87 @@ def _draw_setup_warning(rx, ry, rw, rh, scale):
     _draw_text("Requires ffprobe accessible from Python. CUDA recommended for large files.",
                tx, ty, fs_s, _WARN_DIM)
 
-    btn_w = min(140 * scale, warn_w * 0.38)
+    # Install state — the button below doubles as progress/cancel/error
+    # display while core/ai_pydeps.py's background install runs.
+    try:
+        from core import ai_pydeps as _pydeps
+        _dm_lines, _dm_btn_lbl, _dm_kind = _pydeps.get_progress_display("demucs")
+    except Exception:
+        _dm_lines, _dm_btn_lbl, _dm_kind = [], "INSTALL AUTOMATICALLY  >", "idle"
+
+    _dm_status_y = cmd_y + 10 * scale
+    if _dm_kind == "busy":
+        for _i, _line in enumerate(_dm_lines):
+            _draw_text(_line, tx, _dm_status_y + _i * (fs_s + 3*scale), fs_s, _WARN_TEXT)
+        import time as _dm_time
+        _bar_w = warn_w - 28 * scale
+        _bar_h = max(3 * scale, 3)
+        _bar_x = tx
+        _bar_y = _dm_status_y + len(_dm_lines) * (fs_s + 3*scale) + 3*scale
+        _draw_rect(_bar_x, _bar_y, _bar_w, _bar_h, (0.02, 0.09, 0.03, 1.0))
+        _seg_w = _bar_w * 0.28
+        _t     = (_dm_time.time() * 0.35) % 1.0
+        _pos   = _t * (_bar_w + _seg_w) - _seg_w
+        _seg_x = max(_bar_x, min(_bar_x + _bar_w - _seg_w, _bar_x + _pos))
+        _draw_rect(_seg_x, _bar_y, min(_seg_w, _bar_x + _bar_w - _seg_x), _bar_h, _WARN_TEXT)
+    elif _dm_kind == "error" and _dm_lines:
+        _draw_text(_dm_lines[0], tx, _dm_status_y, fs_s, _WARN_TEXT)
+
+    btn_w = min(170 * scale, warn_w * 0.44)
     btn_h = max(16 * scale, fs_s + 8 * scale)
     btn_x = warn_x + warn_w - btn_w - 12 * scale
     btn_y = warn_y + 8 * scale
-    _draw_rect(btn_x, btn_y, btn_w, btn_h, (0.02, 0.08, 0.03, 1.0))
+    if _dm_kind == "error":
+        btn_bg, btn_edge = (0.10, 0.02, 0.02, 1.0), (1.0, 0.35, 0.3, 1.0)
+    elif _dm_kind == "busy":
+        btn_bg, btn_edge = (0.05, 0.06, 0.02, 1.0), _WARN_DIM
+    else:
+        btn_bg, btn_edge = (0.02, 0.08, 0.03, 1.0), _WARN_BORDER
+    lbl = _dm_btn_lbl
+    _draw_rect(btn_x, btn_y, btn_w, btn_h, btn_bg)
     bvs2 = [(btn_x, btn_y), (btn_x+btn_w, btn_y),
             (btn_x+btn_w, btn_y+btn_h), (btn_x, btn_y+btn_h), (btn_x, btn_y)]
     bb2 = batch_for_shader(sh, "LINE_STRIP", {"pos": bvs2})
-    sh.bind(); sh.uniform_float("color", _WARN_BORDER); bb2.draw(sh)
+    sh.bind(); sh.uniform_float("color", btn_edge); bb2.draw(sh)
     fs_btn = max(1, int(7 * scale))
-    lbl    = "OPEN SETUP GUIDE  >"
     tw_btn = _text_width(lbl, fs_btn)
     _draw_text(lbl, btn_x + btn_w/2 - tw_btn/2,
                btn_y + btn_h/2 - fs_btn/2, fs_btn, _WARN_TEXT)
+    if _dm_kind == "error" and _dm_lines:
+        _draw_text(_dm_lines[0][:70], tx, btn_y + btn_h + 4*scale,
+                    max(1, int(6*scale)), (1.0, 0.45, 0.4, 1.0))
     return btn_x, btn_y, btn_w, btn_h
+
+
+def _start_demucs_install():
+    """Kicks off the background auto-install and re-arms the dep-check
+    cache so the rack re-checks and flips out of the warning panel once
+    it finishes."""
+    from core import ai_pydeps as _pydeps
+
+    if _pydeps.is_installing("demucs"):
+        _pydeps.cancel_install("demucs")
+        return
+
+    def _on_done(success):
+        _dm_dep_cache["checked"] = False
+
+    _pydeps.start_install(
+        "demucs",
+        pip_specs=["demucs"],
+        check_module="demucs",
+        on_done=_on_done,
+        extra_pip_specs=["static-ffmpeg"],
+    )
 
 
 def _get_free_channels(exclude=None):
     try:
+        from core import vse_compat as _vse
         scene = bpy.context.scene
         if not scene or not scene.sequence_editor:
             return []
-        used = {s.channel for s in scene.sequence_editor.sequences_all
+        used = {s.channel for s in _vse.get_all_strips(scene.sequence_editor)
                 if s.type == "SOUND" and s.sound}
         if exclude:
             used.discard(exclude)

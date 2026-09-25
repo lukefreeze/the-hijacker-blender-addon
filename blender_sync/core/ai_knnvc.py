@@ -11,6 +11,8 @@ import threading
 import time
 import bpy
 
+from core import vse_compat as _vse
+
 _active_jobs    = {}
 _cancel_flags   = {}
 _pending_finish = {}
@@ -24,7 +26,13 @@ def _find_system_python():
         return _PYTHON_CMD
     try:
         from core.ai_python_finder import find_python_with as _fpw
-        pkg = "torch"
+        # Needs BOTH — unlike Whisper/VoiceFixer/Demucs, kNN-VC has no
+        # single wrapper module that transitively proves its whole
+        # dependency tree is present, so checking torch alone was a
+        # false-positive trap: any Python with torch but not torchaudio
+        # would pass this check, then fail as soon as processing actually
+        # started (torchaudio import error deep in the runner).
+        pkg = ["torch", "torchaudio"]
         cmd = _fpw(pkg)
         if cmd:
             _PYTHON_CMD = cmd
@@ -106,7 +114,7 @@ def _apply_finish(ai_idx, info):
 
                 place_frame = scene.frame_start
                 strip_name  = f"kNNVC_{ai_idx}_{int(time.time()) % 100000}"
-                seq.sequences.new_sound(
+                _vse.get_strips_collection(seq).new_sound(
                     name=strip_name,
                     filepath=persistent_path,
                     channel=target_ch,
@@ -315,7 +323,7 @@ def add_voice_from_timeline(ai_idx, context):
     trim_end_s   = None   # end time in seconds within the source file
     if seq:
         fps = scene.render.fps / scene.render.fps_base
-        for strip in seq.sequences_all:
+        for strip in _vse.get_all_strips(seq):
             if strip.channel == add_ch and hasattr(strip, "sound"):
                 src_wav = bpy.path.abspath(strip.sound.filepath)
                 # Calculate the trimmed region using VSE in/out points
@@ -435,7 +443,7 @@ def convert_knnvc(ai_idx, context, preview_only=False):
     seq     = scene.sequence_editor
     src_wav = None
     if seq:
-        for strip in seq.sequences_all:
+        for strip in _vse.get_all_strips(seq):
             if strip.channel == src_ch and hasattr(strip, "sound"):
                 src_wav = bpy.path.abspath(strip.sound.filepath)
                 break
@@ -478,9 +486,14 @@ def convert_knnvc(ai_idx, context, preview_only=False):
                 "--ref_secs", str(ref_secs),
                 "--patch",    patch_path,
             ]
+            try:
+                from core.ai_pydeps import get_model_env
+                run_env = get_model_env()
+            except Exception:
+                run_env = None
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8")
+                text=True, encoding="utf-8", env=run_env)
 
             for line in proc.stdout:
                 line = line.strip()

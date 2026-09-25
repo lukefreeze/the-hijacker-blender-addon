@@ -265,6 +265,7 @@ def _render_channel_to_numpy(channel_idx, start_frame, end_frame, scene,
     channels where different strips have different volumes.
     """
     import numpy as _np
+    from core import vse_compat as _vse
 
     fps         = scene.render.fps / scene.render.fps_base
     tl_start_s  = scene.frame_start / fps
@@ -283,7 +284,7 @@ def _render_channel_to_numpy(channel_idx, start_frame, end_frame, scene,
                        else scene.frame_end) / fps
 
         strips = sorted(
-            [s for s in scene.sequence_editor.sequences_all
+            [s for s in _vse.get_all_strips(scene.sequence_editor)
              if s.type == 'SOUND' and s.sound
              and (s.channel - 1) == channel_idx],
             key=lambda s: s.frame_final_end - s.frame_final_duration
@@ -609,6 +610,7 @@ def _finalise_render():
     """Called when all channels have been processed — write file and import."""
     global _mx_state, _mx_job
     import numpy as _np
+    from core import vse_compat as _vse
 
     job = _mx_job
 
@@ -653,7 +655,7 @@ def _finalise_render():
 
                 # Find original strips on this channel
                 orig_strips = [
-                    s for s in list(seq.sequences_all)
+                    s for s in list(_vse.get_all_strips(seq))
                     if s.type == 'SOUND' and (s.channel - 1) == ch_idx
                 ]
 
@@ -667,7 +669,7 @@ def _finalise_render():
                         seq.sequences.remove(s)
                 else:
                     # Find next free channel above this one
-                    used = {s.channel for s in seq.sequences_all}
+                    used = {s.channel for s in _vse.get_all_strips(seq)}
                     place_ch = ch_idx + 1
                     while place_ch in used:
                         place_ch += 1
@@ -676,7 +678,7 @@ def _finalise_render():
                     for s in orig_strips:
                         s.mute = True
 
-                seq.sequences.new_sound(
+                _vse.get_strips_collection(seq).new_sound(
                     name=f"ch{ch_idx+1}_baked",
                     filepath=fpath,
                     channel=place_ch,
@@ -689,14 +691,14 @@ def _finalise_render():
             _, out = job['baked_files'][0]
 
             # Determine target channel
-            used = {s.channel for s in seq.sequences_all}
+            used = {s.channel for s in _vse.get_all_strips(seq)}
             place_ch = max(used, default=0) + 1  # default: above all
 
             # Handle source channels
             mode   = import_mode
             tracks = getattr(scene, "pb_sync_tracks", [])
             for ch_idx in channels:
-                orig = [s for s in list(seq.sequences_all)
+                orig = [s for s in list(_vse.get_all_strips(seq))
                         if s.type == 'SOUND' and (s.channel - 1) == ch_idx]
                 if mode < 0.25:      # mute + place on free channel
                     for s in orig: s.mute = True
@@ -711,7 +713,7 @@ def _finalise_render():
                 elif mode > 0.75:    # remove + place on free channel
                     for s in orig: seq.sequences.remove(s)
 
-            seq.sequences.new_sound(
+            _vse.get_strips_collection(seq).new_sound(
                 name="mixdown",
                 filepath=out,
                 channel=place_ch,

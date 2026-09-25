@@ -206,6 +206,12 @@ def set_skin_dir(assets_dir: str, skin_name: str = "default") -> None:
         print(f"[SKIN] PNGs found: {found if found else 'NONE'}")
 
 
+def get_active_skin() -> str:
+    """Return the currently active skin name (e.g. 'default', 'packapunch').
+    Used by core/packapunch.py to decide which direction toggle() swaps."""
+    return _active_skin
+
+
 def get_texture(key: str):
     """Return a cached gpu.GPUTexture for key, or None if not available.
 
@@ -232,7 +238,31 @@ def get_texture(key: str):
     try:
         import bpy
         img = bpy.data.images.load(filepath, check_existing=True)
-        img.gl_load()
+        # Skin PNGs are pre-rendered UI chrome, not scene-referred color
+        # photography — they need to land on screen as literally the bytes
+        # in the file. Per Blender's own GPU color-management docs, an
+        # Image datablock drawn via the UI path is meant to round-trip
+        # (sRGB -> linear on upload, linear -> sRGB again on display) and
+        # cancel out to a no-op.
+        #
+        # CONFIRMED (not just theorized) against real Blender builds:
+        #   - 4.3 / 4.5: that round-trip completes correctly on its own —
+        #     skins render correctly with NO override needed.
+        #   - 5.2: only the upload-side half (sRGB -> linear) still runs;
+        #     the display-side re-encode back to sRGB is missing, which
+        #     showed up as flattened/dark skins losing shading detail.
+        # Marking the image 'Non-Color' skips the upload-side conversion
+        # entirely, which correctly cancels out 5.2's missing display-side
+        # half — but on 4.3/4.5, where BOTH halves already run correctly,
+        # doing that removes the first half of an otherwise-complete
+        # round-trip and leaves only the display-side re-encode, which
+        # blows the image out (confirmed: this was tried unconditionally
+        # first, fixed 5.2, blew out 4.5). So it must be gated to the
+        # Blender versions that actually need it rather than applied
+        # everywhere. Revisit this version cutoff if a future Blender
+        # release changes its UI color-management path again.
+        if bpy.app.version >= (5, 0, 0):
+            img.colorspace_settings.name = 'Non-Color'
         tex = gpu.texture.from_image(img)
         _texture_cache[key] = tex
         print(f"[SKIN] loaded '{key}' from {os.path.basename(filepath)}")

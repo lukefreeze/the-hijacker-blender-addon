@@ -18,7 +18,7 @@ bl_info = {
     "name":        "The Hijacker",
     "author":      "Luke Bareham",
     "version":     (0, 1, 0),
-    "blender":     (4, 5, 0),
+    "blender":     (4, 3, 0),
     "location":    "Video Sequence Editor > Sidebar > Hijacker",
     "description": "Professional audio mixing and AI processing for Blender's VSE",
     "category":    "Sequencer",

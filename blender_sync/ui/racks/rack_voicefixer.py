@@ -185,28 +185,34 @@ def _run_dep_check():
     global _vf_check_running
     found = False
     try:
-        from core.ai_python_finder import find_python_with as _fpw
-        # Use pip show instead of importing voicefixer directly — importing
-        # pulls in torch which takes 2-3s just for the import check.
-        import subprocess, platform
-        from core.ai_python_finder import (
-            _win_python_paths, _mac_python_paths, _linux_python_paths)
-        sys = platform.system()
-        candidates = (_win_python_paths() if sys == "Windows"
-                      else _mac_python_paths() if sys == "Darwin"
-                      else _linux_python_paths())
-        for cmd in candidates:
-            try:
-                r = subprocess.run(
-                    cmd + ["-m", "pip", "show", "voicefixer"],
-                    capture_output=True, timeout=5)
-                if r.returncode == 0:
-                    found = True
-                    break
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"[VOICEFIXER] dep check error: {e}")
+        from core import ai_pydeps as _pydeps
+        if _pydeps.venv_has_pip_package("voicefixer"):
+            found = True
+    except Exception:
+        pass
+    if not found:
+        try:
+            # Use pip show instead of importing voicefixer directly — importing
+            # pulls in torch which takes 2-3s just for the import check.
+            import subprocess, platform
+            from core.ai_python_finder import (
+                _win_python_paths, _mac_python_paths, _linux_python_paths)
+            sys = platform.system()
+            candidates = (_win_python_paths() if sys == "Windows"
+                          else _mac_python_paths() if sys == "Darwin"
+                          else _linux_python_paths())
+            for cmd in candidates:
+                try:
+                    r = subprocess.run(
+                        cmd + ["-m", "pip", "show", "voicefixer"],
+                        capture_output=True, timeout=5)
+                    if r.returncode == 0:
+                        found = True
+                        break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[VOICEFIXER] dep check error: {e}")
     _vf_dep_cache["ok"]       = found
     _vf_dep_cache["checked"]  = True
     _vf_dep_cache["checking"] = False
@@ -292,19 +298,70 @@ def _draw_setup_warning(rx, ry, rw, rh, scale, has_skin=False):
     ty -= lh
     _draw_text("Works on Windows, macOS (CPU/MPS) and Linux. CUDA recommended.", tx, ty, fs_s, _WARN_DIM)
 
-    btn_w = min(140*scale, warn_w*0.38)
+    try:
+        from core import ai_pydeps as _pydeps
+        _vf_lines, _vf_btn_lbl, _vf_kind = _pydeps.get_progress_display("voicefixer")
+    except Exception:
+        _vf_lines, _vf_btn_lbl, _vf_kind = [], "INSTALL AUTOMATICALLY  >", "idle"
+
+    _vf_status_y = cmd_y + 10 * scale
+    if _vf_kind == "busy":
+        for _i, _line in enumerate(_vf_lines):
+            _draw_text(_line, tx, _vf_status_y + _i * (fs_s + 3*scale), fs_s, _WARN_TEXT)
+        import time as _vf_time
+        _bar_w = warn_w - 28 * scale
+        _bar_h = max(3 * scale, 3)
+        _bar_x = tx
+        _bar_y = _vf_status_y + len(_vf_lines) * (fs_s + 3*scale) + 3*scale
+        _draw_rect(_bar_x, _bar_y, _bar_w, _bar_h, (0.0, 0.07, 0.10, 1.0))
+        _seg_w = _bar_w * 0.28
+        _t     = (_vf_time.time() * 0.35) % 1.0
+        _pos   = _t * (_bar_w + _seg_w) - _seg_w
+        _seg_x = max(_bar_x, min(_bar_x + _bar_w - _seg_w, _bar_x + _pos))
+        _draw_rect(_seg_x, _bar_y, min(_seg_w, _bar_x + _bar_w - _seg_x), _bar_h, _WARN_TEXT)
+    elif _vf_kind == "error" and _vf_lines:
+        _draw_text(_vf_lines[0], tx, _vf_status_y, fs_s, _WARN_TEXT)
+
+    btn_w = min(170*scale, warn_w*0.44)
     btn_h = max(16*scale, fs_s+8*scale)
     btn_x = warn_x + warn_w - btn_w - 12*scale
     btn_y = warn_y + 8*scale
-    _draw_rect(btn_x, btn_y, btn_w, btn_h, (0.04,0.08,0.12,1.0))
+    if _vf_kind == "error":
+        btn_bg, btn_edge = (0.10, 0.02, 0.02, 1.0), (1.0, 0.35, 0.3, 1.0)
+    elif _vf_kind == "busy":
+        btn_bg, btn_edge = (0.03, 0.06, 0.09, 1.0), _WARN_DIM
+    else:
+        btn_bg, btn_edge = (0.04,0.08,0.12,1.0), _WARN_BORDER
+    lbl = _vf_btn_lbl
+    _draw_rect(btn_x, btn_y, btn_w, btn_h, btn_bg)
     bvs2 = [(btn_x,btn_y),(btn_x+btn_w,btn_y),(btn_x+btn_w,btn_y+btn_h),(btn_x,btn_y+btn_h),(btn_x,btn_y)]
     bb2 = batch_for_shader(sh,"LINE_STRIP",{"pos":bvs2})
-    sh.bind(); sh.uniform_float("color",_WARN_BORDER); bb2.draw(sh)
+    sh.bind(); sh.uniform_float("color",btn_edge); bb2.draw(sh)
     fs_btn = max(1,int(7*scale))
-    lbl = "OPEN SETUP GUIDE  >"
     tw_btn = _text_width(lbl, fs_btn)
     _draw_text(lbl, btn_x+btn_w/2-tw_btn/2, btn_y+btn_h/2-fs_btn/2, fs_btn, _WARN_TEXT)
+    if _vf_kind == "error" and _vf_lines:
+        _draw_text(_vf_lines[0][:70], tx, btn_y + btn_h + 4*scale,
+                    max(1, int(6*scale)), (1.0, 0.45, 0.4, 1.0))
     return btn_x, btn_y, btn_w, btn_h
+
+
+def _start_voicefixer_install():
+    from core import ai_pydeps as _pydeps
+
+    if _pydeps.is_installing("voicefixer"):
+        _pydeps.cancel_install("voicefixer")
+        return
+
+    def _on_done(success):
+        _vf_dep_cache["checked"] = False
+
+    _pydeps.start_install(
+        "voicefixer",
+        pip_specs=["voicefixer"],
+        check_module="voicefixer",
+        on_done=_on_done,
+    )
 
 
 def _draw_voicefixer_body(rx, ry, rw, rh, rack, ai_idx, scale):

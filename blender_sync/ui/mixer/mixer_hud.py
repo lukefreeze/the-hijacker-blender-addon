@@ -79,6 +79,18 @@ def load_ui_state() -> None:
           f"enabled={pb_ui_enabled}")
 
 
+def packapunch_button_rect(width: float, height: float, ui_scale: float):
+    """Fixed top-right PACK-A-PUNCH trigger button — screen-space, anchored
+    to the visible canvas corner rather than scrolled content, so it's
+    always reachable regardless of pan/zoom. Shared by draw_callback_px()
+    and interaction.py's click hit test so they can never drift apart."""
+    bw = 150 * ui_scale
+    bh = 30  * ui_scale
+    bx = width  - bw - 10 * ui_scale
+    by = height - bh - 8  * ui_scale
+    return bx, by, bw, bh
+
+
 def compute_autofit(draw_w: float, draw_h: float):
     """Return (UI_SCALE, SCROLL_X, SCROLL_Y) to centre the mixer in the canvas."""
     fit_x   = draw_w / AUTOFIT_CONTENT_W
@@ -146,6 +158,31 @@ def draw_callback_px(self, context) -> None:
         blf.position(0, STRIP_LEFT_MARGIN*UI_SCALE + SCROLL_X,
                      height - 40*UI_SCALE - SCROLL_Y, 0)
         blf.draw(0, f"PEDALBOARD HUD | Scale: {round(UI_SCALE, 2)}")
+
+        # PACK-A-PUNCH trigger button — fixed top-right, screen-space
+        # (not SCROLL_X/Y-shifted, see packapunch_button_rect's docstring).
+        try:
+            from core import packapunch as _pap
+            _pbx, _pby, _pbw, _pbh = packapunch_button_rect(width, height, UI_SCALE)
+            if _pap.is_active():
+                _pap_bg, _pap_fg, _pap_lbl = (
+                    (0.35, 0.18, 0.05, 1.0), (1.0, 0.75, 0.3, 1.0), "PACK-A-PUNCHING…")
+            elif _pap.get_active_skin() == _pap.TARGET_SKIN:
+                _pap_bg, _pap_fg, _pap_lbl = (
+                    (0.10, 0.28, 0.12, 1.0), (0.55, 0.95, 0.55, 1.0), "REVERT SKIN")
+            else:
+                _pap_bg, _pap_fg, _pap_lbl = (
+                    (0.20, 0.06, 0.04, 1.0), (0.90, 0.45, 0.20, 1.0), "PACK-A-PUNCH!")
+            draw_rounded_rect(_pbx, _pby, _pbw, _pbh, 4*UI_SCALE, _pap_bg)
+            _fs_pap = max(1, int(9*UI_SCALE))
+            from ui.mixer.draw_utils import text_width as _tw_pap
+            blf.color(0, *_pap_fg)
+            blf.size(0, _fs_pap)
+            blf.position(0, _pbx + (_pbw - _tw_pap(_pap_lbl, _fs_pap))/2,
+                         _pby + _pbh/2 - _fs_pap/2, 0)
+            blf.draw(0, _pap_lbl)
+        except Exception as _pape:
+            print(f"[PACKAPUNCH] button draw error: {_pape}")
 
         tracks = getattr(bpy.context.scene, "pb_sync_tracks", [])
         base_y = height - 150*UI_SCALE - SCROLL_Y
@@ -274,6 +311,29 @@ def draw_callback_px(self, context) -> None:
 
         # Scrollbars
         _draw_scrollbars(width, height)
+
+        # PACK-A-PUNCH transition overlay — drawn last, on top of everything,
+        # covering the full canvas. The skin swap already happened the
+        # instant the transition started (see core/packapunch.py's module
+        # docstring) — this overlay is purely a visual mask that fades away
+        # via its OWN alpha channel to reveal the new skin underneath.
+        try:
+            from core import packapunch as _pap2
+            _pap_frame = _pap2.get_overlay_frame()
+            if _pap_frame is not None:
+                _pap_tex, _pap_progress = _pap_frame
+                if _pap_tex is not None:
+                    from ui.mixer.draw_utils import blit_texture as _bt_pap
+                    # blend="ALPHA" (not "ALPHA_PREMULT") — a PNG-sequence
+                    # transition exported from video/compositing software
+                    # is typically straight (non-premultiplied) alpha,
+                    # unlike the pre-baked premultiplied skin PNGs
+                    # elsewhere in this file. Switch this if Luke's export
+                    # pipeline produces premultiplied alpha instead.
+                    _bt_pap(_pap_tex, 0, 0, width, height,
+                            key="packapunch_frame", blend="ALPHA")
+        except Exception as _pape2:
+            print(f"[PACKAPUNCH] overlay draw error: {_pape2}")
 
     except Exception as e:
         print(f"DRAW ERROR: {e}")

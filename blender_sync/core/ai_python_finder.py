@@ -1,4 +1,4 @@
-"""
+r"""
 core/ai_python_finder.py
 ========================
 Shared utility for finding system Python with a required package.
@@ -97,10 +97,31 @@ def _linux_python_paths():
 def find_python_with(package, timeout=4):
     """Find a Python executable that has `package` importable.
 
+    `package` is normally one module name, but can also be a list/tuple of
+    module names that must ALL be importable in the same interpreter — for
+    a rack like kNN-VC that needs more than one top-level package (torch
+    AND torchaudio) with no single wrapper module that would transitively
+    prove both are present, checking just one of them is a false-positive
+    trap: a Python that happens to have torch but not torchaudio would
+    incorrectly be reported as "ready".
+
     Returns the command list (e.g. [r'C:\\...\\python.exe']) or None.
-    Tries OS-specific common install locations first so Blender's
-    subprocess environment doesn't need to inherit the user's PATH.
+    Checks the addon's own managed venv first (see core/ai_pydeps.py) —
+    populated by each rack's "INSTALL" button, so it needs nothing from the
+    user's own system Python setup. Falls back to scanning OS-specific
+    common install locations for anyone who already has a working system
+    Python with the package installed the old way.
     """
+    packages = [package] if isinstance(package, str) else list(package)
+
+    try:
+        from core.ai_pydeps import get_venv_python, venv_has_module
+        vp = get_venv_python()
+        if vp and all(venv_has_module(p, timeout=timeout) for p in packages):
+            return [vp]
+    except Exception:
+        pass
+
     sys = platform.system()
     if sys == "Windows":
         candidates = _win_python_paths()
@@ -118,10 +139,11 @@ def find_python_with(package, timeout=4):
             seen.add(key)
             deduped.append(cmd)
 
+    import_stmt = "; ".join(f"import {p}" for p in packages)
     for cmd in deduped:
         try:
             r = subprocess.run(
-                cmd + ["-c", f"import {package}; print('ok')"],
+                cmd + ["-c", f"{import_stmt}; print('ok')"],
                 capture_output=True, timeout=timeout,
                 text=True, encoding="utf-8",
             )

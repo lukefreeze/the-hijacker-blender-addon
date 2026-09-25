@@ -97,23 +97,17 @@ def _run_dep_check():
     global _dep_check_running
     ok = False
     try:
-        import subprocess, platform
-        from core.ai_python_finder import (
-            _win_python_paths, _mac_python_paths, _linux_python_paths)
-        sys_name = platform.system()
-        candidates = (_win_python_paths() if sys_name == "Windows"
-                      else _mac_python_paths() if sys_name == "Darwin"
-                      else _linux_python_paths())
-        for cmd in candidates:
-            try:
-                r = subprocess.run(
-                    cmd + ["-m", "pip", "show", "torch"],
-                    capture_output=True, timeout=5)
-                if r.returncode == 0:
-                    ok = True
-                    break
-            except Exception:
-                continue
+        # Single source of truth, shared with the actual runtime Python
+        # selection in core/ai_knnvc.py's _find_system_python() — both
+        # require torch AND torchaudio importable in the SAME interpreter.
+        # This used to check "torch" alone (via a separate pip-show-based
+        # scan duplicated here), which meant any Python on the system PATH
+        # with torch installed for some unrelated reason — common on a
+        # machine used for other AI/VFX tools — would make this rack claim
+        # "ready" even though torchaudio was never installed and
+        # processing would fail the moment it actually ran.
+        from core.ai_python_finder import find_python_with as _fpw
+        ok = _fpw(["torch", "torchaudio"]) is not None
     except Exception as e:
         print(f"[KNNVC] dep check error: {e}")
     _dep_cache["ok"]       = ok
@@ -223,19 +217,74 @@ def _draw_setup_warning(rx, ry, rw, rh, scale, has_skin=False):
     ty -= lh
     _draw_text("Use clean speech clips (10-30s) as reference. Avoid music/background noise.", tx, ty, fs_s, _WARN_DIM)
 
-    btn_w = min(140*scale, warn_w*0.38)
+    try:
+        from core import ai_pydeps as _pydeps
+        _rv_lines, _rv_btn_lbl, _rv_kind = _pydeps.get_progress_display("knnvc")
+    except Exception:
+        _rv_lines, _rv_btn_lbl, _rv_kind = [], "INSTALL AUTOMATICALLY  >", "idle"
+
+    _rv_status_y = cmd_y + 10 * scale
+    if _rv_kind == "busy":
+        for _i, _line in enumerate(_rv_lines):
+            _draw_text(_line, tx, _rv_status_y + _i * (fs_s + 3*scale), fs_s, _WARN_TEXT)
+        import time as _rv_time
+        _bar_w = warn_w - 28 * scale
+        _bar_h = max(3 * scale, 3)
+        _bar_x = tx
+        _bar_y = _rv_status_y + len(_rv_lines) * (fs_s + 3*scale) + 3*scale
+        _draw_rect(_bar_x, _bar_y, _bar_w, _bar_h, (0.10, 0.07, 0.0, 1.0))
+        _seg_w = _bar_w * 0.28
+        _t     = (_rv_time.time() * 0.35) % 1.0
+        _pos   = _t * (_bar_w + _seg_w) - _seg_w
+        _seg_x = max(_bar_x, min(_bar_x + _bar_w - _seg_w, _bar_x + _pos))
+        _draw_rect(_seg_x, _bar_y, min(_seg_w, _bar_x + _bar_w - _seg_x), _bar_h, _WARN_TEXT)
+    elif _rv_kind == "error" and _rv_lines:
+        _draw_text(_rv_lines[0], tx, _rv_status_y, fs_s, _WARN_TEXT)
+
+    btn_w = min(170*scale, warn_w*0.44)
     btn_h = max(16*scale, fs_s+8*scale)
     btn_x = warn_x + warn_w - btn_w - 12*scale
     btn_y = warn_y + 8*scale
-    _draw_rect(btn_x, btn_y, btn_w, btn_h, (0.10,0.06,0.00,1.0))
+    if _rv_kind == "error":
+        btn_bg, btn_edge = (0.10, 0.02, 0.02, 1.0), (1.0, 0.35, 0.3, 1.0)
+    elif _rv_kind == "busy":
+        btn_bg, btn_edge = (0.06, 0.04, 0.00, 1.0), _WARN_DIM
+    else:
+        btn_bg, btn_edge = (0.10,0.06,0.00,1.0), _WARN_BORDER
+    lbl = _rv_btn_lbl
+    _draw_rect(btn_x, btn_y, btn_w, btn_h, btn_bg)
     bvs2 = [(btn_x,btn_y),(btn_x+btn_w,btn_y),(btn_x+btn_w,btn_y+btn_h),(btn_x,btn_y+btn_h),(btn_x,btn_y)]
     bb2 = batch_for_shader(sh,"LINE_STRIP",{"pos":bvs2})
-    sh.bind(); sh.uniform_float("color",_WARN_BORDER); bb2.draw(sh)
+    sh.bind(); sh.uniform_float("color",btn_edge); bb2.draw(sh)
     fs_btn = max(1,int(7*scale))
-    lbl = "OPEN SETUP GUIDE  >"
     tw_btn = _text_width(lbl,fs_btn)
     _draw_text(lbl, btn_x+btn_w/2-tw_btn/2, btn_y+btn_h/2-fs_btn/2, fs_btn, _WARN_TEXT)
+    if _rv_kind == "error" and _rv_lines:
+        _draw_text(_rv_lines[0][:70], tx, btn_y + btn_h + 4*scale,
+                    max(1, int(6*scale)), (1.0, 0.45, 0.4, 1.0))
     return btn_x, btn_y, btn_w, btn_h
+
+
+def _start_knnvc_install():
+    """CPU-compatible torch/torchaudio wheels — works everywhere without
+    needing to detect the user's GPU/CUDA situation. The pinned-CUDA
+    command shown above stays as a reference for anyone who wants to
+    install a GPU build manually afterward."""
+    from core import ai_pydeps as _pydeps
+
+    if _pydeps.is_installing("knnvc"):
+        _pydeps.cancel_install("knnvc")
+        return
+
+    def _on_done(success):
+        _dep_cache["checked"] = False
+
+    _pydeps.start_install(
+        "knnvc",
+        pip_specs=["torch", "torchaudio"],
+        check_module=["torch", "torchaudio"],
+        on_done=_on_done,
+    )
 
 
 def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):

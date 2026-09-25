@@ -372,13 +372,72 @@ def _draw_warning(rx, ry, rw, rh, scale):
     ty -= lh
     _draw_text("Models download on first run (~150MB for base).", tx, ty, fs_s, _WARN_DIM)
 
-    dw = min(140 * scale, bw * 0.38); dh = max(16 * scale, fs_s + 8 * scale)
+    try:
+        from core import ai_pydeps as _pydeps
+        _wsp_lines, _wsp_btn_lbl, _wsp_kind = _pydeps.get_progress_display("whisper")
+    except Exception:
+        _wsp_lines, _wsp_btn_lbl, _wsp_kind = [], "INSTALL AUTOMATICALLY  >", "idle"
+
+    _wsp_status_y = cy2 + ch + 4 * scale
+    if _wsp_kind == "busy":
+        for _i, _line in enumerate(_wsp_lines):
+            _draw_text(_line, tx, _wsp_status_y + _i * (fs_s + 3*scale), fs_s, _WARN_TEXT)
+        # Animated activity bar — pip doesn't reliably report byte-level %
+        # progress when it isn't talking to a real terminal, so this shows
+        # "still working" rather than a fabricated percentage.
+        import time as _wsp_time
+        _bar_w = bw - 28 * scale
+        _bar_h = max(3 * scale, 3)
+        _bar_x = tx
+        _bar_y = _wsp_status_y + len(_wsp_lines) * (fs_s + 3*scale) + 3*scale
+        _r(_bar_x, _bar_y, _bar_w, _bar_h, (0.10, 0.07, 0.0, 1.0))
+        _seg_w = _bar_w * 0.28
+        _t     = (_wsp_time.time() * 0.35) % 1.0
+        _pos   = _t * (_bar_w + _seg_w) - _seg_w
+        _seg_x = max(_bar_x, min(_bar_x + _bar_w - _seg_w, _bar_x + _pos))
+        _r(_seg_x, _bar_y, min(_seg_w, _bar_x + _bar_w - _seg_x), _bar_h, _WARN_TEXT)
+    elif _wsp_kind == "error" and _wsp_lines:
+        _draw_text(_wsp_lines[0], tx, _wsp_status_y, fs_s, _WARN_TEXT)
+
+    dw = min(170 * scale, bw * 0.44); dh = max(16 * scale, fs_s + 8 * scale)
     dx2 = bx + bw - dw - 12 * scale; dy2 = by + 8 * scale
-    _r(dx2, dy2, dw, dh, (0.10, 0.06, 0.00, 1.0))
-    _box(dx2, dy2, dw, dh, _WARN_BORDER)
-    lbl = "DOCS  >"; tw_d = _text_width(lbl, fs_s)
+    if _wsp_kind == "error":
+        d_bg, d_edge = (0.10, 0.02, 0.02, 1.0), (1.0, 0.35, 0.3, 1.0)
+    elif _wsp_kind == "busy":
+        d_bg, d_edge = (0.06, 0.04, 0.00, 1.0), _WARN_DIM
+    else:
+        d_bg, d_edge = (0.10, 0.06, 0.00, 1.0), _WARN_BORDER
+    lbl = _wsp_btn_lbl
+    _r(dx2, dy2, dw, dh, d_bg)
+    _box(dx2, dy2, dw, dh, d_edge)
+    tw_d = _text_width(lbl, fs_s)
     _draw_text(lbl, dx2 + dw / 2 - tw_d / 2,
                dy2 + dh / 2 - fs_s / 2, fs_s, _WARN_TEXT)
+    if _wsp_kind == "error" and _wsp_lines:
+        _draw_text(_wsp_lines[0][:70], tx, dy2 + dh + 4*scale,
+                    max(1, int(6*scale)), (1.0, 0.45, 0.4, 1.0))
+    return dx2, dy2, dw, dh
+
+
+def _start_whisper_install():
+    from core import ai_pydeps as _pydeps
+
+    # The warning-panel button doubles as CANCEL while an install is
+    # already running (see _draw_warning's get_progress_display() call) —
+    # same button rect, same click handler, branch on current state here.
+    if _pydeps.is_installing("whisper"):
+        _pydeps.cancel_install("whisper")
+        return
+
+    def _on_done(success):
+        _dep_cache["checked"] = False
+
+    _pydeps.start_install(
+        "whisper",
+        pip_specs=["faster-whisper"],
+        check_module="faster_whisper",
+        on_done=_on_done,
+    )
 
 
 # ── Main draw ──────────────────────────────────────────────────────────────────
@@ -421,7 +480,10 @@ def _draw_whisper_body(rx, ry, rw, rh, rack, ai_idx, scale):
             return
         _r(rx, body_bot, rw, body_h, _BG)
         _box(rx, body_bot, rw, body_h, _BORDER)
-        _draw_warning(rx, body_bot, rw, body_h, scale)
+        try:
+            rack['wsp_setup_btn'] = _draw_warning(rx, body_bot, rw, body_h, scale)
+        except Exception:
+            _draw_warning(rx, body_bot, rw, body_h, scale)
         return
 
     get_system_fonts()   # kick off scan if not done

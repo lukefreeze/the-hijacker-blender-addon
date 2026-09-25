@@ -104,7 +104,20 @@ static HijackerEngine* get_engine() {
     return g_hijacker_engine;
 }
 
-PYBIND11_MODULE(hijacker_engine, m)
+// HIJACKER_MODULE_NAME lets a differently-named build (e.g.
+// hijacker_engine_bl5_2.pyd, compiled for a specific Blender version
+// per core/engine.py's naming convention) export the matching
+// PyInit_<name> symbol Python's import machinery looks for -- it
+// must match the .pyd's filename, not just the module's internal
+// name. build.bat doesn't define it, so it defaults to the original
+// "hijacker_engine" name and behaves exactly as before. A
+// version-specific build script defines it via /D on the command
+// line (see build_bl5_2.bat).
+#ifndef HIJACKER_MODULE_NAME
+#define HIJACKER_MODULE_NAME hijacker_engine
+#endif
+
+PYBIND11_MODULE(HIJACKER_MODULE_NAME, m)
 {
     m.doc() = "The Hijacker — audio engine for Blender";
 

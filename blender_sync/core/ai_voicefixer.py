@@ -22,6 +22,8 @@ import threading
 import time
 import bpy
 
+from core import vse_compat as _vse
+
 _active_jobs        = {}   # ai_idx -> Thread
 _cancel_flags       = {}   # ai_idx -> bool
 _pending_finish     = {}   # ai_idx -> info dict
@@ -224,7 +226,7 @@ def _apply_finish(ai_idx, info):
 
                 place_frame = info.get("strip_frame_start", scene.frame_current)
                 strip_name  = f"VF_{ai_idx}_{int(time.time()) % 100000}"
-                seq.sequences.new_sound(
+                _vse.get_strips_collection(seq).new_sound(
                     name=strip_name,
                     filepath=persistent_path,
                     channel=target_ch,
@@ -284,7 +286,7 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
             target_ch  = max(1, min(9, target_ch))
             place_frame = scene.frame_current
             strip_name  = f"VF_{ai_idx}_{int(time.time()) % 100000}"
-            seq.sequences.new_sound(
+            _vse.get_strips_collection(seq).new_sound(
                 name=strip_name, filepath=persistent_path,
                 channel=target_ch, frame_start=place_frame)
             rack.ai_status = "DONE"
@@ -318,7 +320,7 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
     seq    = scene.sequence_editor
     src_strip = None
     if seq:
-        for strip in seq.sequences_all:
+        for strip in _vse.get_all_strips(seq):
             if strip.channel == src_ch and hasattr(strip, "sound"):
                 src_strip = strip
                 break
@@ -356,7 +358,7 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
     # Mute all channels except the source, run mixdown at scene length,
     # then restore mutes. This exports exactly what's in the sequence.
     try:
-        seq_strips     = list(scene.sequence_editor.sequences_all) if scene.sequence_editor else []
+        seq_strips     = list(_vse.get_all_strips(scene.sequence_editor)) if scene.sequence_editor else []
         original_mutes = {}
         for s in seq_strips:
             if hasattr(s, 'mute'):
@@ -399,9 +401,14 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
                 "--output", output_wav,
                 "--mode",   str(mode),
             ]
+            try:
+                from core.ai_pydeps import get_model_env
+                run_env = get_model_env()
+            except Exception:
+                run_env = None
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8")
+                text=True, encoding="utf-8", env=run_env)
 
             for line in proc.stdout:
                 line = line.strip()

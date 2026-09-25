@@ -23,6 +23,8 @@ import json
 
 import bpy
 
+from core import vse_compat as _vse
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -813,7 +815,7 @@ def _place_output_in_vse(scene, ai_idx, output_wav, target_ch_idx, rack):
         if target_ch_idx is not None:
             target_ch = target_ch_idx + 1   # 1-based
         else:
-            used = {s.channel for s in seq.sequences_all}
+            used = {s.channel for s in _vse.get_all_strips(seq)}
             target_ch = 1
             while target_ch in used:
                 target_ch += 1
@@ -826,7 +828,7 @@ def _place_output_in_vse(scene, ai_idx, output_wav, target_ch_idx, rack):
         import time as _t
         strip_name = f"Piper_{ai_idx}_{int(_t.time()) % 100000}"
 
-        new_strip = seq.sequences.new_sound(
+        new_strip = _vse.get_strips_collection(seq).new_sound(
             name        = strip_name,
             filepath    = persistent_wav,
             channel     = target_ch,

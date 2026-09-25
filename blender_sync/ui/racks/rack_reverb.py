@@ -150,6 +150,7 @@ def _draw_reverb_body(rx, ry, rw, rh, rack, rack_idx, scale):
         try:
             import bpy as _bpy_rv
             from core.meters import _envelope_cache, get_envelope as _get_env_rv
+            from core import vse_compat as _vse
             assigned_rv = get_rack_channels(rack)
             if assigned_rv:
                 ch_rv   = list(assigned_rv)[0]
@@ -163,7 +164,7 @@ def _draw_reverb_body(rx, ry, rw, rh, rack, rack_idx, scale):
                     f_end   = f_start + N_WIN
 
                     strips_rv = [
-                        s for s in scene_rv.sequence_editor.sequences_all
+                        s for s in _vse.get_all_strips(scene_rv.sequence_editor)
                         if s.type == "SOUND" and s.sound
                         and (s.channel - 1) == ch_rv
                     ]

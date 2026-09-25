@@ -857,10 +857,11 @@ def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
     ch_s    = 18*scale
     ch_gap  = 3*scale
     ch_y    = ctrl_bot + 2*scale
+    from core import vse_compat as _vse
     scene_c = bpy.context.scene
     high_c  = 0
     if scene_c and scene_c.sequence_editor:
-        for _s in scene_c.sequence_editor.sequences_all:
+        for _s in _vse.get_all_strips(scene_c.sequence_editor):
             if _s.type == "SOUND" and _s.sound:
                 high_c = max(high_c, _s.channel - 1)
     num_ch = max(9, high_c + 1)

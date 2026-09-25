@@ -230,10 +230,11 @@ def _get_live_levels(rack):
 
 def _get_free_channels():
     try:
+        from core import vse_compat as _vse
         scene = bpy.context.scene
         if not scene or not scene.sequence_editor:
             return []
-        used = {s.channel for s in scene.sequence_editor.sequences_all
+        used = {s.channel for s in _vse.get_all_strips(scene.sequence_editor)
                 if s.type == "SOUND" and s.sound}
         return [ch for ch in range(1, 33) if ch not in used][:5]
     except Exception:

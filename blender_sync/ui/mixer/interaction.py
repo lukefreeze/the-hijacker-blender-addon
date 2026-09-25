@@ -449,6 +449,22 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                     _active_text_field = None
                     context.area.tag_redraw()
                     # Don't return — let the click be processed normally below
+                # PACK-A-PUNCH trigger button — fixed top-right, screen-space
+                # (shares its geometry function with mixer_hud.py's draw so
+                # the clickable area can never drift from what's drawn).
+                try:
+                    from ui.mixer.mixer_hud import packapunch_button_rect as _pap_rect
+                    _pbx, _pby, _pbw, _pbh = _pap_rect(region.width, region.height, UI_SCALE)
+                    if _pbx <= rx <= _pbx + _pbw and _pby <= ry <= _pby + _pbh:
+                        from core import packapunch as _pap
+                        if not _pap.is_active():
+                            _pap.toggle()
+                            _pb_push_undo("Hijacker: PACK-A-PUNCH triggered")
+                        context.area.tag_redraw()
+                        return {"RUNNING_MODAL"}
+                except Exception as _pape:
+                    print(f"[PACKAPUNCH] button click error: {_pape}")
+
                 if ry < 14:   # horizontal scrollbar hit zone (8px track + margin)
                     is_dragging_h = True
                     _hdrag_anchor_mouse_x  = event.mouse_x

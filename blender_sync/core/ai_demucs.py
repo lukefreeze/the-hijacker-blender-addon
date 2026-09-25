@@ -28,6 +28,8 @@ import threading
 import time
 import bpy
 
+from core import vse_compat as _vse
+
 _active_jobs    = {}
 _cancel_flags   = {}
 _pending_finish = {}
@@ -58,18 +60,20 @@ def _find_system_python():
     global _PYTHON_CMD
     if _PYTHON_CMD:
         return _PYTHON_CMD
-    for cmd in [["py", "-3.12"], ["py", "-3.11"], ["py", "-3.10"],
-                ["python"], ["python3"]]:
-        try:
-            r = subprocess.run(
-                cmd + ["-c", "import demucs; print('ok')"],
-                capture_output=True, timeout=6, text=True)
-            if r.returncode == 0 and "ok" in r.stdout:
-                _PYTHON_CMD = cmd
-                print(f"[DEMUCS] system Python: {' '.join(cmd)}")
-                return _PYTHON_CMD
-        except Exception:
-            continue
+    # Shared finder checks the addon's own managed venv first (see
+    # core/ai_pydeps.py — populated by the rack's INSTALL button), then
+    # falls back to scanning system Python locations. Replaces the old
+    # short hardcoded candidate list here with the same broader/consistent
+    # search every other AI rack already uses.
+    try:
+        from core.ai_python_finder import find_python_with as _fpw
+        cmd = _fpw("demucs")
+        if cmd:
+            _PYTHON_CMD = cmd
+            print(f"[DEMUCS] Python: {' '.join(cmd)}")
+            return _PYTHON_CMD
+    except Exception as e:
+        print(f"[DEMUCS] find_python_with error: {e}")
     return None
 
 
@@ -150,7 +154,7 @@ def _apply_finish(ai_idx, info):
             scene.sequence_editor_create()
             seq = scene.sequence_editor
 
-        used_channels = {s.channel for s in seq.sequences_all}
+        used_channels = {s.channel for s in _vse.get_all_strips(seq)}
 
         # Auto-assign channels sequentially from after source channel
         auto_start = src_ch_idx + 2  # 1-based VSE channel
@@ -174,7 +178,7 @@ def _apply_finish(ai_idx, info):
 
             strip_name = f"DEMUCS_{STEM_LABELS.get(stem, stem).upper()}_r{ai_idx}"
             try:
-                new_strip = seq.sequences.new_sound(
+                new_strip = _vse.get_strips_collection(seq).new_sound(
                     name=strip_name,
                     filepath=wav_path,
                     channel=target_ch,
@@ -203,7 +207,7 @@ def _apply_finish(ai_idx, info):
                 print(f"[DEMUCS] muted original ch{src_ch_idx + 1} (engine + VSE)")
             except Exception as _me:
                 # Fallback: at least set the VSE strip visual
-                for strip in seq.sequences_all:
+                for strip in _vse.get_all_strips(seq):
                     if (strip.type == "SOUND" and strip.sound and
                             strip.channel == src_ch_idx + 1):
                         strip.mute = True
@@ -269,7 +273,7 @@ def separate_demucs(ai_idx, context):
     seq = scene.sequence_editor
     src_strip = None
     if seq:
-        for strip in sorted(seq.sequences_all,
+        for strip in sorted(_vse.get_all_strips(seq),
                             key=lambda s: s.frame_final_start):
             if (strip.channel == src_ch_1based and
                     hasattr(strip, "sound") and strip.sound):
@@ -323,7 +327,7 @@ def separate_demucs(ai_idx, context):
         os.makedirs(out_dir, exist_ok=True)
 
     try:
-        seq_strips     = list(seq.sequences_all)
+        seq_strips     = list(_vse.get_all_strips(seq))
         original_mutes = {s.name: s.mute for s in seq_strips if hasattr(s, "mute")}
         for s in seq_strips:
             if hasattr(s, "mute"):
@@ -368,10 +372,33 @@ def separate_demucs(ai_idx, context):
     def _worker():
         stems_placed = {}
         try:
+            # Model cache redirect (TORCH_HOME etc.) — see ai_pydeps.py's
+            # "AI models directory" section. Built first so the ffmpeg PATH
+            # prepend below layers on top of it rather than replacing it.
+            try:
+                from core.ai_pydeps import get_model_env
+                run_env = get_model_env()
+            except Exception:
+                run_env = None
+
+            # If we're running on the addon's own managed venv, its
+            # imageio-ffmpeg-bundled binary needs to be on PATH — Demucs
+            # shells out to `ffmpeg`/`ffprobe` by name, it doesn't take a
+            # path directly. Falls back to whatever's already on PATH
+            # (e.g. a system ffmpeg install) if that package isn't there.
+            try:
+                from core.ai_pydeps import get_bundled_ffmpeg_dir
+                ffmpeg_dir = get_bundled_ffmpeg_dir()
+                if ffmpeg_dir:
+                    run_env = run_env if run_env is not None else dict(os.environ)
+                    run_env["PATH"] = ffmpeg_dir + os.pathsep + run_env.get("PATH", "")
+            except Exception:
+                pass
+
             proc = subprocess.Popen(
                 python_cmd + [runner_path, "--args", args_path],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8")
+                text=True, encoding="utf-8", env=run_env)
 
             for line in proc.stdout:
                 line = line.strip()

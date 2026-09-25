@@ -13,6 +13,7 @@ import time as _time
 import bpy
 
 from core.engine import get_engine
+from core import vse_compat as _vse
 
 
 # ---------------------------------------------------------------------------
@@ -52,7 +53,7 @@ def apply_fader_to_channel(channel_idx, old_fader, new_fader):
     if abs(new_fader - old_fader) < 1e-6: return
     old_fader = max(old_fader, 0.001)
     ratio = new_fader / old_fader
-    for strip in scene.sequence_editor.sequences_all:
+    for strip in _vse.get_all_strips(scene.sequence_editor):
         if strip.type != "SOUND": continue
         if (strip.channel - 1) != channel_idx: continue
         strip.volume = max(0.001, strip.volume * ratio)
@@ -66,7 +67,7 @@ def apply_gain_to_channel(channel_idx, old_gain, new_gain):
     if abs(new_gain - old_gain) < 1e-6: return
     old_gain = max(old_gain, 0.001)
     ratio = new_gain / old_gain
-    for strip in scene.sequence_editor.sequences_all:
+    for strip in _vse.get_all_strips(scene.sequence_editor):
         if strip.type != "SOUND": continue
         if (strip.channel - 1) != channel_idx: continue
         strip.volume = max(0.001, strip.volume * ratio)
@@ -599,7 +600,7 @@ def _hj_build_segment_playlist(channel_idx, scene):
     seq_end   = (scene.frame_end + 1) / fps
 
     strips = sorted(
-        [s for s in scene.sequence_editor.sequences_all
+        [s for s in _vse.get_all_strips(scene.sequence_editor)
          if s.type == "SOUND" and s.sound
          and (s.channel - 1) == channel_idx],
         key=lambda s: s.frame_final_start
@@ -789,7 +790,7 @@ def _hj_load_all_channels(scene):
     hj.clear_all_channels()
 
     channels = set()
-    for s in scene.sequence_editor.sequences_all:
+    for s in _vse.get_all_strips(scene.sequence_editor):
         if s.type == "SOUND" and s.sound:
             channels.add(s.channel - 1)
 
@@ -1175,32 +1176,29 @@ def _pb_recover_stuck_audio():
 
 
 def _pb_engine_enable():
-    """Disable Blender's audio, start Hijacker engine, register handlers."""
+    """Start Hijacker engine, take over Blender's audio, register handlers.
+
+    Order matters: we only disable Blender's own audio device *after*
+    confirming the Hijacker engine actually loaded and initialized. Previously
+    this disabled Blender's native audio unconditionally up front, so on a
+    machine where hijacker_engine fails to load (missing/incompatible build,
+    a missing native dependency, etc.) the user was left with no audio at
+    all instead of falling back to Blender's own device.
+    """
     global _pb_engine_active, _pb_original_device, _pb_eq_timer_registered
 
     if _pb_engine_active: return
 
-    # Disable Blender's audio device
-    try:
-        current_device = bpy.context.preferences.system.audio_device
-        if current_device and current_device != 'None':
-            _pb_original_device = current_device
-        else:
-            _pb_original_device = _pb_guess_audio_device()
-        bpy.context.preferences.system.audio_device = 'None'
-        print(f"[HIJACKER] Blender audio disabled (was '{current_device}', "
-              f"will restore to '{_pb_original_device}')")
-    except Exception as e:
-        print(f"[HIJACKER] could not disable Blender audio: {e}")
-
-    # Init Hijacker PortAudio engine
+    # Init Hijacker PortAudio engine first — don't touch Blender's own audio
+    # device until we know the replacement actually works.
     engine = get_engine()
+    ok = False
     if engine:
         try:
             sample_rate = 44100
             scene = bpy.context.scene
             if scene and scene.sequence_editor:
-                for strip in scene.sequence_editor.sequences_all:
+                for strip in _vse.get_all_strips(scene.sequence_editor):
                     if strip.type == "SOUND" and strip.sound:
                         try:
                             import aud as _aud_sr
@@ -1216,11 +1214,33 @@ def _pb_engine_enable():
             if ok:
                 print(f"[HIJACKER] audio engine active @ {sample_rate}Hz")
             else:
-                print("[HIJACKER] WARNING: engine_init failed — no audio output")
+                print("[HIJACKER] WARNING: engine_init failed — no audio output. "
+                      "Falling back to Blender's native audio.")
         except Exception as e:
-            print(f"[HIJACKER] engine_init error: {e}")
+            print(f"[HIJACKER] engine_init error: {e}. "
+                  f"Falling back to Blender's native audio.")
     else:
-        print("[HIJACKER] WARNING: hijacker_engine.pyd not found — compile with build.bat")
+        print("[HIJACKER] WARNING: hijacker_engine not found — compile with "
+              "build.bat (Windows) or build the .so (macOS/Linux). "
+              "Falling back to Blender's native audio.")
+
+    if not ok:
+        # Hijacker engine isn't available/working on this machine — leave
+        # Blender's own audio device untouched so the user still has sound.
+        return
+
+    # Disable Blender's audio device now that Hijacker is confirmed working
+    try:
+        current_device = bpy.context.preferences.system.audio_device
+        if current_device and current_device != 'None':
+            _pb_original_device = current_device
+        else:
+            _pb_original_device = _pb_guess_audio_device()
+        bpy.context.preferences.system.audio_device = 'None'
+        print(f"[HIJACKER] Blender audio disabled (was '{current_device}', "
+              f"will restore to '{_pb_original_device}')")
+    except Exception as e:
+        print(f"[HIJACKER] could not disable Blender audio: {e}")
 
     # Register Blender transport handlers
     if _pb_on_play_start not in bpy.app.handlers.animation_playback_pre:
@@ -1259,7 +1279,7 @@ def _pb_engine_disable():
         scene = bpy.context.scene
         if scene and scene.sequence_editor:
             tracks = getattr(scene, "pb_sync_tracks", [])
-            for strip in scene.sequence_editor.sequences_all:
+            for strip in _vse.get_all_strips(scene.sequence_editor):
                 if strip.type == "SOUND":
                     idx = strip.channel - 1
                     strip.mute = tracks[idx].mute if idx < len(tracks) else False
@@ -1353,7 +1373,7 @@ def sync_vse_mute(channel_idx, state):
     """Mute: update strip.mute (VSE appearance) and engine mute instantly."""
     scene = bpy.context.scene
     if not scene or not scene.sequence_editor: return
-    for strip in scene.sequence_editor.sequences_all:
+    for strip in _vse.get_all_strips(scene.sequence_editor):
         if strip.type == "SOUND" and (strip.channel - 1) == channel_idx:
             strip.mute = state
     # Update engine — takes effect next audio buffer (~5ms)
@@ -1373,7 +1393,7 @@ def sync_vse_solo(channel_idx, solo_state):
     soloed   = {i for i, t in enumerate(tracks) if t.solo}
     any_solo = len(soloed) > 0
 
-    for strip in scene.sequence_editor.sequences_all:
+    for strip in _vse.get_all_strips(scene.sequence_editor):
         if strip.type != "SOUND": continue
         idx        = strip.channel - 1
         strip.mute = (idx not in soloed) if any_solo else (
@@ -1385,7 +1405,7 @@ def sync_vse_solo(channel_idx, solo_state):
         hj = engine.get_engine()
         if hj:
             active_chs = set()
-            for strip in scene.sequence_editor.sequences_all:
+            for strip in _vse.get_all_strips(scene.sequence_editor):
                 if strip.type == "SOUND" and strip.sound:
                     active_chs.add(strip.channel - 1)
             for idx in active_chs:

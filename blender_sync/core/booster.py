@@ -23,6 +23,8 @@ import tempfile
 
 import bpy
 
+from core import vse_compat as _vse
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -65,7 +67,7 @@ def _extract_channel_wav(channel_idx, out_path):
     seq_end   = scene.frame_end   / fps
 
     strips = sorted(
-        [s for s in scene.sequence_editor.sequences_all
+        [s for s in _vse.get_all_strips(scene.sequence_editor)
          if s.type == "SOUND" and s.sound
          and (s.channel - 1) == channel_idx],
         key=lambda s: (s.frame_final_start
@@ -143,7 +145,7 @@ def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack):
         fps = scene.render.fps / scene.render.fps_base
 
         orig_strips = sorted(
-            [s for s in seq.sequences_all
+            [s for s in _vse.get_all_strips(seq)
              if s.type == "SOUND" and s.sound
              and (s.channel - 1) == ch_idx],
             key=lambda s: (s.frame_final_start
@@ -159,7 +161,7 @@ def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack):
         last_frame  = max(s.frame_final_end for s in orig_strips)
 
         # Find target channel — use rack's p2 setting (0 = auto-next-free)
-        used = {s.channel for s in seq.sequences_all}
+        used = {s.channel for s in _vse.get_all_strips(seq)}
         requested = int(getattr(rack, 'p2', 0))
         if requested > 0 and requested not in used:
             target_ch = requested
@@ -169,7 +171,7 @@ def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack):
             while target_ch in used:
                 target_ch += 1
 
-        new_strip = seq.sequences.new_sound(
+        new_strip = _vse.get_strips_collection(seq).new_sound(
             name        = f"BOOSTED_ch{ch_idx+1}_r{rack_idx}",
             filepath    = output_wav,
             channel     = target_ch,
@@ -310,7 +312,7 @@ def process_booster(rack_idx, context):
     # Build output path alongside original file
     try:
         seq = scene.sequence_editor
-        orig_strips = [s for s in seq.sequences_all
+        orig_strips = [s for s in _vse.get_all_strips(seq)
                        if s.type == "SOUND" and s.sound
                        and (s.channel - 1) == ch_idx]
         if orig_strips:

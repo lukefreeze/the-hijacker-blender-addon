@@ -89,6 +89,19 @@ _ai_popup_x       = 0.0
 _ai_popup_y       = 0.0
 _ai_popup_group_idx = 0   # which fader group the ADD AI RACK button belongs to
 
+# AI settings popup state — opened from a "⚙ Settings" row in the same
+# + ADD AI RACK selector (see AI_RACK_TYPES' __SETTINGS__ sentinel below).
+# Shares _ai_popup_x/_ai_popup_y as its anchor point since it opens from
+# the same button. Whisper/VoiceFixer/kNN-VC/Demucs share ONE managed
+# Python environment + models folder (core/ai_pydeps.py), so this is a
+# single global settings panel, not per-rack.
+_ai_settings_open       = False
+_ai_settings_confirm    = False   # armed by a first click on DELETE ALL
+_ai_settings_confirm_at = 0.0     # time.time() when armed — confirm expires after a few seconds
+_ai_settings_confirm_bytes = 0    # size frozen at arm-time, shown in the confirm label
+_ai_settings_result_msg    = ""   # transient feedback after a delete (trashed vs permanent)
+_ai_settings_result_at     = 0.0  # time.time() when that feedback was set — shown for a few seconds
+
 # ---------------------------------------------------------------------------
 # Rack dimensions (in unscaled pixels, multiplied by UI_SCALE at draw time)
 # ---------------------------------------------------------------------------
@@ -153,6 +166,12 @@ AI_RACK_TYPES = [
     ("RESEMBLE",      "VoiceFixer — Speech Restoration (Beta)"),
     ("WHISPER",       "Whisper — Speech to Text (Beta)"),
     ("DEMUCS",        "Demucs — Source Separation (Beta)"),
+    # Sentinel, not a real rack type — handled specially in
+    # handle_ai_rack_click() (opens the AI settings popup instead of
+    # creating a rack). Included in this list so it gets a free row in
+    # _draw_ai_add_popup()/hit_test_ai_racks() without duplicating their
+    # layout math.
+    ("__SETTINGS__",  "⚙  Settings"),
 ]
 
 EFFECT_PARAMS = {
@@ -3449,6 +3468,8 @@ def draw_racks(region_width, region_height, scroll_x, scroll_y, ui_scale):
     # AI rack popup (drawn on top of everything — not group-specific)
     if _ai_popup_open:
         _draw_ai_add_popup(_ai_popup_x, _ai_popup_y, ui_scale)
+    if _ai_settings_open:
+        _draw_ai_settings_popup(_ai_popup_x, _ai_popup_y, ui_scale)
 
     # Reorder dropdown (drawn on top of everything)
     if _reorder_open and _reorder_rack_idx >= 0:
@@ -5181,10 +5202,11 @@ def _draw_ai_rack_expanded(rx, ry, rw, rh, rack, ai_idx, scale):
     _ch_g_r   = 3*scale
     _avail_r  = _on_x_r - (name_draw_x + _text_width(aname.upper(), fs_name) + 8*scale) - 6*scale
     _mfit_r   = max(1, int(_avail_r / (_ch_s_r + _ch_g_r)))
+    from core import vse_compat as _vse
     _scene_r  = bpy.context.scene
     _high_r   = 0
     if _scene_r and _scene_r.sequence_editor:
-        for _sr in _scene_r.sequence_editor.sequences_all:
+        for _sr in _vse.get_all_strips(_scene_r.sequence_editor):
             if _sr.type == "SOUND" and _sr.sound:
                 _high_r = max(_high_r, _sr.channel - 1)
     _nch_r    = min(max(9, _high_r + 1), _mfit_r)
@@ -5536,6 +5558,120 @@ def _draw_ai_add_popup(px, py, scale):
                    fs_b, (0.75, 0.30, 0.20, 1.0))
 
 
+# Fixed row heights for the AI settings popup — shared between the draw
+# function below and its hit test in hit_test_ai_racks() so a click always
+# lands on the row it looks like it's over. Whisper/VoiceFixer/kNN-VC/
+# Demucs all install into and download models to this ONE shared folder
+# (see core/ai_pydeps.py), so this is a single global panel, not per-rack.
+_AI_SETTINGS_TITLE_H = 24
+_AI_SETTINGS_INFO_H  = 40
+_AI_SETTINGS_BTN_H   = 30
+_AI_SETTINGS_GAP     = 6
+
+
+def _draw_ai_settings_popup(px, py, scale):
+    """Draw the AI models settings popup — storage usage + open-folder +
+    delete-everything, for the one Python environment/models folder shared
+    by Whisper, VoiceFixer, kNN-VC and Demucs.
+
+    px, py = left edge, top of the popup (same anchor as _draw_ai_add_popup,
+    since this opens from the same button). Draws downward from py.
+    """
+    try:
+        from ui.mixer.draw_utils import (
+            draw_rect  as _draw_rect,
+            draw_text  as _draw_text,
+            text_width as _text_width,
+        )
+    except ImportError:
+        from ui.racks.rack_base import _draw_rect, _draw_text, _text_width
+
+    import time as _ast_time
+    from core import ai_pydeps as _pydeps
+
+    title_h = _AI_SETTINGS_TITLE_H * scale
+    info_h  = _AI_SETTINGS_INFO_H * scale
+    btn_h   = _AI_SETTINGS_BTN_H * scale
+    gap     = _AI_SETTINGS_GAP * scale
+    popup_w = 260 * scale
+    popup_h = title_h + info_h + 2*(btn_h + gap) + gap
+
+    popup_top = py
+    popup_bot = py - popup_h
+
+    _draw_rect(px + 3*scale, popup_bot - 3*scale, popup_w, popup_h,
+               (0.0, 0.0, 0.0, 0.5))
+    _draw_rect(px, popup_bot, popup_w, popup_h, (0.10, 0.06, 0.05, 1.0))
+    shader = _get_shader()
+    verts = [(px, popup_bot), (px+popup_w, popup_bot),
+             (px+popup_w, popup_top), (px, popup_top), (px, popup_bot)]
+    batch = batch_for_shader(shader, "LINE_STRIP", {"pos": verts})
+    shader.bind(); shader.uniform_float("color", (0.30, 0.12, 0.08, 1.0))
+    batch.draw(shader)
+
+    _draw_rect(px, popup_top - title_h, popup_w, title_h, (0.14, 0.08, 0.06, 1.0))
+    fs_t = max(1, int(9*scale))
+    _draw_text("AI MODELS & STORAGE", px + 8*scale,
+               popup_top - title_h + title_h/2 - fs_t/2,
+               fs_t, (0.70, 0.25, 0.16, 1.0))
+
+    # Storage usage — computed off the main thread (core/ai_pydeps.py's
+    # refresh_storage_usage(), kicked off when this popup was opened) since
+    # walking the whole folder tree can take a moment once torch etc. are
+    # installed. Shows "Calculating…" until that finishes.
+    #
+    # Right after a delete, this same two-line area briefly shows feedback
+    # instead — whether the data was moved to Recycle Bin/Trash (and so is
+    # still recoverable) or had to be permanently deleted — so the user
+    # isn't left guessing what actually happened.
+    info_top = popup_top - title_h
+    fs_i  = max(1, int(7*scale))
+    fs_i2 = max(1, int(11*scale))
+    result_active = bool(_ai_settings_result_msg) and (_ast_time.time() - _ai_settings_result_at) < 6.0
+    if result_active:
+        msg = _ai_settings_result_msg
+        wrap_at = 42
+        line1, line2 = msg[:wrap_at], msg[wrap_at:wrap_at * 2]
+        msg_color = (0.55, 0.85, 0.55, 1.0) if "Moved" in msg else (0.90, 0.65, 0.35, 1.0)
+        _draw_text(line1, px + 10*scale, info_top - fs_i - 6*scale, fs_i, msg_color)
+        _draw_text(line2, px + 10*scale, info_top - fs_i - fs_i2 - 12*scale, fs_i, msg_color)
+    else:
+        cache = _pydeps.get_storage_cache()
+        usage_txt = "Calculating…" if cache["status"] == "CALCULATING" else _pydeps.format_bytes(cache["bytes"])
+        _draw_text("Whisper / VoiceFixer / kNN-VC / Demucs use:",
+                   px + 10*scale, info_top - fs_i - 6*scale, fs_i, (0.75, 0.55, 0.45, 1.0))
+        _draw_text(usage_txt, px + 10*scale, info_top - fs_i - fs_i2 - 12*scale,
+                   fs_i2, (0.90, 0.75, 0.60, 1.0))
+
+    # Row 1 — open the shared folder in Explorer/Finder
+    btn1_top = info_top - info_h
+    btn1_bot = btn1_top - btn_h
+    _draw_rect(px + 4*scale, btn1_bot, popup_w - 8*scale, btn_h, (0.09, 0.05, 0.04, 1.0))
+    fs_b = max(1, int(7.5*scale))
+    _draw_text("OPEN MODELS FOLDER", px + 12*scale,
+               btn1_bot + btn_h/2 - fs_b/2, fs_b, (0.80, 0.55, 0.35, 1.0))
+
+    # Row 2 — delete everything, double-click-style confirm (mirrors the
+    # fader/pan double-click-to-reset convention used elsewhere in this
+    # file) since this deletes real downloaded data, not just a UI rack.
+    any_installing  = _pydeps.any_group_installing()
+    confirm_active  = _ai_settings_confirm and (_ast_time.time() - _ai_settings_confirm_at) < 4.0
+    btn2_top = btn1_bot - gap
+    btn2_bot = btn2_top - btn_h
+    if any_installing:
+        btn2_bg, btn2_fg = (0.07, 0.05, 0.05, 1.0), (0.45, 0.35, 0.35, 1.0)
+        lbl2 = "CAN'T DELETE — INSTALL RUNNING"
+    elif confirm_active:
+        btn2_bg, btn2_fg = (0.22, 0.03, 0.03, 1.0), (1.0, 0.4, 0.35, 1.0)
+        size_txt = _pydeps.format_bytes(_ai_settings_confirm_bytes)
+        lbl2 = f"CLICK AGAIN — DELETE {size_txt}?"
+    else:
+        btn2_bg, btn2_fg = (0.09, 0.05, 0.04, 1.0), (0.80, 0.30, 0.20, 1.0)
+        lbl2 = "DELETE ALL MODELS & PACKAGES"
+    _draw_rect(px + 4*scale, btn2_bot, popup_w - 8*scale, btn_h, btn2_bg)
+    _draw_text(lbl2, px + 12*scale, btn2_bot + btn_h/2 - fs_b/2, fs_b, btn2_fg)
+
+
 # ---------------------------------------------------------------------------
 # AI rack hit test and click handler
 # ---------------------------------------------------------------------------
@@ -5582,6 +5718,29 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
     # same value or the two disagree on where the popup actually is (this was
     # the "have to click the bottom edge of each row" bug). Mirrors how the
     # DSP add-rack popup already does it with _popup_x/_popup_y.
+    if _ai_settings_open:
+        title_h = _AI_SETTINGS_TITLE_H * scale
+        info_h  = _AI_SETTINGS_INFO_H * scale
+        btn_h   = _AI_SETTINGS_BTN_H * scale
+        gap     = _AI_SETTINGS_GAP * scale
+        popup_w = 260 * scale
+        popup_h = title_h + info_h + 2*(btn_h + gap) + gap
+        popup_top = _ai_popup_y
+        popup_bot = _ai_popup_y - popup_h
+        if (_ai_popup_x <= mouse_x <= _ai_popup_x + popup_w and
+                popup_bot <= mouse_y <= popup_top):
+            info_top = popup_top - title_h
+            btn1_top = info_top - info_h
+            btn1_bot = btn1_top - btn_h
+            if btn1_bot <= mouse_y <= btn1_top:
+                return {'zone': 'ai_settings_open_folder'}
+            btn2_top = btn1_bot - gap
+            btn2_bot = btn2_top - btn_h
+            if btn2_bot <= mouse_y <= btn2_top:
+                return {'zone': 'ai_settings_delete'}
+            return {'zone': 'ai_settings_noop'}
+        return {'zone': 'ai_settings_dismiss'}
+
     if _ai_popup_open:
         popup_w = 260 * scale
         title_h = 24 * scale
@@ -5860,18 +6019,19 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                 if _math_p.sqrt((mouse_x-_kx_p)**2+(mouse_y-_ky_p)**2) < _kr_p:
                     return {'zone': 'ai_piper_knob', 'ai_idx': ai_idx, 'knob_idx': _ki}
 
-        # RVC: setup guide button hit test
+        # RVC: install-dependencies button hit test
         if rack.ai_type == "RVC" and not rack.collapsed:
-            # Setup guide button (shown when PyTorch not found)
+            # Install button (shown when PyTorch not found)
             try:
                 btn_geom = rack.get('rvc_setup_btn')
                 if btn_geom:
                     bx,by,bw,bh = btn_geom
                     if bx <= mouse_x <= bx+bw and by <= mouse_y <= by+bh:
-                        return {'zone': 'ai_rvc_setup_guide', 'ai_idx': ai_idx}
+                        return {'zone': 'ai_rvc_install', 'ai_idx': ai_idx}
             except Exception:
                 pass
-            # Fallback warning button geometry
+            # Fallback warning button geometry (matches rack_knnvc.py's
+            # _draw_setup_warning button sizing)
             _rail_rvc = RACK_RAIL_H * scale
             _bb_rvc   = rack_y
             _bh_rvc   = rack_y + rack_h - _rail_rvc - _bb_rvc
@@ -5880,12 +6040,12 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             _wh_rvc   = min(_bh_rvc * 0.78, 160 * scale)
             _wx_rvc   = rack_x + (rw - _ww_rvc) / 2
             _wy_rvc   = _bb_rvc + (_bh_rvc - _wh_rvc) / 2
-            _bw_rvc   = min(140 * scale, _ww_rvc * 0.38)
+            _bw_rvc   = min(170 * scale, _ww_rvc * 0.44)
             _bh2_rvc  = max(16 * scale, 7 * scale + 8 * scale)
             _bx_rvc   = _wx_rvc + _ww_rvc - _bw_rvc - 12 * scale
             _by_rvc   = _wy_rvc + 8 * scale
             if _bx_rvc <= mouse_x <= _bx_rvc+_bw_rvc and _by_rvc <= mouse_y <= _by_rvc+_bh2_rvc:
-                return {'zone': 'ai_rvc_setup_guide', 'ai_idx': ai_idx}
+                return {'zone': 'ai_rvc_install', 'ai_idx': ai_idx}
 
             # ── RVC full hit test (mirrors rack_rvc.py geometry exactly) ──────
             _mg2          = 8 * scale
@@ -6100,13 +6260,35 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                     _row2_y_vf <= mouse_y <= _row2_y_vf+_row2_h_vf):
                 return {'zone': 'ai_vf_outch_inc', 'ai_idx': ai_idx}
 
-            # Setup guide button
+            # Install-dependencies button
             try:
                 btn_geom = rack.get('vf_setup_btn')
                 if btn_geom:
                     bx,by,bw,bh = btn_geom
                     if bx <= mouse_x <= bx+bw and by <= mouse_y <= by+bh:
-                        return {'zone': 'ai_resemble_setup_guide', 'ai_idx': ai_idx}
+                        return {'zone': 'ai_resemble_install', 'ai_idx': ai_idx}
+            except Exception:
+                pass
+
+        # Demucs: install-dependencies button hit test
+        if rack.ai_type == "DEMUCS" and not rack.collapsed:
+            try:
+                btn_geom = rack.get('dm_setup_btn')
+                if btn_geom:
+                    bx,by,bw,bh = btn_geom
+                    if bx <= mouse_x <= bx+bw and by <= mouse_y <= by+bh:
+                        return {'zone': 'ai_dm_install', 'ai_idx': ai_idx}
+            except Exception:
+                pass
+
+        # Whisper: install-dependencies button hit test
+        if rack.ai_type == "WHISPER" and not rack.collapsed:
+            try:
+                btn_geom = rack.get('wsp_setup_btn')
+                if btn_geom:
+                    bx,by,bw,bh = btn_geom
+                    if bx <= mouse_x <= bx+bw and by <= mouse_y <= by+bh:
+                        return {'zone': 'ai_wsp_install', 'ai_idx': ai_idx}
             except Exception:
                 pass
 
@@ -6132,10 +6314,11 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
         _ch_g_ht   = 3*scale
         _avail_ht  = _on_x_ht - (name_dx_ht + name_w_ht + 8*scale) - 6*scale
         _mfit_ht   = max(1, int(_avail_ht / (_ch_s_ht + _ch_g_ht)))
+        from core import vse_compat as _vse
         _scene_ht2 = bpy.context.scene
         _high_ht   = 0
         if _scene_ht2 and _scene_ht2.sequence_editor:
-            for _sh in _scene_ht2.sequence_editor.sequences_all:
+            for _sh in _vse.get_all_strips(_scene_ht2.sequence_editor):
                 if _sh.type == "SOUND" and _sh.sound:
                     _high_ht = max(_high_ht, _sh.channel - 1)
         _nch_ht    = min(max(9, _high_ht + 1), _mfit_ht)
@@ -6576,11 +6759,76 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
 def handle_ai_rack_click(hit, context):
     """Handle a click that hit an AI rack zone. Returns True if consumed."""
     global _ai_popup_open, _ai_popup_x, _ai_popup_y
+    global _ai_settings_open, _ai_settings_confirm, _ai_settings_confirm_at
+    global _ai_settings_confirm_bytes, _ai_settings_result_msg, _ai_settings_result_at
 
     zone = hit.get('zone')
 
     if zone == 'ai_popup_dismiss':
         _ai_popup_open = False
+        return True
+
+    if zone == 'ai_settings_dismiss':
+        _ai_settings_open    = False
+        _ai_settings_confirm = False
+        _ai_settings_result_msg = ""
+        return True
+
+    if zone == 'ai_settings_noop':
+        return True
+
+    if zone == 'ai_settings_open_folder':
+        try:
+            from core import ai_pydeps as _pydeps
+            _pydeps.open_models_folder()
+        except Exception as e:
+            print(f"[AI RACKS] could not open models folder: {e}")
+        return True
+
+    if zone == 'ai_settings_delete':
+        import time as _asd_time
+        try:
+            from core import ai_pydeps as _pydeps
+            if _pydeps.any_group_installing():
+                return True  # button is disabled in this state — no-op
+            confirm_active = (_ai_settings_confirm and
+                               (_asd_time.time() - _ai_settings_confirm_at) < 4.0)
+            if confirm_active:
+                result = _pydeps.delete_everything()
+                _ai_settings_confirm = False
+                size_txt = _pydeps.format_bytes(_ai_settings_confirm_bytes)
+                if result.get("ok"):
+                    if result.get("trashed"):
+                        _ai_settings_result_msg = (
+                            f"Moved {size_txt} to Recycle Bin/Trash — "
+                            f"restore it from there if this was a mistake."
+                        )
+                    else:
+                        _ai_settings_result_msg = (
+                            f"Deleted {size_txt} permanently — "
+                            f"Recycle Bin/Trash wasn't available on this machine."
+                        )
+                else:
+                    _ai_settings_result_msg = "Delete failed — check the system console."
+                _ai_settings_result_at = _asd_time.time()
+                _pydeps.refresh_storage_usage()
+            else:
+                # First click — arm confirmation, require a second click
+                # within 4s, and freeze the current size so the confirm
+                # button shows exactly what's about to go. Deletes real
+                # downloaded data (potentially several GB / hours of
+                # downloading), so this mirrors the double-click-to-confirm
+                # convention already used for fader/pan resets elsewhere
+                # in this file, rather than deleting on a single click —
+                # and the delete itself goes to Recycle Bin/Trash rather
+                # than a permanent filesystem delete wherever the OS
+                # supports it (see delete_everything() in ai_pydeps.py).
+                cache = _pydeps.get_storage_cache()
+                _ai_settings_confirm_bytes = cache.get("bytes", 0)
+                _ai_settings_confirm    = True
+                _ai_settings_confirm_at = _asd_time.time()
+        except Exception as e:
+            print(f"[AI RACKS] delete-all failed: {e}")
         return True
 
     if zone == 'ai_add_click':
@@ -6598,7 +6846,17 @@ def handle_ai_rack_click(hit, context):
         return True
 
     if zone == 'ai_add_type':
-        atype    = hit['ai_type']
+        atype = hit['ai_type']
+        if atype == "__SETTINGS__":
+            _ai_popup_open       = False
+            _ai_settings_open    = True
+            _ai_settings_confirm = False
+            try:
+                from core import ai_pydeps as _pydeps
+                _pydeps.refresh_storage_usage()
+            except Exception as e:
+                print(f"[AI RACKS] storage usage refresh failed: {e}")
+            return True
         ai_racks = context.scene.pb_ai_racks
         new_rack = ai_racks.add()
         new_rack.ai_type   = atype
@@ -6631,6 +6889,7 @@ def handle_ai_rack_click(hit, context):
             # Left in place (renamed from the old dnf_*/DeepFilterNet-era
             # names) as the intended hook for whichever rack wires it up.
             try:
+                from core import vse_compat as _vse
                 out_ch = rack.get('ai_output_channel')   # 1-based VSE channel
                 src_ch = rack.get('ai_source_channel')   # 1-based VSE channel
                 seq    = context.scene.sequence_editor
@@ -6642,7 +6901,7 @@ def handle_ai_rack_click(hit, context):
                     out_idx = out_ch - 1
 
                     # Update VSE strip.mute for visual correctness
-                    for s in seq.sequences_all:
+                    for s in _vse.get_all_strips(seq):
                         if s.type == "SOUND":
                             if s.channel == src_ch:
                                 s.mute = rack.enabled       # mute original when rack ON
@@ -6996,6 +7255,7 @@ def handle_ai_rack_click(hit, context):
                         print(f"[KNNVC] WARNING: persist failed: {_pe}")
                     # Place on timeline
                     print(f"[KNNVC] generate: placing output on timeline")
+                    from core import vse_compat as _vse
                     rack = ai_racks[i]
                     seq  = scene.sequence_editor
                     if not seq:
@@ -7008,7 +7268,7 @@ def handle_ai_rack_click(hit, context):
                     target_ch  = max(1, min(9, target_ch))
                     place_frame = scene.frame_start
                     strip_name  = f"kNNVC_{i}_{int(_t.time()) % 100000}"
-                    seq.sequences.new_sound(
+                    _vse.get_strips_collection(seq).new_sound(
                         name=strip_name, filepath=wav_path,
                         channel=target_ch, frame_start=place_frame)
                     rack.ai_status = "DONE"
@@ -7156,17 +7416,31 @@ def handle_ai_rack_click(hit, context):
             rack_s['rvc_scroll'] = new_scroll
         return True
 
-    # RVC setup guide button
-    if zone == 'ai_rvc_setup_guide':
-        import webbrowser
-        webbrowser.open("https://github.com/bshall/knn-vc")
+    # RVC — install PyTorch/torchaudio into the addon's managed venv
+    if zone == 'ai_rvc_install':
+        try:
+            from ui.racks.rack_knnvc import _start_knnvc_install
+            _start_knnvc_install()
+        except Exception as e:
+            print(f"[KNNVC] install trigger failed: {e}")
         return True
 
-    # Resemble setup guide button
-    # VoiceFixer setup guide
-    if zone == 'ai_resemble_setup_guide':
-        import webbrowser
-        webbrowser.open("https://github.com/haoheliu/voicefixer")
+    # VoiceFixer — install voicefixer into the addon's managed venv
+    if zone == 'ai_resemble_install':
+        try:
+            from ui.racks.rack_voicefixer import _start_voicefixer_install
+            _start_voicefixer_install()
+        except Exception as e:
+            print(f"[VOICEFIXER] install trigger failed: {e}")
+        return True
+
+    # Demucs — install demucs + static-ffmpeg into the addon's managed venv
+    if zone == 'ai_dm_install':
+        try:
+            from ui.racks.rack_demucs import _start_demucs_install
+            _start_demucs_install()
+        except Exception as e:
+            print(f"[DEMUCS] install trigger failed: {e}")
         return True
 
     # VoiceFixer ENHANCE button
@@ -7417,9 +7691,13 @@ def handle_ai_rack_click(hit, context):
             print(f"[WHISPER] SRT browse error: {e}")
         return True
 
-    if zone == 'ai_wsp_setup_guide':
-        import webbrowser
-        webbrowser.open("https://github.com/SYSTRAN/faster-whisper")
+    # Whisper — install faster-whisper into the addon's managed venv
+    if zone == 'ai_wsp_install':
+        try:
+            from ui.racks.rack_whisper import _start_whisper_install
+            _start_whisper_install()
+        except Exception as e:
+            print(f"[WHISPER] install trigger failed: {e}")
         return True
 
     return False

@@ -33,6 +33,8 @@ import threading
 import time
 import bpy
 
+from core import vse_compat as _vse
+
 _active_jobs    = {}
 _cancel_flags   = {}
 _pending_finish = {}
@@ -186,7 +188,7 @@ def _apply_finish(ai_idx, info):
             dur = max(1, ef - sf)
             sname = f"WSP_{ai_idx}_{placed}_{int(time.time()) % 100000}"
             try:
-                t = seq.sequences.new_effect(
+                t = _vse.get_strips_collection(seq).new_effect(
                     name=sname, type='TEXT', channel=subtitle_ch,
                     frame_start=sf, frame_end=sf + dur)
                 t.text        = text
@@ -251,7 +253,7 @@ def transcribe_whisper(ai_idx, context):
     seq = scene.sequence_editor
     src_strip = None
     if seq:
-        for strip in seq.sequences_all:
+        for strip in _vse.get_all_strips(seq):
             if strip.channel == src_ch and hasattr(strip, "sound"):
                 src_strip = strip
                 break
@@ -266,7 +268,7 @@ def transcribe_whisper(ai_idx, context):
     # Output channel
     out_ch = int(getattr(rack, "p3", 0.0))
     if out_ch < 1:
-        occupied = {s.channel for s in seq.sequences_all} if seq else set()
+        occupied = {s.channel for s in _vse.get_all_strips(seq)} if seq else set()
         out_ch = src_ch + 1
         while out_ch in occupied:
             out_ch += 1
@@ -296,7 +298,7 @@ def transcribe_whisper(ai_idx, context):
     scene_name = scene.name
 
     try:
-        seq_strips     = list(scene.sequence_editor.sequences_all) if scene.sequence_editor else []
+        seq_strips     = list(_vse.get_all_strips(scene.sequence_editor)) if scene.sequence_editor else []
         original_mutes = {}
         for s in seq_strips:
             if hasattr(s, 'mute'):
@@ -341,10 +343,15 @@ def transcribe_whisper(ai_idx, context):
 
     def _worker():
         try:
+            try:
+                from core.ai_pydeps import get_model_env
+                run_env = get_model_env()
+            except Exception:
+                run_env = None
             proc = subprocess.Popen(
                 python_cmd + [runner_path, "--args", args_file],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8")
+                text=True, encoding="utf-8", env=run_env)
 
             result_segs = []
             for line in proc.stdout:
