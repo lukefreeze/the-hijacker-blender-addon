@@ -76,6 +76,16 @@ SKIN_MAP = {
     "rack_comp_single_bg": "rack_comp_single_bg.png",
     "rack_comp_single_glass": "rack_comp_single_glass.png",
     "rack_comp_multi_glass":  "rack_comp_multi_glass.png",
+    # PackAPunch multiband screen glow: grid lines only (black elsewhere),
+    # drawn additively and breathed; rack_pulse_glow is the soft round glow used
+    # for the ball of light that runs along the chassis circuit lines.
+    "rack_comp_multi_lines":  "rack_comp_multi_lines.png",
+    "rack_comp_multi_glow":   "rack_comp_multi_glow.png",
+    "rack_comp_multi_off_btn": "rack_comp_multi_off_btn.png",
+    "rack_eq_off_btn":         "rack_eq_off_btn.png",
+    "rack_reverb_off_btn":     "rack_reverb_off_btn.png",
+    "rack_comp_single_bg_off": "rack_comp_single_bg_off.png",
+    "rack_pulse_glow":        "rack_pulse_glow.png",
     "rack_eq_bg":          "rack_eq_bg.png",
     "rack_reverb_bg":      "rack_reverb_bg.png",
     "rack_noisegate_bg":   "rack_noisegate_bg.png",
@@ -316,6 +326,43 @@ def blit_texture(tex, x: float, y: float, w: float, h: float,
         gpu.state.blend_set("ALPHA")  # restore standard blend for everything else
     except Exception as e:
         print(f"[SKIN] blit error '{key}': {e}")
+
+
+_tint_shader = None
+
+def blit_texture_tinted(tex, x: float, y: float, w: float, h: float,
+                        color=(1.0, 1.0, 1.0, 1.0), blend: str = "ADDITIVE_PREMULT",
+                        uv=None, key: str = "") -> None:
+    """Like blit_texture, but multiplies the texture by `color` (r,g,b,a) so a
+    layer can be faded / tinted per draw. Built for glow layers: with the
+    default "ADDITIVE_PREMULT" blend the texture's rgb x color.rgb is simply
+    ADDED to whatever is already on screen, so (k,k,k,k) acts as a brightness
+    knob and black pixels in the texture add nothing. Uses Blender's
+    IMAGE_COLOR builtin shader. Any GPU error is printed and swallowed, and
+    the blend mode is always restored to "ALPHA" afterwards."""
+    global _tint_shader
+    if tex is None or w <= 0 or h <= 0:
+        return
+    try:
+        if _tint_shader is None:
+            _tint_shader = gpu.shader.from_builtin("IMAGE_COLOR")
+        gpu.state.blend_set(blend)
+        u0, v0, u1, v1 = uv if uv is not None else (0, 0, 1, 1)
+        verts = [(x, y), (x+w, y), (x, y+h), (x+w, y+h)]
+        uvs   = [(u0, v0), (u1, v0), (u0, v1), (u1, v1)]
+        batch = batch_for_shader(_tint_shader, "TRI_STRIP",
+                                 {"pos": verts, "texCoord": uvs})
+        _tint_shader.bind()
+        _tint_shader.uniform_sampler("image", tex)
+        _tint_shader.uniform_float("color", color)
+        batch.draw(_tint_shader)
+    except Exception as e:
+        print(f"[SKIN] tinted blit error '{key}': {e}")
+    finally:
+        try:
+            gpu.state.blend_set("ALPHA")
+        except Exception:
+            pass
 
 
 def clear_cache() -> None:

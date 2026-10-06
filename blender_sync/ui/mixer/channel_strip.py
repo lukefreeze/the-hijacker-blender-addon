@@ -56,7 +56,7 @@ from core.constants import (
     SEND_BTN_H,
     SEND_MIN_SLOTS,
 )
-from ui.mixer.texture_cache import get_texture
+from ui.mixer.texture_cache import get_texture, get_active_skin, blit_texture
 from ui.mixer.draw_utils import (
     draw_circle,
     draw_circle_knob,
@@ -217,6 +217,51 @@ def _divider(sx, y, scale):
 
 
 # ---------------------------------------------------------------------------
+# Helper: mute/solo "on" indicator — normal replacement art for most skins,
+# an additive glow overlay for skins in _GLOW_ON_SKINS.
+# ---------------------------------------------------------------------------
+# On the packapunch desk every M/S button is drawn uniquely as part of the
+# one shared strip_top_bg background art — there's no separate per-button
+# "off" texture to swap, the burnt/cracked look of each button is just
+# baked into the background wherever it sits. So a single shared PNG per
+# key (still called "btn_mute_on"/"btn_solo_on" — same filenames as the
+# default skin, just placed in ui/assets/skins/packapunch/) can't be a
+# full replacement image the way default's is; instead it's a small,
+# mostly-transparent glow shape that gets additively blended on top of
+# whatever's already drawn there. The same glow texture lands on all 9
+# visually different buttons and picks up each one's own colour/pattern
+# underneath for free — no need to hand-paint a unique "on" image per
+# button.
+_GLOW_ON_SKINS = {"packapunch"}
+
+# ---------------------------------------------------------------------------
+# Skins whose fader-bottom numbox ("CH N PK" + live dB readout) shouldn't be
+# drawn at all. The packapunch desk has that readout baked directly into
+# strip_bottom_bg as a themed "-666dB" — burnt, molten, part of the art — so
+# a live-updating "+0.0 db" drawn on top of it would both look wrong and
+# fight visually with the baked-in text. Every other skin still gets the
+# normal live readout.
+# ---------------------------------------------------------------------------
+_NO_LIVE_NUMBOX_SKINS = {"packapunch"}
+
+# Skins whose VU meter should only ever show red — no green/yellow zones —
+# regardless of level. Matches the all-molten theme of the packapunch desk.
+_RED_ONLY_METER_SKINS = {"packapunch"}
+
+
+def _draw_on_state(key, x, y, w, h, fallback_color):
+    """Draw a mute/solo 'on' indicator at (x, y, w, h). Falls back to a
+    flat-colour rect (matching the old draw_element() behaviour) when no
+    texture is loaded for this skin at all."""
+    tex = get_texture(key)
+    if tex is None:
+        draw_rect(x, y, w, h, fallback_color)
+        return
+    blend = "ADDITIVE" if get_active_skin() in _GLOW_ON_SKINS else "ALPHA_PREMULT"
+    blit_texture(tex, x, y, w, h, key=key, blend=blend)
+
+
+# ---------------------------------------------------------------------------
 # Main draw function
 # ---------------------------------------------------------------------------
 def draw_channel_strip(
@@ -285,15 +330,13 @@ def draw_channel_strip(
 
     # Mute button
     if track.mute:
-        draw_element("btn_mute_on", _mute_x, _btn_y, _btn_w, _btn_h,
-                     draw_rect, M_COLOR_ON)
+        _draw_on_state("btn_mute_on", _mute_x, _btn_y, _btn_w, _btn_h, M_COLOR_ON)
     elif not _skin_active:
         draw_rect(_mute_x, _btn_y, _btn_w, _btn_h, M_COLOR_OFF)
 
     # Solo button
     if track.solo:
-        draw_element("btn_solo_on", _solo_x, _btn_y, _btn_w, _btn_h,
-                     draw_rect, S_COLOR_ON)
+        _draw_on_state("btn_solo_on", _solo_x, _btn_y, _btn_w, _btn_h, S_COLOR_ON)
     elif not _skin_active:
         draw_rect(_solo_x, _btn_y, _btn_w, _btn_h, S_COLOR_OFF)
 
@@ -482,17 +525,21 @@ def draw_channel_strip(
     f_hx    = sx + FADER_HANDLE_X_OFF * scale
     rail_cx = f_hx + f_hw / 2 - 5 * scale
 
-    # Numbox drawn FIRST so fader rail and handle always paint on top
+    # Numbox drawn FIRST so fader rail and handle always paint on top.
+    # Skipped entirely for skins in _NO_LIVE_NUMBOX_SKINS — see its
+    # docstring above; packapunch's "-666dB" readout is baked into
+    # strip_bottom_bg, not drawn live.
     nb_h = NUMBOX_H * scale
     nb_y = f_y - (FADER_BOTTOM_PAD // 2) * scale - nb_h
-    draw_numbox(
-        sx + 15 * scale, nb_y, 90 * scale, nb_h,
-        track.volume,
-        channel=i,
-        peak_hold=peak_hold,
-        skip_bg=get_texture("strip_bottom_bg") is not None,
-        scale=scale,
-    )
+    if get_active_skin() not in _NO_LIVE_NUMBOX_SKINS:
+        draw_numbox(
+            sx + 15 * scale, nb_y, 90 * scale, nb_h,
+            track.volume,
+            channel=i,
+            peak_hold=peak_hold,
+            skip_bg=get_texture("strip_bottom_bg") is not None,
+            scale=scale,
+        )
 
     draw_element(
         "fader_rail", rail_cx, f_y, 10 * scale, fader_h, draw_rect, FADER_RAIL_COLOR
@@ -526,5 +573,6 @@ def draw_channel_strip(
     draw_element(_fh_key, _img_x, _img_y, _img_w, _img_h, draw_rect, FADER_HANDLE_COLOR)
 
     draw_meter(
-        sx + METER_X_OFFSET * scale, f_y, METER_W * scale, fader_h, engine_level, peak_hold
+        sx + METER_X_OFFSET * scale, f_y, METER_W * scale, fader_h, engine_level, peak_hold,
+        all_red=get_active_skin() in _RED_ONLY_METER_SKINS,
     )

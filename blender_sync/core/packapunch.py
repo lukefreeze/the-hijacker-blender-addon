@@ -31,12 +31,23 @@
 #   the Hijacker C++ engine (see its docstring in core/audio.py) — so
 #   triggering PackAPunch mid-playback can never interrupt, desync, or
 #   otherwise fight with whatever the Hijacker engine is doing with the
-#   VSE mix. This is a short one-off transition sting, not part of the
-#   timeline mix. The tradeoff: subprocess launch has some tens-of-ms of
-#   startup latency before audio is actually audible, so the audio/video
-#   sync here is "good enough for a fun transition", not sample-accurate.
+#   VSE mix. The tradeoff: subprocess launch has some tens-of-ms of startup
+#   latency before audio is actually audible, so the START of the video and
+#   audio is "good enough for a fun transition", not sample-accurate.
 #   Sample-accurate sync would mean routing this through the C++ PortAudio
 #   engine instead — deliberately out of scope for this first pass.
+#
+# The video and audio only share a START time, not a duration.
+#   Luke's transition audio is a full music cue meant to keep playing as
+#   ambient mood music well after the visual reveal finishes — the PNG
+#   sequence only covers the video up to its fade-out point (no padding
+#   frames wasting memory on a hold that isn't there). So the overlay's
+#   own frame count at a FIXED export frame rate (VIDEO_FPS) is what
+#   determines how long the visual transition runs; the audio subprocess
+#   plays independently to its own full length regardless of how long the
+#   overlay took. Once the overlay finishes, is_active() goes False (skin's
+#   already swapped, button re-arms) even though the music may still be
+#   going in the background — that's intentional, not a bug.
 #
 # Frames are optional.
 #   Luke's real transition art (a PNG sequence exported from his video
@@ -45,6 +56,25 @@
 #   — just without an image overlay on top. Drop numbered PNGs in that
 #   folder later and they're picked up automatically on the next trigger,
 #   no code changes needed.
+#
+# The frame texture cache is a small rolling window, not a growing pile.
+#   Luke's real sequence is 305 frames at 1920x1080 RGBA — ~8MB of GPU
+#   texture per frame, and Blender keeps the decoded pixel buffer for each
+#   loaded Image data-block in system RAM too. The first version of this
+#   file cached every frame forever once shown (never evicted, never
+#   freed), so a single run accumulated roughly 2.5GB of VRAM and another
+#   2.5GB of RAM by the time it reached frame 305 — nothing ever got freed
+#   until the whole add-on reloaded. That growing memory pressure is what
+#   was actually behind "getting further behind as it plays": it isn't a
+#   timing bug (frame_index is still recomputed fresh from wall-clock time
+#   every redraw, so it can never architecturally drift), it's that each
+#   new frame's load+upload got slower as VRAM/RAM filled up, so real wall
+#   time kept advancing past whatever frame was still loading. Fixed by
+#   evicting frames well behind the current playhead (playback is strictly
+#   forward and one-shot, so nothing behind the playhead is ever needed
+#   again) and by fully clearing the cache both at the start of a run (in
+#   case a previous run was interrupted mid-playback) and the moment a run
+#   finishes.
 # =============================================================================
 
 import os
@@ -61,17 +91,49 @@ from core.audio import play_oneshot
 # ---------------------------------------------------------------------------
 # Paths / constants
 # ---------------------------------------------------------------------------
-FRAMES_DIR   = os.path.join(ADDON_DIR, "ui", "assets", "packapunch", "frames")
-AUDIO_SRC    = os.path.join(ADDON_DIR, "ui", "PackAPunch.mp3")
+PACKAPUNCH_DIR = os.path.join(ADDON_DIR, "ui", "assets", "packapunch")
+FRAMES_DIR   = os.path.join(PACKAPUNCH_DIR, "frames")
+# All PackAPunch assets live under one folder — frames/ for the PNG
+# sequence, the audio cue right alongside it. Drop the real transition
+# audio in here as "PackAPunch.mp3" (any format aud.Sound.file() can
+# read works — it gets decoded to WAV once regardless, see
+# _ensure_wav_audio() below).
+AUDIO_SRC    = os.path.join(PACKAPUNCH_DIR, "PackAPunch.mp3")
 _WAV_CACHE   = os.path.join(tempfile.gettempdir(), "hijacker_packapunch_cache.wav")
 
 TARGET_SKIN  = "packapunch"
 DEFAULT_SKIN = "default"
 
-DEFAULT_FPS          = 24.0
-# Used only when no frame sequence exists yet, so an audio-only transition
-# still has a sensible on-screen duration before the button re-arms.
+# The frame rate the PNG sequence in frames/ was actually exported at.
+# This is the ONLY thing that determines how long the visual overlay
+# plays for (frame_count / VIDEO_FPS) — deliberately decoupled from the
+# audio cue's length, see the module docstring above. Update this if a
+# future re-export changes frame rate.
+VIDEO_FPS            = 24.0
+# Used only when there's no frame sequence at all yet, so an audio-only
+# transition still has a sensible on-screen duration before the button
+# re-arms (the audio itself is unaffected by this — it always plays to
+# its own full length regardless).
 FALLBACK_DURATION_S  = 3.0
+
+# How many already-shown frames to keep cached behind the current
+# playhead, plus how far ahead to opportunistically pre-load. Playback is
+# strictly forward and one-shot, so a small window is enough to smooth
+# over redraw-timing jitter without letting the cache grow unbounded over
+# a 300+-frame run — see the module docstring above.
+#
+# _PRELOAD_AHEAD started at 2, based on real console timing: individual
+# frame loads at 1920x1080 RGBA averaged ~22ms but ran up to ~41ms, so
+# prefetching 2 per redraw-timer tick could cost up to ~80ms — well over
+# the timer's own ~33ms interval. That's backwards: the prefetch meant to
+# keep the timer ahead of the draw callback was instead what made the
+# timer itself fall behind (observed directly: measured redraw rate
+# dropped to 10-24Hz against a 30Hz target for most of a run, recovering
+# only once fewer new frames were left to prefetch near the end).
+# Prefetching only 1 frame per tick keeps a single tick's worst case
+# closer to that ~33ms budget.
+_KEEP_BEHIND    = 2
+_PRELOAD_AHEAD  = 1
 
 # ---------------------------------------------------------------------------
 # State
@@ -79,11 +141,26 @@ FALLBACK_DURATION_S  = 3.0
 _active          = False
 _start_wall       = 0.0
 _frame_paths      = []      # sorted absolute PNG paths for this run
-_frame_tex_cache  = {}       # frame index -> gpu.types.GPUTexture, rebuilt per run
-_fps              = DEFAULT_FPS
+_frame_tex_cache  = {}       # frame index -> gpu.types.GPUTexture, rolling window
+_frame_img_cache  = {}       # frame index -> bpy.types.Image, freed alongside the texture
+_fps              = VIDEO_FPS
 _duration_s       = FALLBACK_DURATION_S
 _target_skin      = TARGET_SKIN
 _redraw_timer_registered = False
+
+# ---- Debug/diagnostic counters (reset per run, printed to the console) ----
+# Console output, not on-screen — see Window > Toggle System Console on
+# Windows. These exist to answer "is it actually running at 24fps" with
+# real numbers instead of another guess: DEBUG = False makes this a no-op
+# once we've got what we need.
+DEBUG                = True
+_dbg_redraws_total   = 0
+_dbg_last_report_t   = 0.0
+_dbg_last_report_n   = 0
+_dbg_last_frame_idx  = -1
+_dbg_skipped_frames  = 0
+_dbg_shown_frames    = set()
+_dbg_load_times      = []   # list of (frame_idx, ms, blocking: bool)
 
 
 # ---------------------------------------------------------------------------
@@ -102,35 +179,124 @@ def get_active_skin() -> str:
 # Frame sequence discovery + lazy per-frame texture loading
 # ---------------------------------------------------------------------------
 def _scan_frames():
+    """Find the numbered PNG frames for this run.
+
+    Globs both *.png and *.PNG because a case-SENSITIVE filesystem (Linux,
+    if this ever runs there) could genuinely have distinct files under
+    each. But on Windows — a case-INSENSITIVE filesystem — those two
+    glob patterns both match the exact same files, so every real frame
+    was showing up twice in the combined list (305 real frames -> 610
+    entries). That doubled list, once sorted, put each frame right next
+    to a duplicate of itself, so every unique image played for 2/24s
+    instead of 1/24s — the whole sequence took twice as long and looked
+    like it was running at half speed. This was there well before the
+    caching/prefetch work; dedupe by the normalized absolute path so a
+    genuinely case-sensitive filesystem still works while Windows no
+    longer double-counts."""
     if not os.path.isdir(FRAMES_DIR):
         return []
-    return sorted(
-        glob.glob(os.path.join(FRAMES_DIR, "*.png")) +
-        glob.glob(os.path.join(FRAMES_DIR, "*.PNG"))
-    )
+    seen  = set()
+    paths = []
+    for p in (glob.glob(os.path.join(FRAMES_DIR, "*.png")) +
+              glob.glob(os.path.join(FRAMES_DIR, "*.PNG"))):
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen:
+            seen.add(key)
+            paths.append(p)
+    return sorted(paths)
+
+
+def _load_frame(idx, blocking):
+    """Actually load+upload one frame. Never call directly from the draw
+    path without going through _get_frame_texture()/_prefetch_frame() —
+    this is the expensive, uncached operation.
+
+    blocking: True when this is happening synchronously inside the draw
+    callback because get_overlay_frame() needed this frame *right now*
+    (i.e. the redraw timer's look-ahead didn't already warm it). False
+    when it's a look-ahead prefetch happening in the redraw timer, which
+    has more slack. Only used for the DEBUG timing breakdown below."""
+    t0 = time.perf_counter()
+    img = bpy.data.images.load(_frame_paths[idx], check_existing=True)
+    # Same reasoning as ui/mixer/texture_cache.py's get_texture(): on
+    # Blender 5.x only the upload-side sRGB->linear conversion runs for
+    # GPU-drawn images, not the matching display-side re-encode, so a
+    # pre-rendered transition frame needs Non-Color to land on screen
+    # as the literal bytes in the file instead of coming out flattened.
+    if bpy.app.version >= (5, 0, 0):
+        img.colorspace_settings.name = 'Non-Color'
+    tex = gpu.texture.from_image(img)
+    _frame_tex_cache[idx] = tex
+    _frame_img_cache[idx] = img
+    if DEBUG:
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        _dbg_load_times.append((idx, dt_ms, blocking))
+        if blocking and dt_ms > 15.0:
+            print(f"[PACKAPUNCH][DEBUG] frame {idx} loaded ON-DEMAND inside "
+                  f"the draw callback, took {dt_ms:.1f}ms "
+                  f"(24fps budget is {1000.0/_fps:.1f}ms) — this stalls that redraw")
+
+
+def _evict_frames_behind(current_idx):
+    """Free every cached frame more than _KEEP_BEHIND behind current_idx.
+    Playback only ever moves forward within a run, so anything this far
+    behind the playhead is never requested again — see the module
+    docstring for why this matters (without it, a 305-frame run at
+    1920x1080 RGBA accumulates ~2.5GB of VRAM + ~2.5GB of RAM and gets
+    progressively slower as it plays)."""
+    stale = [i for i in _frame_tex_cache if i < current_idx - _KEEP_BEHIND]
+    for i in stale:
+        _frame_tex_cache.pop(i, None)
+        img = _frame_img_cache.pop(i, None)
+        if img is not None:
+            try:
+                bpy.data.images.remove(img)
+            except Exception:
+                pass
+
+
+def _clear_frame_cache():
+    """Free every currently-cached frame outright — called at the start of
+    a run (in case a previous run was interrupted mid-playback and left
+    frames cached) and the instant a run finishes (so the ~2.5GB this
+    sequence can reach doesn't sit around until the next trigger)."""
+    for img in _frame_img_cache.values():
+        try:
+            bpy.data.images.remove(img)
+        except Exception:
+            pass
+    _frame_tex_cache.clear()
+    _frame_img_cache.clear()
 
 
 def _get_frame_texture(idx):
-    if idx in _frame_tex_cache:
-        return _frame_tex_cache[idx]
     if idx < 0 or idx >= len(_frame_paths):
         return None
+    if idx not in _frame_tex_cache:
+        try:
+            _load_frame(idx, blocking=True)
+        except Exception as e:
+            print(f"[PACKAPUNCH] frame {idx} load failed: {e}")
+            _frame_tex_cache[idx] = None
+    _evict_frames_behind(idx)
+    return _frame_tex_cache.get(idx)
+
+
+def _prefetch_frame(idx):
+    """Best-effort look-ahead load, called from the redraw timer (which
+    ticks at 30Hz, slightly faster than the 24fps playback rate) so a
+    frame's load+upload cost is more often already paid by the time
+    get_overlay_frame() actually needs it, instead of always happening
+    synchronously inside the draw callback. Silently does nothing if the
+    frame's already cached, out of range, or fails to load — this is
+    purely an optimization, never load-bearing for correctness."""
+    if idx < 0 or idx >= len(_frame_paths) or idx in _frame_tex_cache:
+        return
     try:
-        img = bpy.data.images.load(_frame_paths[idx], check_existing=True)
-        # Same reasoning as ui/mixer/texture_cache.py's get_texture(): on
-        # Blender 5.x only the upload-side sRGB->linear conversion runs for
-        # GPU-drawn images, not the matching display-side re-encode, so a
-        # pre-rendered transition frame needs Non-Color to land on screen
-        # as the literal bytes in the file instead of coming out flattened.
-        if bpy.app.version >= (5, 0, 0):
-            img.colorspace_settings.name = 'Non-Color'
-        tex = gpu.texture.from_image(img)
-        _frame_tex_cache[idx] = tex
-        return tex
+        _load_frame(idx, blocking=False)
     except Exception as e:
-        print(f"[PACKAPUNCH] frame {idx} load failed: {e}")
+        print(f"[PACKAPUNCH] prefetch frame {idx} failed: {e}")
         _frame_tex_cache[idx] = None
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +308,13 @@ def _ensure_wav_audio():
     if not os.path.exists(AUDIO_SRC):
         print(f"[PACKAPUNCH] audio cue not found: {AUDIO_SRC}")
         return None
-    if os.path.exists(_WAV_CACHE):
+    # Re-decode whenever the source is newer than the cached WAV — this
+    # cache lives in the OS temp dir, which persists across Blender
+    # restarts, so without this check swapping in new transition audio
+    # would silently keep playing the old cached decode until someone
+    # thought to clear temp.
+    if (os.path.exists(_WAV_CACHE)
+            and os.path.getmtime(_WAV_CACHE) >= os.path.getmtime(AUDIO_SRC)):
         return _WAV_CACHE
     try:
         import aud, wave as _wave, numpy as np
@@ -167,23 +339,114 @@ def _ensure_wav_audio():
         return None
 
 
+def _wav_duration_s(wav_path):
+    """Length of a WAV file in seconds, or None if it can't be read.
+
+    Not currently used for anything (start()/get_overlay_frame() no longer
+    tie the overlay's duration to the audio's length — see module
+    docstring). Kept because it's exactly the building block a future
+    "meters react to the transition music" feature would need: decode
+    once (already happening via _ensure_wav_audio()), compute a rolling
+    amplitude envelope over that same PCM data, then sample the envelope
+    by elapsed wall-clock time the same way get_overlay_frame() samples
+    frames — same pattern, just feeding meter levels instead of a texture."""
+    if not wav_path:
+        return None
+    try:
+        import wave as _wave
+        with _wave.open(wav_path, 'rb') as wf:
+            frames = wf.getnframes()
+            rate   = wf.getframerate()
+            return (frames / float(rate)) if rate else None
+    except Exception as e:
+        print(f"[PACKAPUNCH] could not read audio duration: {e}")
+        return None
+
+
+def _reset_debug_stats():
+    global _dbg_redraws_total, _dbg_last_report_t, _dbg_last_report_n, \
+           _dbg_last_frame_idx, _dbg_skipped_frames, _dbg_shown_frames, \
+           _dbg_load_times
+    _dbg_redraws_total  = 0
+    _dbg_last_report_t  = 0.0
+    _dbg_last_report_n  = 0
+    _dbg_last_frame_idx = -1
+    _dbg_skipped_frames = 0
+    _dbg_shown_frames   = set()
+    _dbg_load_times     = []
+
+
+def _print_debug_summary(final_elapsed):
+    n_shown  = len(_dbg_shown_frames)
+    n_total  = len(_frame_paths)
+    blocking = [ms for (_, ms, b) in _dbg_load_times if b]
+    prefetch = [ms for (_, ms, b) in _dbg_load_times if not b]
+    measured_fps = (n_shown / final_elapsed) if final_elapsed > 0 else 0.0
+    print("[PACKAPUNCH][DEBUG] ---------------- transition summary ----------------")
+    print(f"[PACKAPUNCH][DEBUG]  expected: {n_total} frames @ {_fps:.0f}fps -> {_duration_s:.2f}s")
+    print(f"[PACKAPUNCH][DEBUG]  actual wall time elapsed: {final_elapsed:.2f}s")
+    print(f"[PACKAPUNCH][DEBUG]  distinct frames actually shown: {n_shown}/{n_total}  "
+          f"(effective ~{measured_fps:.1f}fps of unique content)")
+    print(f"[PACKAPUNCH][DEBUG]  frames skipped over (never shown): {_dbg_skipped_frames}")
+    print(f"[PACKAPUNCH][DEBUG]  total draw-callback redraws while active: {_dbg_redraws_total}")
+    if blocking:
+        print(f"[PACKAPUNCH][DEBUG]  ON-DEMAND loads (blocked the draw callback): "
+              f"{len(blocking)}  avg {sum(blocking)/len(blocking):.1f}ms  "
+              f"max {max(blocking):.1f}ms  (24fps budget is {1000.0/_fps:.1f}ms)")
+    else:
+        print("[PACKAPUNCH][DEBUG]  ON-DEMAND loads (blocked the draw callback): 0 "
+              "(the look-ahead prefetch kept up)")
+    if prefetch:
+        print(f"[PACKAPUNCH][DEBUG]  pre-fetched loads (in the redraw timer): "
+              f"{len(prefetch)}  avg {sum(prefetch)/len(prefetch):.1f}ms  "
+              f"max {max(prefetch):.1f}ms")
+    print("[PACKAPUNCH][DEBUG] -----------------------------------------------------")
+
+
 # ---------------------------------------------------------------------------
 # Trigger
 # ---------------------------------------------------------------------------
 def toggle():
     """Trigger the transition, alternating direction each press: swaps INTO
     the packapunch skin if currently on default (or anything else), or back
-    OUT to default if already on packapunch. Same transition animation +
-    audio cue either way — see module docstring for why."""
-    target = DEFAULT_SKIN if get_active_skin() == TARGET_SKIN else TARGET_SKIN
-    start(target)
+    OUT to default if already on packapunch.
+
+    Only the way IN plays the full transition (video overlay + audio cue)
+    — see start()'s play_video/play_audio docstrings for why. Reverting
+    back to default is an instant skin swap with no fanfare: there's
+    nothing to "reveal" on the way out, so replaying the PNG sequence
+    (and the "PACK-A-PUNCH!" cue) on revert just looked/sounded like a
+    glitch rather than a deliberate second transition."""
+    entering = get_active_skin() != TARGET_SKIN
+    target   = TARGET_SKIN if entering else DEFAULT_SKIN
+    start(target, play_audio=entering, play_video=entering)
 
 
-def start(target_skin: str = TARGET_SKIN, fps: float = DEFAULT_FPS):
+def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: bool = True):
     """Begin the PackAPunch transition: swap the skin immediately, start the
-    audio cue, and arm the wall-clock reference the draw callback reads via
-    get_overlay_frame(). Re-entrant-safe — ignored if already running."""
-    global _active, _start_wall, _frame_paths, _frame_tex_cache, _fps, \
+    audio cue, and (if play_video) arm the wall-clock reference the draw
+    callback reads via get_overlay_frame(). Re-entrant-safe — ignored if
+    already running.
+
+    Video and audio share a start time, not a duration — see the module
+    docstring above. The overlay plays for exactly frame_count / VIDEO_FPS
+    seconds and then stops (is_active() goes False, button re-arms); the
+    audio subprocess plays independently to its own full length and is
+    never truncated or waited on.
+
+    play_audio: skips the audio cue for this run. toggle() sets this False
+    when reverting back to the default skin — the "PACK-A-PUNCH!" fanfare
+    makes sense firing once, going in; playing it again on the way back out
+    just sounded like a glitch, not a deliberate second cue.
+
+    play_video: skips the PNG-sequence overlay entirely for this run —
+    just the immediate skin swap above, with is_active() never going True.
+    toggle() sets this False on the same revert path as play_audio: the
+    overlay's whole reason to exist is to fade out and reveal the skin
+    already swapped underneath it, which only makes sense going IN. On
+    the way back out there's nothing to reveal, so there's no reason to
+    play the sequence (or wait through it) at all."""
+    global _active, _start_wall, _frame_paths, _fps, \
            _duration_s, _target_skin, _redraw_timer_registered
 
     if _active:
@@ -191,23 +454,38 @@ def start(target_skin: str = TARGET_SKIN, fps: float = DEFAULT_FPS):
 
     from ui.mixer.texture_cache import set_skin_dir, clear_cache
 
-    _frame_paths     = _scan_frames()
-    _frame_tex_cache = {}
-    _fps             = max(1.0, fps)
-    _target_skin     = target_skin
-    _duration_s      = (len(_frame_paths) / _fps) if _frame_paths else FALLBACK_DURATION_S
+    # Free anything left over from a previous run (e.g. Blender closed or
+    # the addon reloaded mid-transition) before starting fresh — see
+    # _clear_frame_cache()'s docstring.
+    _clear_frame_cache()
+    _target_skin = target_skin
 
     # Skin swap FIRST — see module docstring. Everything underneath the
     # overlay is already the destination skin for the whole transition.
     set_skin_dir(ASSETS_DIR, _target_skin)
     clear_cache()
 
-    wav = _ensure_wav_audio()
-    if wav:
-        play_oneshot(wav)
+    if play_audio:
+        wav = _ensure_wav_audio()
+        if wav:
+            play_oneshot(wav)   # fire-and-forget — plays to its own full
+                                 # length, decoupled from the overlay below
+
+    if not play_video:
+        _frame_paths = []
+        _active      = False
+        print(f"[PACKAPUNCH] instant switch -> skin '{_target_skin}' (no video)")
+        return
+
+    _frame_paths = _scan_frames()
+    _fps        = VIDEO_FPS
+    _duration_s = (len(_frame_paths) / _fps) if _frame_paths else FALLBACK_DURATION_S
 
     _start_wall = time.perf_counter()
     _active     = True
+
+    if DEBUG:
+        _reset_debug_stats()
 
     if not _redraw_timer_registered:
         bpy.app.timers.register(_redraw_timer, first_interval=0.0)
@@ -223,19 +501,45 @@ def get_overlay_frame():
     never active). texture_or_None is None whenever no frame art exists yet
     for this index — the caller should just skip drawing the overlay that
     tick, the skin swap underneath already happened at start()."""
-    global _active
+    global _active, _dbg_redraws_total, _dbg_last_report_t, \
+           _dbg_last_report_n, _dbg_last_frame_idx, _dbg_skipped_frames
     if not _active:
         return None
 
     elapsed = time.perf_counter() - _start_wall
     if elapsed >= _duration_s:
         _active = False
+        if DEBUG:
+            _print_debug_summary(elapsed)
+        _clear_frame_cache()  # free the whole run's cached frames now, not
+                               # just the rolling window — see docstring
         print(f"[PACKAPUNCH] transition finished ({_duration_s:.2f}s)")
         return None
 
     progress  = elapsed / _duration_s if _duration_s > 0 else 1.0
     frame_idx = int(elapsed * _fps)
-    tex       = _get_frame_texture(frame_idx)
+
+    if DEBUG:
+        _dbg_redraws_total += 1
+        _dbg_shown_frames.add(frame_idx)
+        if _dbg_last_frame_idx >= 0 and frame_idx > _dbg_last_frame_idx + 1:
+            _dbg_skipped_frames += frame_idx - _dbg_last_frame_idx - 1
+        _dbg_last_frame_idx = frame_idx
+        # Once a second: how many redraws actually happened in the last
+        # second (target ~30) — if this comes back far below 30, the draw
+        # callback itself is what's taking too long per call (almost
+        # always the ON-DEMAND load warning above firing repeatedly), not
+        # a scheduling issue elsewhere.
+        if elapsed - _dbg_last_report_t >= 1.0:
+            redraws_this_window = _dbg_redraws_total - _dbg_last_report_n
+            print(f"[PACKAPUNCH][DEBUG] t={elapsed:5.2f}s  "
+                  f"expected_frame={frame_idx}/{len(_frame_paths)}  "
+                  f"redraws_last~1s={redraws_this_window} (target ~30)  "
+                  f"skipped_so_far={_dbg_skipped_frames}")
+            _dbg_last_report_t = elapsed
+            _dbg_last_report_n = _dbg_redraws_total
+
+    tex = _get_frame_texture(frame_idx)
     return (tex, progress)
 
 
@@ -249,6 +553,17 @@ def _redraw_timer():
     if not _active:
         _redraw_timer_registered = False
         return None
+
+    # Opportunistically warm the cache a couple frames ahead of the
+    # current playhead. This timer ticks at 30Hz, a bit faster than the
+    # 24fps playback rate, which gives just enough slack for a frame's
+    # load+upload to often finish here instead of stalling the draw
+    # callback the moment it's actually needed.
+    elapsed = time.perf_counter() - _start_wall
+    current_idx = int(elapsed * _fps)
+    for lookahead in range(1, _PRELOAD_AHEAD + 1):
+        _prefetch_frame(current_idx + lookahead)
+
     try:
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
@@ -268,6 +583,7 @@ def reset():
     from a previous session (e.g. Blender closed mid-transition)."""
     global _active
     _active = False
+    _clear_frame_cache()
 
 
 def register():
@@ -278,3 +594,4 @@ def register():
 def unregister():
     global _active
     _active = False
+    _clear_frame_cache()

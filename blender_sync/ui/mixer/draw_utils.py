@@ -311,11 +311,15 @@ def draw_circle_knob(x: float, y: float, radius: float, value: float,
 
 
 def draw_meter(x: float, y: float, w: float, h: float,
-               level: float, peak: float) -> None:
+               level: float, peak: float, all_red: bool = False) -> None:
     """VU LED meter — 19 segments, batched by colour zone (4 draw calls max).
 
     Uses meter_led_green/yellow/red/off tiles if loaded.
     Falls back to original solid bar if tiles not found.
+
+    all_red: every lit segment uses the red tile/colour regardless of
+             level — no green/yellow zones at all. Used for skins whose
+             meter is themed as an all-red readout (e.g. packapunch).
     """
     N_LEDS     = 19
     GREEN_TOP  = 0.70   # bottom 70% of segments are green
@@ -332,16 +336,20 @@ def draw_meter(x: float, y: float, w: float, h: float,
         draw_rect(x, y, w, h, (0.03, 0.03, 0.03, 1.0))
         if level > 0.0:
             fh = min(level, 1.0) * h
-            gt, yt = h * GREEN_TOP, h * YELLOW_TOP
-            if fh > 0:
-                draw_rect(x, y, w, min(fh, gt), (0.0, 0.55, 0.15, 1.0))
-            if fh > gt:
-                draw_rect(x, y + gt, w, min(fh - gt, yt - gt), (0.7, 0.6, 0.0, 1.0))
-            if fh > yt:
-                draw_rect(x, y + yt, w, fh - yt, (0.85, 0.1, 0.1, 1.0))
+            if all_red:
+                draw_rect(x, y, w, fh, (0.85, 0.1, 0.1, 1.0))
+            else:
+                gt, yt = h * GREEN_TOP, h * YELLOW_TOP
+                if fh > 0:
+                    draw_rect(x, y, w, min(fh, gt), (0.0, 0.55, 0.15, 1.0))
+                if fh > gt:
+                    draw_rect(x, y + gt, w, min(fh - gt, yt - gt), (0.7, 0.6, 0.0, 1.0))
+                if fh > yt:
+                    draw_rect(x, y + yt, w, fh - yt, (0.85, 0.1, 0.1, 1.0))
         if peak > 0.0:
             ph  = min(peak, 1.0) * h
-            col = ((0.85, 0.1, 0.1, 1.0) if peak > 0.90 else
+            col = ((0.85, 0.1, 0.1, 1.0) if all_red else
+                   (0.85, 0.1, 0.1, 1.0) if peak > 0.90 else
                    (0.7, 0.6, 0.0, 1.0)  if peak > 0.70 else
                    (0.0, 0.85, 0.3, 1.0))
             draw_rect(x, y + ph - 1, w, max(1.5, h * 0.01), col)
@@ -363,7 +371,9 @@ def draw_meter(x: float, y: float, w: float, h: float,
         is_lit  = (i < lit_count) or (i == peak_idx)
         frac    = (i + 1) / N_LEDS
         if is_lit:
-            if frac <= GREEN_TOP:
+            if all_red:
+                red_q.append(quad)
+            elif frac <= GREEN_TOP:
                 green_q.append(quad)
             elif frac <= YELLOW_TOP:
                 yellow_q.append(quad)

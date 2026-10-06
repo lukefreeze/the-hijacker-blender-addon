@@ -7,6 +7,7 @@
 import os
 import sys
 import math
+import atexit
 import tempfile
 import time as _time
 
@@ -100,13 +101,68 @@ class _OneshotHandle:
                 pass
 
 
+class _WinsoundHandle:
+    """Same stop()/status interface as _OneshotHandle, for the winsound
+    path below. winsound has no subprocess to poll, so status is a
+    duration estimate from the WAV's own header — accurate in practice
+    since WinMM playback timing doesn't drift the way a busy Python
+    process might. stop() calls SND_PURGE, which stops every sound this
+    process started via winsound — fine here since nothing else in the
+    addon plays audio through winsound, only through play_oneshot()."""
+    def __init__(self, duration_s):
+        self._start    = _time.perf_counter()
+        self._duration = duration_s
+        self._stopped  = False
+
+    @property
+    def status(self):
+        if self._stopped:
+            return False
+        if self._duration is None:
+            return True  # unknown length — assume playing until stop() is called
+        return (_time.perf_counter() - self._start) < self._duration
+
+    def stop(self):
+        self._stopped = True
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+
+def _probe_wav_duration(path):
+    """Length of a WAV file in seconds, or None if it can't be read —
+    used only to drive _WinsoundHandle.status's estimate above."""
+    try:
+        import wave
+        with wave.open(path, 'rb') as wf:
+            frames = wf.getnframes()
+            rate   = wf.getframerate()
+            return (frames / float(rate)) if rate else None
+    except Exception:
+        return None
+
+
 _oneshot_handles = []  # keep references alive
 
 
 def play_oneshot(filepath):
     """Play a WAV file without touching aud.Device or the Hijacker engine.
-    Returns an _OneshotHandle with stop() and .status.
+    Returns a handle with stop() and .status.
     Safe to call at any time — no WASAPI conflict possible.
+
+    On Windows this plays via winsound (a thin wrapper over the WinMM
+    PlaySound API) instead of spawning a PowerShell subprocess to host a
+    .NET Media.SoundPlayer. Same isolation guarantee as before — winsound
+    never touches aud.Device() or the Hijacker engine either — but without
+    the ~100-300ms it takes just to start a new PowerShell process before
+    anything is audible. That startup latency was small enough to ignore
+    while other things in this feature were badly desynced, but once
+    those got fixed it became the visible "audio starts a beat after the
+    video" gap. winsound.PlaySound(..., SND_ASYNC) returns almost
+    immediately and the OS starts playback itself, so there's no process
+    launch sitting between calling this and hearing something.
     """
     global _oneshot_handles
     # Trim dead handles
@@ -114,18 +170,18 @@ def play_oneshot(filepath):
     try:
         import sys, subprocess
         if sys.platform == 'win32':
-            # PowerShell Media.SoundPlayer — plays WAV, exits when done
-            cmd = [
-                'powershell', '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
-                f'(New-Object Media.SoundPlayer "{filepath}").PlaySync()'
-            ]
-        elif sys.platform == 'darwin':
-            cmd = ['afplay', filepath]
+            import winsound
+            duration = _probe_wav_duration(filepath)
+            winsound.PlaySound(filepath, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            handle = _WinsoundHandle(duration)
         else:
-            cmd = ['aplay', filepath]
-        proc   = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-        handle = _OneshotHandle(proc)
+            if sys.platform == 'darwin':
+                cmd = ['afplay', filepath]
+            else:
+                cmd = ['aplay', filepath]
+            proc   = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+            handle = _OneshotHandle(proc)
         _oneshot_handles.append(handle)
         print(f"[AUDIO] play_oneshot: {filepath}")
         return handle
@@ -140,6 +196,20 @@ def stop_all_oneshots():
     for h in _oneshot_handles:
         h.stop()
     _oneshot_handles = []
+
+
+# play_oneshot() spawns a genuinely separate OS process (PowerShell/afplay/
+# aplay) to play the file — that process has no inherent link to Blender's
+# own lifetime, so it happily keeps running (and keeps playing) even after
+# Blender's window closes, unless something explicitly kills it first.
+# unregister() covers the addon being disabled while Blender keeps running;
+# this atexit hook covers the far more common case of Blender itself
+# quitting — CPython's atexit callbacks still run during a normal
+# interpreter shutdown even though Blender doesn't call each addon's own
+# unregister() at that point. (A hard kill / crash bypasses this — nothing
+# running in-process can catch that — but that's not what was happening
+# here: this fixes the normal "closed Blender, sound kept playing" case.)
+atexit.register(stop_all_oneshots)
 
 
 # ---------------------------------------------------------------------------

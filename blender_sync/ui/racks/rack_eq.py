@@ -7,8 +7,10 @@
 # =============================================================================
 
 import math
+import os
 import gpu
 from gpu_extras.batch import batch_for_shader
+from core.constants import ASSETS_DIR
 # ---------------------------------------------------------------------------
 # Shader singleton — gpu.shader.from_builtin() is expensive; reuse one instance.
 # ---------------------------------------------------------------------------
@@ -58,6 +60,80 @@ RACK_RAIL_H = 32  # duplicated from Racks.py to avoid circular import
 # =============================================================================
 EQ_KNOB_SCALE    = 0.7
 EQ_KNOB_X_OFFSET = 0.0
+
+# =============================================================================
+# PACKAPUNCH SCREEN SEQUENCE
+# Animated vortex background drawn behind the frequency display, only while
+# the "packapunch" skin is active (default skin is untouched — see the
+# EQ_SCREEN_SEQ_SKIN check at the draw site below). These are the knobs to
+# hand-tune for THIS rack; the player itself is generic and reused as-is by
+# any other rack that gets one of these (core/rack_screen_sequence.py).
+#
+# EQ_SCREEN_SEQ_DIR      : folder of pre-scaled, pre-matted, pre-cropped PNG
+#                          frames — lives in the skin's own asset folder
+#                          (.../skins/packapunch/EQ_frames/) rather than
+#                          "working" since these are a shipped asset, not
+#                          scratch material, and "working" isn't pushed to
+#                          git. Originally produced by the batch pipeline
+#                          that still lives at .../working/parametricEQ/
+#                          packApunch/process_frames.py, if this sequence
+#                          ever needs regenerating from the raw source
+#                          frames (same folder, frames/).
+#                          119 frames (every other frame of the original
+#                          238 dropped) run through pngquant to cut the
+#                          shipped size — 238 raw frames @ 1261x354 RGBA
+#                          was ~83MB; this is ~18MB. Re-run both steps
+#                          together if the source footage changes: halving
+#                          the frame count on its own would double actual
+#                          playback speed unless EQ_SCREEN_SEQ_FPS below
+#                          is halved to match, which it already is here.
+# EQ_SCREEN_SEQ_FPS      : playback rate for the loop.
+# EQ_SCREEN_SEQ_STRETCH  : True  = stretch the sequence to exactly fill the
+#                                  display rect (disp_w x disp_h) — safe
+#                                  default, always fully covers the screen.
+#                          False = draw at the frame's own native pixel size
+#                                  (x scale) instead, positioned purely by
+#                                  the offsets below. Try this if stretching
+#                                  looks visibly distorted.
+# EQ_SCREEN_SEQ_WIDTH_SCALE  : fraction of disp_w to use when STRETCH is on.
+#                               1.0 = fill the full display width. Our CRT-
+#                               style PackAPunch screen reads narrower than
+#                               the display box, hence < 1.0 below.
+# EQ_SCREEN_SEQ_HEIGHT_SCALE : same, for disp_h.
+#                               Both scales shrink the sequence toward the
+#                               CENTRE of the display rect; EQ_SCREEN_SEQ_
+#                               OFFSET_X/Y below still nudge it further from
+#                               that centred position, same as before.
+# EQ_SCREEN_SEQ_OFFSET_X : unscaled px, nudge from the centred position.
+#                          Positive = right.
+# EQ_SCREEN_SEQ_OFFSET_Y : unscaled px. Positive = up.
+# =============================================================================
+EQ_SCREEN_SEQ_SKIN          = "packapunch"
+EQ_SCREEN_SEQ_DIR           = os.path.join(
+    ASSETS_DIR, "packapunch", "EQ_frames")
+EQ_SCREEN_SEQ_FPS           = 12.0  # halved alongside the frame count (238->119)
+# Power on/off: the screen animation winds down to a stop when the rack is
+# switched off, and winds back up to full speed when it's switched on again.
+EQ_SEQ_RAMP_DOWN_SEC        = 2.0   # seconds from full speed to a standstill
+EQ_SEQ_RAMP_UP_SEC          = 2.5   # seconds from standstill back to full speed
+EQ_SCREEN_SEQ_STRETCH       = True
+EQ_SCREEN_SEQ_WIDTH_SCALE   = 0.97
+EQ_SCREEN_SEQ_HEIGHT_SCALE  = 0.98
+EQ_SCREEN_SEQ_OFFSET_X      = 2
+EQ_SCREEN_SEQ_OFFSET_Y      = 0
+
+# =============================================================================
+# PACKAPUNCH CURVE COLOUR
+# The main combined-response curve reads fine as neon cyan against the old
+# flat dark background, but disappears against the blue-heavy vortex screen
+# above — swapped to neon red + a glow halo for packapunch only; every other
+# skin keeps the original cyan untouched. The fill under the curve is
+# dropped entirely for packapunch rather than recoloured — it doesn't follow
+# the screen's matted glass shape, so a flat fill just paints over the
+# vortex background underneath it.
+# =============================================================================
+EQ_PACKAPUNCH_CURVE_COLOR = (1.00, 0.08, 0.10)   # neon red, RGB 0-1
+EQ_PACKAPUNCH_CURVE_GLOW  = True                 # halo passes under the core line
 
 # =============================================================================
 # PER-KNOB X/Y NUDGE TABLES
@@ -165,6 +241,27 @@ def _eq_biquad_response(freq_hz, gain_db, band_filter_type, q, f_test):
         return 0.0
 
 
+_eq_seq_speed = {}      # rack_idx -> {"s": current speed 0..1, "t": last update time}
+
+
+def _eq_seq_speed_now(rack_idx, enabled):
+    """Playback speed of this rack's screen animation: 1 = normal, 0 = stopped.
+    Eases toward 0 when the rack is off and back toward 1 when it's on."""
+    import time as _t
+    now = _t.perf_counter()
+    st = _eq_seq_speed.get(rack_idx)
+    if st is None:                                   # first sight: no ramp
+        st = {"s": 1.0 if enabled else 0.0, "t": now}
+        _eq_seq_speed[rack_idx] = st
+    dt = min(0.25, max(0.0, now - st["t"]))
+    st["t"] = now
+    if enabled:
+        st["s"] = min(1.0, st["s"] + dt / max(0.01, EQ_SEQ_RAMP_UP_SEC))
+    else:
+        st["s"] = max(0.0, st["s"] - dt / max(0.01, EQ_SEQ_RAMP_DOWN_SEC))
+    return st["s"]
+
+
 def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
     """
     Parametric EQ rack body — Adobe Premiere Pro style.
@@ -191,6 +288,10 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
     rail_h = RACK_RAIL_H * scale
     body_h = rh - rail_h
     # ── Skin background — full rack height (rail/title now baked into PNG)
+    # _eq_tex is reused further down (packapunch "frame" layer, drawn again
+    # UV-sliced to just the display sub-rect) so it must stay a safely
+    # referenceable name even if this try block fails before assignment.
+    _eq_tex = None
     try:
         from ui.mixer.texture_cache import get_texture as _gtc_eq
         from ui.mixer.texture_cache import blit_texture as _blt_eq
@@ -201,7 +302,6 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
             _draw_rect(rx, ry, rw, body_h, (0.07, 0.07, 0.07, 1.0))
     except Exception:
         _draw_rect(rx, ry, rw, body_h, (0.07, 0.07, 0.07, 1.0))
-
 
     EQ7_BANDS = [
         ("L",  (0.30, 0.60, 1.00), "low_shelf",   80.0,  0.7),
@@ -242,28 +342,86 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
     knob_h = body_h * 0.44 - 6 * scale
     knob_y = ry + 2 * scale                      # knob strip at bottom of body
 
+    # -----------------------------------------------------------------------
+    # PLOT AREA — where all frequency-axis content (grid, spectrum, curves,
+    # band dots) actually draws. Equals the full display box for every skin
+    # except packapunch, where the CRT-style screen art is narrower than the
+    # box itself — without this, the curve/grid/dots draw past the visible
+    # screen edges into the surrounding rack art. Same width/height-scale +
+    # centre + offset math as the background sequence below, computed once
+    # here and shared so nothing drifts out of sync with where the vortex
+    # background itself sits.
+    # -----------------------------------------------------------------------
+    plot_x, plot_w = disp_x, disp_w
+    plot_y, plot_h = disp_y, disp_h
+    # Computed once here and reused for every packapunch-specific choice
+    # below (background sequence, plot-area narrowing, fill removal, curve
+    # colour) instead of re-querying the active skin at each separate site.
+    _is_packapunch = False
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_plot
+        _is_packapunch = _gas_plot() == EQ_SCREEN_SEQ_SKIN
+        if _is_packapunch:
+            plot_w = disp_w * EQ_SCREEN_SEQ_WIDTH_SCALE
+            plot_h = disp_h * EQ_SCREEN_SEQ_HEIGHT_SCALE
+            plot_x = disp_x + (disp_w - plot_w) * 0.5 + EQ_SCREEN_SEQ_OFFSET_X * scale
+            plot_y = disp_y + (disp_h - plot_h) * 0.5 + EQ_SCREEN_SEQ_OFFSET_Y * scale
+    except Exception:
+        pass
+
     db_range  = 18.0
-    zero_db_y = disp_y + disp_h * 0.5
-    px_per_db = (disp_h * 0.5) / db_range
+    zero_db_y = plot_y + plot_h * 0.5
+    px_per_db = (plot_h * 0.5) / db_range
 
     shader = _get_shader()
 
     # -----------------------------------------------------------------------
     # DISPLAY BACKGROUND + GRID
     # -----------------------------------------------------------------------
-    _draw_rect(disp_x, disp_y, disp_w, disp_h, (0.035, 0.035, 0.040, 1.0))
+    _drew_seq_bg = False
+    try:
+        if _is_packapunch:
+            from ui.mixer.texture_cache import blit_texture as _blt_seq
+            from core.rack_screen_sequence import get_sequence_frame as _gsf_eq
+            _seq_tex = _gsf_eq("eq_packapunch_vortex", EQ_SCREEN_SEQ_DIR,
+                                fps=EQ_SCREEN_SEQ_FPS,
+                                speed=_eq_seq_speed_now(rack_idx, rack.enabled),
+                                phase_key=rack_idx)
+            if _seq_tex is not None:
+                if EQ_SCREEN_SEQ_STRETCH:
+                    # plot_x/plot_w/plot_y/plot_h already ARE this exact
+                    # box (scale + centre + offset), computed once above so
+                    # the curve/grid/dots line up with it automatically.
+                    _seq_x, _seq_y, _seq_w, _seq_h = plot_x, plot_y, plot_w, plot_h
+                else:
+                    _seq_w = _seq_tex.width * scale
+                    _seq_h = _seq_tex.height * scale
+                    _seq_x = plot_x + (plot_w - _seq_w) * 0.5
+                    _seq_y = plot_y + (plot_h - _seq_h) * 0.5
+                # ALPHA, not the default ALPHA_PREMULT — these frames carry
+                # straight (non-premultiplied) alpha from the GIMP/PIL
+                # pipeline that made them, same convention as the mute/solo
+                # glow overlays.
+                _blt_seq(_seq_tex, _seq_x, _seq_y, _seq_w, _seq_h,
+                         key="eq_packapunch_vortex", blend="ALPHA")
+                _drew_seq_bg = True
+    except Exception as e:
+        print(f"[EQ] packapunch screen sequence draw failed: {e}")
+
+    if not _drew_seq_bg:
+        _draw_rect(disp_x, disp_y, disp_w, disp_h, (0.035, 0.035, 0.040, 1.0))
 
     for db_val in (18, 12, 6, 0, -6, -12, -18):
         gy = zero_db_y + db_val * px_per_db
-        if not (disp_y <= gy <= disp_y + disp_h):
+        if not (plot_y <= gy <= plot_y + plot_h):
             continue
         bright = 0.22 if db_val == 0 else 0.09
         lw     = max(1.0, scale) if db_val == 0 else max(0.5, scale * 0.5)
-        _draw_rect(disp_x, gy, disp_w, lw, (bright, bright, bright, 0.9))
+        _draw_rect(plot_x, gy, plot_w, lw, (bright, bright, bright, 0.9))
         lbl   = "0dB" if db_val == 0 else f"{db_val:+d}"
         fs_db = max(1, int(7 * scale))
         tw_db = _text_width(lbl, fs_db)
-        _draw_text(lbl, disp_x - tw_db - 4 * scale,
+        _draw_text(lbl, plot_x - tw_db - 4 * scale,
                    gy - fs_db * 0.5, fs_db, (0.30, 0.30, 0.30, 1.0))
 
     freq_marks = [
@@ -272,15 +430,15 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
     ]
     for fhz_m, lbl_m in freq_marks:
         t_m  = (_m.log10(fhz_m) - EQ_FREQ_MIN_LOG) / (EQ_FREQ_MAX_LOG - EQ_FREQ_MIN_LOG)
-        gx_m = disp_x + t_m * disp_w
-        if not (disp_x <= gx_m <= disp_x + disp_w):
+        gx_m = plot_x + t_m * plot_w
+        if not (plot_x <= gx_m <= plot_x + plot_w):
             continue
-        _draw_rect(gx_m, disp_y, max(0.5, scale * 0.5), disp_h,
+        _draw_rect(gx_m, plot_y, max(0.5, scale * 0.5), plot_h,
                    (0.11, 0.11, 0.11, 1.0))
         fs_f = max(1, int(7 * scale))
         tw_f = _text_width(lbl_m, fs_f)
         _draw_text(lbl_m, gx_m - tw_f * 0.5,
-                   disp_y - 11 * scale, fs_f, (0.28, 0.28, 0.28, 1.0))
+                   plot_y - 11 * scale, fs_f, (0.28, 0.28, 0.28, 1.0))
 
     # -----------------------------------------------------------------------
     # SPECTRUM ANALYSER — FabFilter Pro-Q style
@@ -322,9 +480,9 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
             # TRI_STRIP naturally fills between them with no cross-over
             verts = []
             for t_x, amp in pairs:
-                px = disp_x + t_x * disp_w
-                py = disp_y + amp * disp_h * h_scale
-                verts.append((px, disp_y))   # floor point
+                px = plot_x + t_x * plot_w
+                py = plot_y + amp * plot_h * h_scale
+                verts.append((px, plot_y))   # floor point
                 verts.append((px, py))        # top point
             _b = _bfs(_sh, "TRI_STRIP", {"pos": verts})
             _sh.bind(); _sh.uniform_float("color", color); _b.draw(_sh)
@@ -335,7 +493,7 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
             import gpu
             from gpu_extras.batch import batch_for_shader as _bfs
             _sh = _get_shader()
-            verts = [(disp_x + t*disp_w, disp_y + a*disp_h*h_scale)
+            verts = [(plot_x + t*plot_w, plot_y + a*plot_h*h_scale)
                      for t, a in pairs]
             _b = _bfs(_sh, "LINE_STRIP", {"pos": verts})
             gpu.state.line_width_set(max(1.0, scale * 1.2))
@@ -343,7 +501,13 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
             gpu.state.line_width_set(1.0)
 
         if freq_amp:
-            _spectrum_poly(freq_amp, (0.17, 0.17, 0.22, 0.85))
+            # The filled silhouette (not just its edge line) is what was
+            # blocking the vortex background — same reasoning as dropping
+            # the EQ-curve fill: it doesn't follow the screen's matted glass
+            # shape, so a solid fill just paints over what's behind it.
+            # Dropped for packapunch only; default skin keeps both layers.
+            if not _is_packapunch:
+                _spectrum_poly(freq_amp, (0.17, 0.17, 0.22, 0.85))
             _spectrum_edge(freq_amp, (0.35, 0.35, 0.42, 0.70))
 
             # Post-EQ layer — apply current EQ curve to each bin
@@ -359,7 +523,8 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
                             fhz_s, gdb_s, EQ7_BANDS[bi][2], q_s, freq_hz)
                     lin = 10.0 ** (eq_db / 20.0)
                     post_pairs.append((t_x, max(0.0, min(1.0, amp * lin))))
-                _spectrum_poly(post_pairs, (0.20, 0.28, 0.38, 0.65))
+                if not _is_packapunch:
+                    _spectrum_poly(post_pairs, (0.20, 0.28, 0.38, 0.65))
                 _spectrum_edge(post_pairs, (0.45, 0.62, 0.85, 0.95))
             except Exception:
                 pass
@@ -390,22 +555,26 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
         for pi in range(N_PTS):
             t   = pi / (N_PTS - 1)
             db  = max(-db_range * 1.1, min(db_range * 1.1, combined_db[pi]))
-            cpx = disp_x + t * disp_w
+            cpx = plot_x + t * plot_w
             cpy = zero_db_y + db * px_per_db
-            cpy = max(disp_y + 1, min(disp_y + disp_h - 1, cpy))
+            cpy = max(plot_y + 1, min(plot_y + plot_h - 1, cpy))
             curve_pts.append((cpx, cpy))
 
-        # Filled teal area between curve and 0dB
-        y_zero  = max(disp_y, min(disp_y + disp_h, zero_db_y))
-        fill_v2 = []
-        for i in range(N_PTS):
-            fill_v2.append(curve_pts[i])
-            fill_v2.append((curve_pts[i][0], y_zero))
-        if len(fill_v2) >= 4:
-            bfill = batch_for_shader(shader, "TRI_STRIP", {"pos": fill_v2})
-            shader.bind()
-            shader.uniform_float("color", (0.05, 0.35, 0.52, 0.18))
-            bfill.draw(shader)
+        # Filled area between curve and 0dB — teal, for every skin except
+        # packapunch: the vortex screen shows through the gap underneath the
+        # curve there, a flat fill would just paint over it, and the fill's
+        # own shape doesn't follow the screen's matted glass cutout anyway.
+        if not _is_packapunch:
+            y_zero  = max(plot_y, min(plot_y + plot_h, zero_db_y))
+            fill_v2 = []
+            for i in range(N_PTS):
+                fill_v2.append(curve_pts[i])
+                fill_v2.append((curve_pts[i][0], y_zero))
+            if len(fill_v2) >= 4:
+                bfill = batch_for_shader(shader, "TRI_STRIP", {"pos": fill_v2})
+                shader.bind()
+                shader.uniform_float("color", (0.05, 0.35, 0.52, 0.18))
+                bfill.draw(shader)
 
         # Per-band dim curves
         for bi in range(N_BANDS):
@@ -420,9 +589,9 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
                 db  = _eq_biquad_response(fhz_b, gdb_b, bftype_b, q_b,
                                           _eq_freq_from_norm(t))
                 db  = max(-db_range * 1.1, min(db_range * 1.1, db))
-                bpx  = disp_x + t * disp_w
+                bpx  = plot_x + t * plot_w
                 bpyv = zero_db_y + db * px_per_db
-                bpyv = max(disp_y + 1, min(disp_y + disp_h - 1, bpyv))
+                bpyv = max(plot_y + 1, min(plot_y + plot_h - 1, bpyv))
                 bpts.append((bpx, bpyv))
             if len(bpts) >= 2:
                 bb_b = batch_for_shader(shader, "LINE_STRIP", {"pos": bpts})
@@ -432,20 +601,38 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
                 bb_b.draw(shader)
                 gpu.state.line_width_set(1.0)
 
-        # Combined curve (bright cyan)
+        # Combined curve — bright cyan normally; neon red with a glow halo
+        # for packapunch, where cyan disappears against the blue vortex
+        # screen behind it.
         if len(curve_pts) >= 2:
             bc = batch_for_shader(shader, "LINE_STRIP", {"pos": curve_pts})
-            gpu.state.line_width_set(max(2.0, scale * 2.0))
             shader.bind()
-            shader.uniform_float("color", (0.15, 0.75, 1.00, 0.95))
-            bc.draw(shader)
+            if _is_packapunch:
+                if EQ_PACKAPUNCH_CURVE_GLOW:
+                    # Wide, translucent, additive passes first — overlapping
+                    # alpha brightens where the curve bends back on itself,
+                    # the same core+halo idea as the mute/solo glow PNGs
+                    # earlier, just drawn as line passes instead of a texture.
+                    gpu.state.blend_set('ADDITIVE')
+                    for halo_w, halo_a in ((10.0, 0.05), (6.0, 0.09), (3.5, 0.16)):
+                        gpu.state.line_width_set(max(1.0, halo_w * scale))
+                        shader.uniform_float("color", (*EQ_PACKAPUNCH_CURVE_COLOR, halo_a))
+                        bc.draw(shader)
+                    gpu.state.blend_set('ALPHA')
+                gpu.state.line_width_set(max(2.0, scale * 2.0))
+                shader.uniform_float("color", (*EQ_PACKAPUNCH_CURVE_COLOR, 0.95))
+                bc.draw(shader)
+            else:
+                gpu.state.line_width_set(max(2.0, scale * 2.0))
+                shader.uniform_float("color", (0.15, 0.75, 1.00, 0.95))
+                bc.draw(shader)
             gpu.state.line_width_set(1.0)
 
         # Band handle dots — positioned on the combined curve at each band freq
         for bi in range(N_BANDS):
             gdb_b, fhz_b, q_b, gn_b, fn_b, qn_b = band_params[bi]
             bname_b, bcol_b = EQ7_BANDS[bi][0], EQ7_BANDS[bi][1]
-            dot_x = disp_x + fn_b * disp_w
+            dot_x = plot_x + fn_b * plot_w
             f_here = _eq_freq_from_norm(fn_b)
             dot_db = sum(
                 _eq_biquad_response(band_params[b][1], band_params[b][0],
@@ -454,7 +641,7 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
             )
             dot_db = max(-db_range, min(db_range, dot_db))
             dot_y  = zero_db_y + dot_db * px_per_db
-            dot_y  = max(disp_y + 5*scale, min(disp_y + disp_h - 5*scale, dot_y))
+            dot_y  = max(plot_y + 5*scale, min(plot_y + plot_h - 5*scale, dot_y))
             dot_r  = max(6*scale, 7*scale)
             _draw_circle(dot_x, dot_y, dot_r + 2*scale, (*bcol_b, 0.20))
             _draw_circle(dot_x, dot_y, dot_r,           (*bcol_b, 1.00))
@@ -466,6 +653,37 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
 
     except Exception:
         import traceback; traceback.print_exc()
+
+    # ── PackAPunch "frame" layer — garbage-matte the live content.
+    # Luke cut the screen's glass area out of the rack's own background art
+    # (ui/assets/skins/packapunch/rack_eq_bg.png) so it's transparent there,
+    # bezel/tentacle art everywhere else. Redrawing that SAME texture here,
+    # on top of the vortex sequence + grid/spectrum/curves/dots, means the
+    # true rounded-CRT screen shape (not a rectangular approximation) is
+    # what clips the live content — any overflow just lands under opaque
+    # bezel pixels and disappears, no extra per-element coordinate math.
+    #
+    # UV-sliced to the display sub-rect only (not the full rx/ry/rw/rh rack
+    # rect the first draw used) so this second pass doesn't re-cover the
+    # knob strip below, which the rest of this function still draws using
+    # that first, full-rack copy of the same art.
+    if _is_packapunch and _eq_tex:
+        try:
+            from ui.mixer.texture_cache import blit_texture as _blt_frame
+            u0 = (disp_x - rx) / rw
+            u1 = (disp_x + disp_w - rx) / rw
+            v0 = (disp_y - ry) / rh
+            v1 = (disp_y + disp_h - ry) / rh
+            # Same texture as the first (full-rack) draw above, which used
+            # the default ALPHA_PREMULT blend — skin PNGs are pre-multiplied,
+            # so this second pass must match it rather than use "ALPHA"
+            # (that's for non-premultiplied overlays like glass layers) or
+            # the cutout's soft edge would blend with the wrong darkness.
+            _blt_frame(_eq_tex, disp_x, disp_y, disp_w, disp_h,
+                       key="rack_eq_bg_frame", blend="ALPHA_PREMULT",
+                       uv=(u0, v0, u1, v1))
+        except Exception:
+            pass
 
     # Display border
     bv3 = [(disp_x, disp_y), (disp_x + disp_w, disp_y),
@@ -505,12 +723,14 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
         bname_b, bcol_b, bftype_b = EQ7_BANDS[bi][0], EQ7_BANDS[bi][1], EQ7_BANDS[bi][2]
         col_cx = disp_x + (bi + 0.5) * col_w + _eq_x_shift
 
-        # Band label
-        tw_l = _text_width(bname_b, fs_lbl)
-        _draw_text(bname_b,
-                   col_cx - tw_l * 0.5 + EQ_LABEL_X[bi] * scale,
-                   row_lbl - fs_lbl    + EQ_LABEL_Y[bi] * scale,
-                   fs_lbl, (*bcol_b, 1.0))
+        # Band label (L / 1 / 2 ... H) — baked into the packapunch art, so only
+        # drawn for the other skins.
+        if not _is_packapunch:
+            tw_l = _text_width(bname_b, fs_lbl)
+            _draw_text(bname_b,
+                       col_cx - tw_l * 0.5 + EQ_LABEL_X[bi] * scale,
+                       row_lbl - fs_lbl    + EQ_LABEL_Y[bi] * scale,
+                       fs_lbl, (*bcol_b, 1.0))
 
         # Gain knob
         gain_str = f"{gdb_b:+.1f}dB"

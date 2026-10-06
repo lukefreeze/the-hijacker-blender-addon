@@ -10,9 +10,11 @@
 print("[RACK_BASE] loading rack_base.py")
 
 import math
+import os
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
+from core.constants import ASSETS_DIR
 # ---------------------------------------------------------------------------
 # Shader singleton — gpu.shader.from_builtin() is expensive; reuse one instance.
 # ---------------------------------------------------------------------------
@@ -173,6 +175,55 @@ SB_KNOB_X_COL2  = 1.5   # p5 Knee      (top) / p4 Gain    (bottom)
 SB_KNOB_Y_ROW0  = 4.5   # top row    — positive moves up
 SB_KNOB_Y_ROW1  = -5.0   # bottom row — positive moves up
 
+# =============================================================================
+# PackAPunch COMP_SINGLE screen — looping "trench" image sequence behind the
+# spectrum graph, plus a narrower graph box to match the smaller CRT screen
+# in the packapunch background art. Same pattern as rack_eq.py's
+# EQ_SCREEN_SEQ_* constants: tune these by eye with the addon reloaded
+# (disable/enable), no restart needed.
+#
+# The background sequence and the live graph (bars/grid/GR-curve) each get
+# their OWN independent width/height scale + x/y offset, since the trench
+# footage and the bars don't necessarily need to sit in exactly the same
+# sub-rect of the screen. Both sets measure against the SAME original
+# (non-packapunch) spec_x/y/w/h box, shrinking toward ITS centre — they're
+# just two independent crops of that one reference box, not nested inside
+# each other.
+#
+# SB_SCREEN_SEQ_DIR    : folder of pre-warped, pre-matted PNG frames (see
+#                        the GIMP-mask warp pipeline that produced them —
+#                        .../working/singlebandComp/packApunch/editted/ —
+#                        shipped copy lives in the skin's own asset folder
+#                        below since "working" isn't pushed to git).
+# SB_SCREEN_SEQ_FPS    : playback rate for the loop. Only 12 source frames,
+#                        so this mostly just sets how fast the trench
+#                        pulses — nudge until it feels right.
+# SB_BG_SEQ_WIDTH_SCALE / SB_BG_SEQ_HEIGHT_SCALE
+#                      : fraction of the original spec_w/spec_h the
+#                        background sequence fills. Shrinks toward the
+#                        CENTRE of the original box; OFFSET_X/Y nudge it
+#                        further from there.
+# SB_BG_SEQ_OFFSET_X / SB_BG_SEQ_OFFSET_Y
+#                      : unscaled px. X positive = right, Y positive = up.
+# SB_GRAPH_WIDTH_SCALE / SB_GRAPH_HEIGHT_SCALE / SB_GRAPH_OFFSET_X /
+# SB_GRAPH_OFFSET_Y    : same four, but for the bars/grid/GR-curve box.
+# =============================================================================
+SB_SCREEN_SEQ_SKIN       = "packapunch"
+SB_SCREEN_SEQ_DIR        = os.path.join(ASSETS_DIR, "packapunch", "SingleBand_frames")
+SB_SCREEN_SEQ_FPS        = 12.0
+
+SB_BG_SEQ_WIDTH_SCALE    = 0.675   # starting guess — "almost half" per Luke, tune live
+SB_BG_SEQ_HEIGHT_SCALE   = 1.125
+SB_BG_SEQ_OFFSET_X       = 10
+SB_BG_SEQ_OFFSET_Y       = 15
+
+SB_GRAPH_WIDTH_SCALE     = 0.675   # starting guess, same as the bg sequence — tune live
+SB_GRAPH_HEIGHT_SCALE    = 1.125
+SB_GRAPH_OFFSET_X        = 10
+SB_GRAPH_OFFSET_Y        = 15
+
+SB_SPEC_BANDS_PACKAPUNCH = SPEC_BANDS // 2   # halved bar count for the narrower screen
+
 # EFFECT_TYPES and PRESETS are fetched lazily from Racks inside each function
 # that needs them — see _get_racks_state() helper below.
 
@@ -201,6 +252,75 @@ try:
 except ImportError:
     pass
 
+# --- PackAPunch singleband: power on / off --------------------------------
+# OFF: the screen animation fades to black and every lamp / LED / lit display on
+# the chassis goes dark (a second copy of the chassis art with the lights turned
+# off, rack_comp_single_bg_off.png, is faded in over the normal one). The rest of
+# the rack is NOT dimmed. ON: both fade back. The buttons themselves are baked
+# into the art, so no button overlays are drawn for this skin (see
+# PACKAPUNCH_BAKED_BTNS) - the lights-off art already includes a dimmed ON button.
+SB_POWER_DOWN_SEC = 0.9     # fade-out time when switched off
+SB_POWER_UP_SEC   = 1.1     # fade-in time when switched back on
+_sb_power_state   = {}      # rack_idx -> {"s": 0..1 raw level, "t": last update}
+
+
+def _sb_rack_enabled(rack_idx):
+    try:
+        import bpy as _bpy_pw
+        _sc = _bpy_pw.context.scene
+        _rs = getattr(_sc, "pb_racks", []) if _sc else []
+        return _rs[rack_idx].enabled if rack_idx < len(_rs) else True
+    except Exception:
+        return True
+
+
+def _sb_power(rack_idx, enabled=None):
+    """Eased power level of a singleband rack: 1 = fully on, 0 = off."""
+    import time as _t_pw
+    if enabled is None:
+        enabled = _sb_rack_enabled(rack_idx)
+    now = _t_pw.perf_counter()
+    st = _sb_power_state.get(rack_idx)
+    if st is None:                                   # first sight: no fade
+        st = {"s": 1.0 if enabled else 0.0, "t": now}
+        _sb_power_state[rack_idx] = st
+    dt = min(0.25, max(0.0, now - st["t"]))
+    st["t"] = now
+    if enabled:
+        st["s"] = min(1.0, st["s"] + dt / max(0.01, SB_POWER_UP_SEC))
+    else:
+        st["s"] = max(0.0, st["s"] - dt / max(0.01, SB_POWER_DOWN_SEC))
+    s = st["s"]
+    return s * s * (3.0 - 2.0 * s)
+
+
+_sb_lights_state = {}       # rack_idx -> {"s": 0..1 raw level, "t": last update}
+_sb_last_bars    = {}       # rack_idx -> last spectrum frame, kept so the bars can fade out
+
+
+def _sb_lights_power(rack_idx, enabled=None):
+    """Level of the chassis lights and of the graph / curve on the screen:
+    switching ON snaps straight to 1 (lights just turn on); switching OFF fades
+    1 -> 0 over SB_POWER_DOWN_SEC. (The screen animation has its own, fading,
+    _sb_power level.)"""
+    import time as _t_lp
+    if enabled is None:
+        enabled = _sb_rack_enabled(rack_idx)
+    now = _t_lp.perf_counter()
+    st = _sb_lights_state.get(rack_idx)
+    if st is None:
+        st = {"s": 1.0 if enabled else 0.0, "t": now}
+        _sb_lights_state[rack_idx] = st
+    dt = min(0.25, max(0.0, now - st["t"]))
+    st["t"] = now
+    if enabled:
+        st["s"] = 1.0
+    else:
+        st["s"] = max(0.0, st["s"] - dt / max(0.01, SB_POWER_DOWN_SEC))
+    s = st["s"]
+    return s * s * (3.0 - 2.0 * s)
+
+
 def _draw_spectrum(rx, ry, rw, rh, rack_idx, scale):
     """Draw the spectrum analyser display."""
     # Lazy import — get_rack_channels not available at module level
@@ -209,41 +329,107 @@ def _draw_spectrum(rx, ry, rw, rh, rack_idx, scale):
         get_rack_channels = _rs_spec.get_rack_channels
     except Exception:
         get_rack_channels = lambda r: set()
-    # Background — skin PNG if available, otherwise solid colour
+    # Is packapunch active? Computed once, reused below for: which box the
+    # background sequence gets, which (independent) box the graph itself
+    # gets, and halving the bar count further down.
+    _is_packapunch = False
     try:
-        from ui.mixer.draw_utils import draw_element as _de
-        _rack_skin_key = {
-            "COMP_MULTI":  "rack_comp_multi_bg",
-            "COMP_SINGLE": "rack_comp_single_bg",
-            "EQ":          "rack_eq_bg",
-            "REVERB":      "rack_reverb_bg",
-            "NOISE_GATE":  "rack_noisegate_bg",
-            "DELAY":       "rack_delay_bg",
-            "BOOSTER":     "rack_booster_bg",
-            "MIXDOWN":     "rack_mixdown_bg",
-        }.get(getattr(rack, 'effect_type', ''), None)
-        if _rack_skin_key:
-            _de(_rack_skin_key, rx, ry, rw, rh, _draw_rect, (0.04, 0.04, 0.04, 1.0))
-        else:
-            _draw_rect(rx, ry, rw, rh, (0.04, 0.04, 0.04, 1.0))
+        from ui.mixer.texture_cache import get_active_skin as _gas_spec
+        _is_packapunch = _gas_spec() == SB_SCREEN_SEQ_SKIN
     except Exception:
-        _draw_rect(rx, ry, rw, rh, (0.04, 0.04, 0.04, 1.0))
-    # Border
+        pass
+
+    # rx/ry/rw/rh is the ORIGINAL (non-packapunch) box the caller always
+    # passes in now. The background sequence and the graph itself each get
+    # their own independently shrunk+offset crop of that same box — see the
+    # SB_BG_SEQ_* / SB_GRAPH_* constants block for why they're kept apart.
+    bg_x, bg_y, bg_w, bg_h       = rx, ry, rw, rh
+    graph_x, graph_y, graph_w, graph_h = rx, ry, rw, rh
+    if _is_packapunch:
+        bg_w = rw * SB_BG_SEQ_WIDTH_SCALE
+        bg_h = rh * SB_BG_SEQ_HEIGHT_SCALE
+        bg_x = rx + (rw - bg_w) * 0.5 + SB_BG_SEQ_OFFSET_X * scale
+        bg_y = ry + (rh - bg_h) * 0.5 + SB_BG_SEQ_OFFSET_Y * scale
+
+        graph_w = rw * SB_GRAPH_WIDTH_SCALE
+        graph_h = rh * SB_GRAPH_HEIGHT_SCALE
+        graph_x = rx + (rw - graph_w) * 0.5 + SB_GRAPH_OFFSET_X * scale
+        graph_y = ry + (rh - graph_h) * 0.5 + SB_GRAPH_OFFSET_Y * scale
+
+    # Background — packapunch's looping trench sequence (own box, bg_x/y/
+    # w/h), else skin PNG if available, else solid colour (the fallback
+    # still uses the full original rx/ry/rw/rh, same as before).
+    _drew_bg = False
+    if _is_packapunch:
+        try:
+            from ui.mixer.texture_cache import blit_texture as _blt_sbseq
+            from core.rack_screen_sequence import get_sequence_frame as _gsf_sb
+            _seq_tex = _gsf_sb("sb_packapunch_trench", SB_SCREEN_SEQ_DIR,
+                                fps=SB_SCREEN_SEQ_FPS)
+            if _seq_tex is not None:
+                _sb_pw = _sb_power(rack_idx)
+                if _sb_pw >= 0.999:
+                    _blt_sbseq(_seq_tex, bg_x, bg_y, bg_w, bg_h,
+                               key="sb_packapunch_trench", blend="ALPHA")
+                else:
+                    # fading to / from black: black behind, frame darkened by the power level
+                    _draw_rect(bg_x, bg_y, bg_w, bg_h, (0.0, 0.0, 0.0, 1.0))
+                    if _sb_pw > 0.003:
+                        from ui.mixer.texture_cache import blit_texture_tinted as _blt_sbfade
+                        _blt_sbfade(_seq_tex, bg_x, bg_y, bg_w, bg_h,
+                                    color=(_sb_pw, _sb_pw, _sb_pw, 1.0), blend="ALPHA",
+                                    key="sb_packapunch_trench")
+                _drew_bg = True
+        except Exception as e:
+            print(f"[SPEC] packapunch screen sequence draw failed: {e}")
+
+    if not _drew_bg:
+        try:
+            from ui.mixer.draw_utils import draw_element as _de
+            _rack_skin_key = {
+                "COMP_MULTI":  "rack_comp_multi_bg",
+                "COMP_SINGLE": "rack_comp_single_bg",
+                "EQ":          "rack_eq_bg",
+                "REVERB":      "rack_reverb_bg",
+                "NOISE_GATE":  "rack_noisegate_bg",
+                "DELAY":       "rack_delay_bg",
+                "BOOSTER":     "rack_booster_bg",
+                "MIXDOWN":     "rack_mixdown_bg",
+            }.get(getattr(rack, 'effect_type', ''), None)
+            if _rack_skin_key:
+                _de(_rack_skin_key, rx, ry, rw, rh, _draw_rect, (0.04, 0.04, 0.04, 1.0))
+            else:
+                _draw_rect(rx, ry, rw, rh, (0.04, 0.04, 0.04, 1.0))
+        except Exception:
+            _draw_rect(rx, ry, rw, rh, (0.04, 0.04, 0.04, 1.0))
+    # PackAPunch: graph / curve fade out when the rack is switched off and snap
+    # back on with it (see _sb_lights_power). _ga multiplies every alpha below.
+    _ga = _sb_lights_power(rack_idx) if _is_packapunch else 1.0
+    def _ga_col(c):
+        return (c[0], c[1], c[2], c[3] * _ga) if _ga < 0.999 else c
+    _graph_visible = _ga > 0.003
+
+    # Border — around the graph box, not the full original rx/ry/rw/rh
     shader = _get_shader()
-    verts = [(rx,ry),(rx+rw,ry),(rx+rw,ry+rh),(rx,ry+rh),(rx,ry)]
+    verts = [(graph_x,graph_y),(graph_x+graph_w,graph_y),
+             (graph_x+graph_w,graph_y+graph_h),(graph_x,graph_y+graph_h),
+             (graph_x,graph_y)]
     batch = batch_for_shader(shader, "LINE_STRIP", {"pos": verts})
-    shader.bind(); shader.uniform_float("color", (0.15,0.15,0.15,1.0))
-    batch.draw(shader)
+    shader.bind(); shader.uniform_float("color", _ga_col((0.15,0.15,0.15,1.0)))
+    if _graph_visible:
+        batch.draw(shader)
 
     # Grid lines horizontal (every 6dB)
     for i in range(1, 6):
-        gy = ry + (i/6)*rh
-        _draw_rect(rx, gy, rw, max(0.5, scale*0.5), (0.1,0.1,0.1,1.0))
+        _gy = graph_y + (i/6)*graph_h
+        if _graph_visible:
+            _draw_rect(graph_x, _gy, graph_w, max(0.5, scale*0.5), _ga_col((0.1,0.1,0.1,1.0)))
 
     # Grid lines vertical
     for i in range(1, 8):
-        gx = rx + (i/8)*rw
-        _draw_rect(gx, ry, max(0.5, scale*0.5), rh, (0.1,0.1,0.1,1.0))
+        _gx = graph_x + (i/8)*graph_w
+        if _graph_visible:
+            _draw_rect(_gx, graph_y, max(0.5, scale*0.5), graph_h, _ga_col((0.1,0.1,0.1,1.0)))
 
     # Spectrum bars — clear when rack is bypassed, no static fallback
     fft_flat = None
@@ -277,30 +463,42 @@ def _draw_spectrum(rx, ry, rw, rh, rack_idx, scale):
                                 fft_flat = _np.array(all_bins, dtype=float)
         except Exception:
             fft_flat = None
+    if _is_packapunch:
+        # keep the last spectrum so the bars can fade out after switch-off
+        if fft_flat is not None:
+            _sb_last_bars[rack_idx] = fft_flat
+        elif not _rack_on and _graph_visible:
+            fft_flat = _sb_last_bars.get(rack_idx)
 
-    bar_w = (rw - 4*scale) / SPEC_BANDS
-    if fft_flat is not None and _rack_on:
+    # Halved bar count on packapunch — the graph box itself is already
+    # roughly half the width (see SB_GRAPH_WIDTH_SCALE), so halving the
+    # band count keeps individual bars close to their normal-skin width
+    # instead of cramming the full 48 into a much narrower screen.
+    _spec_bands = SB_SPEC_BANDS_PACKAPUNCH if _is_packapunch else SPEC_BANDS
+
+    bar_w = (graph_w - 4*scale) / _spec_bands
+    if fft_flat is not None and (_rack_on or (_is_packapunch and _graph_visible)):
         import math as _mth
         n_bins = len(fft_flat)
 
         # Log-spaced centre bin for each bar
-        centres = [_mth.pow(n_bins, b / SPEC_BANDS) - 1.0
-                   for b in range(SPEC_BANDS)]
+        centres = [_mth.pow(n_bins, b / _spec_bands) - 1.0
+                   for b in range(_spec_bands)]
 
         # Sigma = half the gap to adjacent centres, wider for low-freq bars
         # that share only a few real FFT bins between many display bars
         sigmas = []
-        for b in range(SPEC_BANDS):
+        for b in range(_spec_bands):
             if b == 0:
                 gap = max(0.5, centres[1] - centres[0])
-            elif b == SPEC_BANDS - 1:
+            elif b == _spec_bands - 1:
                 gap = max(0.5, centres[-1] - centres[-2])
             else:
                 gap = max(0.5, (centres[b + 1] - centres[b - 1]) * 0.5)
             sigmas.append(max(1.5, gap * 1.5))
 
-        for b in range(SPEC_BANDS):
-            t      = b / SPEC_BANDS
+        for b in range(_spec_bands):
+            t      = b / _spec_bands
             centre = centres[b]
             sigma  = sigmas[b]
             # Gaussian-weighted average — each bar blends across its neighbourhood
@@ -314,13 +512,13 @@ def _draw_spectrum(rx, ry, rw, rh, rack_idx, scale):
                 total_v += w * float(fft_flat[i])
             h_frac = (total_v / total_w) if total_w > 0 else float(fft_flat[max(0, min(n_bins - 1, int(centre)))])
             h_frac = max(0.04, min(0.95, h_frac))
-            bar_h  = h_frac * rh
-            bx     = rx + 2*scale + b * bar_w
+            bar_h  = h_frac * graph_h
+            bx     = graph_x + 2*scale + b * bar_w
             if t < 0.3:   col = (0.0, 0.7,  0.45, 0.75)
             elif t < 0.6: col = (0.0, 0.85, 0.55, 0.85)
             elif t < 0.8: col = (0.9, 0.65, 0.0,  0.7)
             else:         col = (0.7, 0.35, 0.0,  0.5)
-            _draw_rect(bx, ry, max(bar_w - scale, 1.0), bar_h, col)
+            _draw_rect(bx, graph_y, max(bar_w - scale, 1.0), bar_h, _ga_col(col))
 
     # GR curve — classic soft knee transfer function (input→output diagonal).
     # X = input level -60..0 dB, Y = output level -60..0 dB.
@@ -348,19 +546,22 @@ def _draw_spectrum(rx, ry, rw, rh, rack_idx, scale):
                 else:
                     out_db = thr_db + (in_db - thr_db) / ratio
                 out_norm = (out_db + 60.0) / 60.0
-                pts.append((rx + t*rw, ry + out_norm*rh))
+                pts.append((graph_x + t*graph_w, graph_y + out_norm*graph_h))
 
             # Thick red diagonal line — clearly visible over bars
             for i in range(len(pts)-1):
+                if not _graph_visible:
+                    break
                 _draw_line(pts[i][0], pts[i][1],
                            pts[i+1][0], pts[i+1][1],
-                           (0.9, 0.2, 0.2, 0.9), max(2.5, scale*2.5))
+                           _ga_col((0.9, 0.2, 0.2, 0.9)), max(2.5, scale*2.5))
 
             # Threshold vertical marker
             thr_norm = (thr_db + 60.0) / 60.0
-            thr_x    = rx + thr_norm * rw
-            _draw_line(thr_x, ry, thr_x, ry+rh,
-                       (0.6, 0.2, 0.2, 0.4), max(1.0, scale*1.0))
+            thr_x    = graph_x + thr_norm * graph_w
+            if _graph_visible:
+                _draw_line(thr_x, graph_y, thr_x, graph_y+graph_h,
+                           _ga_col((0.6, 0.2, 0.2, 0.4)), max(1.0, scale*1.0))
 
     # Frequency labels — suppressed for COMP_SINGLE (baked into background PNG)
     _spec_etype = getattr(rack, 'effect_type', '') if rack_idx < len(racks) else ''
@@ -565,6 +766,202 @@ BAND_FREQS  = ["<120Hz", "120-800Hz", "800Hz-5kHz", ">5kHz"]
 
 
 
+# --- PackAPunch multiband: ON / close buttons are BAKED into the background art ---
+# For that skin we draw no button overlays at all. When the rack is switched OFF
+# a small pre-dimmed copy of the baked ON button (rack_comp_multi_off_btn.png,
+# cut from the same art with the glow turned down) is laid over it. Rect is in
+# the 1758x589 background-art pixels (top-left origin): x0, y0, x1, y1.
+MB_OFF_BTN_ART = (1640, 0, 1718, 50)
+MB_ART_W_BTN, MB_ART_H_BTN = 1758, 589
+
+# PackAPunch racks whose ON / close buttons are baked into the background art:
+#   effect type -> (texture key of the dimmed ON-button patch, patch rect in
+#                   background-art px (x0, y0, x1, y1, top-left origin),
+#                   background art width, height)
+# The patch is laid over the baked ON button while the rack is switched off.
+PACKAPUNCH_BAKED_BTNS = {
+    "COMP_MULTI": ("rack_comp_multi_off_btn", (1640, 0, 1718, 50), 1758, 589),
+    "EQ":         ("rack_eq_off_btn",         (1388, 0, 1458, 46), 1488, 719),
+    # Singleband: no patch needed - its lights-off art (faded in by _sb_power)
+    # already contains the dimmed ON button. Key None = suppress overlays only.
+    "COMP_SINGLE": (None, (0, 0, 0, 0), 1, 1),
+    # Reverb: buttons sit in a different place from the generic rail buttons,
+    # so it also has click zones (PACKAPUNCH_BTN_HITBOXES below).
+    "REVERB":      ("rack_reverb_off_btn",    (1512, 42, 1676, 148), 1908, 544),
+}
+
+# Click zones for baked buttons that are NOT where the generic rail buttons are.
+#   effect type -> {"on": rect, "close": rect, "art": (W, H)}  rects in art px (x0, y0, x1, y1, top-left origin)
+PACKAPUNCH_BTN_HITBOXES = {
+    "REVERB": {
+        "on":    (1537, 60, 1651, 126),   # the lit ON glass
+        "close": (1691, 59, 1759, 130),   # the red square button
+        "art":   (1908, 544),
+        # 3x3 channel keypad (centres of the key faces, row-major: 1-3 top row, 4-6, 7-9)
+        "keys":  {"cx": (1572.5, 1638.0, 1703.5), "cy": (229.5, 298.0, 368.0), "w": 50.0, "h": 50.0},
+        # preset display: the amber box above the screen (arrow zones are the outer ends)
+        "preset": {"box": (667.0, 45.0, 1294.0, 88.0), "arrow_w": 62.0},
+    },
+}
+
+
+def packapunch_preset_rects(rack, rack_x, rack_y, rw, rh):
+    """Screen-space rects for the baked preset display on a packApunch rack:
+    {"box", "left", "right"} each (x0, y0, x1, y1), or None for the normal preset box."""
+    cfg = PACKAPUNCH_BTN_HITBOXES.get(getattr(rack, "effect_type", None))
+    if not cfg or "preset" not in cfg or getattr(rack, "collapsed", False):
+        return None
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_p
+        if _gas_p() != "packapunch":
+            return None
+    except Exception:
+        return None
+    aw, ah = cfg["art"]
+    x0, y0, x1, y1 = cfg["preset"]["box"]
+    aw_arrow = cfg["preset"]["arrow_w"]
+    X = lambda ax: rack_x + ax / aw * rw
+    Y = lambda ay: rack_y + (1.0 - ay / ah) * rh
+    box = (X(x0), Y(y1), X(x1), Y(y0))
+    return {"box": box,
+            "left":  (X(x0), Y(y1), X(x0 + aw_arrow), Y(y0)),
+            "right": (X(x1 - aw_arrow), Y(y1), X(x1), Y(y0))}
+
+
+# Look of the packApunch preset display (text + arrows drawn inside the baked box)
+PP_PRESET_COL        = (1.00, 0.72, 0.22, 0.95)   # preset name
+PP_PRESET_ARROW_COL  = (1.00, 0.62, 0.15, 0.90)   # the two arrows
+PP_PRESET_UPPERCASE  = True                       # the baked box style is all caps
+PP_PRESET_TEXT_FRAC  = 0.50                       # text height as a fraction of the box height
+
+
+PP_PRESET_ARROW_SIZE = 0.30                       # arrow size as a fraction of the box height (was 0.42)
+PP_PRESET_FADE_SEC   = 0.9                        # seconds for the name + arrows to fade out when the rack is switched off
+
+_pp_preset_pow = {}                               # rack_idx -> {"en", "t0", "l0", "l"}
+
+
+def _pp_preset_level(rack_idx, enabled, now):
+    """0..1 brightness of the preset display: fades out after switch-off, snaps back on at switch-on."""
+    st = _pp_preset_pow.get(rack_idx)
+    if st is None:                                # first sight: no animation
+        v = 1.0 if enabled else 0.0
+        st = {"en": bool(enabled), "t0": now - 999.0, "l0": v, "l": v}
+        _pp_preset_pow[rack_idx] = st
+    if bool(enabled) != st["en"]:
+        st["en"], st["t0"], st["l0"] = bool(enabled), now, st["l"]
+    if st["en"]:
+        lv = 1.0
+    else:
+        lv = st["l0"] * max(0.0, 1.0 - (now - st["t0"]) / max(0.01, PP_PRESET_FADE_SEC))
+    st["l"] = lv
+    return lv
+
+
+def _draw_pp_preset(rects, name, level=1.0):
+    """Preset name and arrows inside the baked amber box."""
+    if level <= 0.01:
+        return
+    x0, y0, x1, y1 = rects["box"]
+    h = y1 - y0
+    cy = (y0 + y1) / 2
+    shader = _get_shader()
+    gpu.state.blend_set("ALPHA")
+    # arrows (centred in the end zones)
+    ah_, aw_ = h * PP_PRESET_ARROW_SIZE, h * PP_PRESET_ARROW_SIZE * 0.72
+    lx0, lx1 = rects["left"][0], rects["left"][2]
+    rx0, rx1 = rects["right"][0], rects["right"][2]
+    lcx, rcx = (lx0 + lx1) / 2, (rx0 + rx1) / 2
+    left_tri  = [(lcx - aw_, cy), (lcx + aw_, cy + ah_), (lcx + aw_, cy - ah_)]
+    right_tri = [(rcx + aw_, cy), (rcx - aw_, cy + ah_), (rcx - aw_, cy - ah_)]
+    shader.bind()
+    shader.uniform_float("color", (*PP_PRESET_ARROW_COL[:3], PP_PRESET_ARROW_COL[3] * level))
+    batch_for_shader(shader, "TRIS", {"pos": left_tri}).draw(shader)
+    batch_for_shader(shader, "TRIS", {"pos": right_tri}).draw(shader)
+    # name, centred between the arrows
+    label = name.upper() if PP_PRESET_UPPERCASE else name
+    fs = max(1, int(h * PP_PRESET_TEXT_FRAC))
+    max_w = (rx0 - lx1) * 0.96
+    while fs > 6 and _text_width(label, fs) > max_w:
+        fs -= 1
+    tw = _text_width(label, fs)
+    _draw_text(label, (lx1 + rx0) / 2 - tw / 2, cy - fs / 2 + 1, fs,
+               (*PP_PRESET_COL[:3], PP_PRESET_COL[3] * level))
+
+
+def packapunch_key_rects(rack, rack_x, rack_y, rw, rh):
+    """Screen-space rects (x0, y0, x1, y1) of the 9 baked keypad keys, in channel
+    order, or None when this rack/skin uses the normal channel buttons."""
+    cfg = PACKAPUNCH_BTN_HITBOXES.get(getattr(rack, "effect_type", None))
+    if not cfg or "keys" not in cfg or getattr(rack, "collapsed", False):
+        return None
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_k
+        if _gas_k() != "packapunch":
+            return None
+    except Exception:
+        return None
+    aw, ah = cfg["art"]
+    k = cfg["keys"]
+    out = []
+    for r in range(3):
+        for c in range(3):
+            cx = rack_x + k["cx"][c] / aw * rw
+            cy = rack_y + (1.0 - k["cy"][r] / ah) * rh
+            hw, hh = k["w"] * 0.5 / aw * rw, k["h"] * 0.5 / ah * rh
+            out.append((cx - hw, cy - hh, cx + hw, cy + hh))
+    return out
+
+
+# Look of the keypad numbers / key lighting on the packApunch skin
+PP_KEY_ON_TEXT   = (1.00, 0.80, 0.32, 1.0)    # number on an assigned channel
+PP_KEY_OFF_TEXT  = (0.60, 0.46, 0.28, 0.80)   # number on an unassigned channel
+PP_KEY_ON_GLOW   = (1.00, 0.55, 0.10, 0.20)   # additive amber light on an assigned key (alpha 0 = off)
+
+
+def _draw_pp_keypad(rack, key_rects, scale):
+    """Channel numbers (and a soft amber light on assigned keys) over the baked keypad."""
+    group_idx = getattr(rack, 'group_idx', 0)
+    shader = _get_shader()
+    for local_idx, (x0, y0, x1, y1) in enumerate(key_rects):
+        assigned = getattr(rack, f'ch{local_idx}', False)
+        if assigned and PP_KEY_ON_GLOW[3] > 0:
+            ix, iy = (x1 - x0) * 0.12, (y1 - y0) * 0.12
+            a, b, c, d = (x0 + ix, y0 + iy), (x1 - ix, y0 + iy), (x1 - ix, y1 - iy), (x0 + ix, y1 - iy)
+            gpu.state.blend_set("ADDITIVE")
+            shader.bind()
+            shader.uniform_float("color", PP_KEY_ON_GLOW)
+            batch_for_shader(shader, "TRIS", {"pos": [a, b, c, a, c, d]}).draw(shader)
+            gpu.state.blend_set("ALPHA")
+        label = str(group_idx * 9 + local_idx + 1)
+        fs = max(1, int((y1 - y0) * 0.42))
+        tw = _text_width(label, fs)
+        _draw_text(label, (x0 + x1) / 2 - tw / 2, (y0 + y1) / 2 - fs / 2 + 1,
+                   fs, PP_KEY_ON_TEXT if assigned else PP_KEY_OFF_TEXT)
+
+
+def packapunch_btn_hitboxes(rack, rack_x, rack_y, rw, rh):
+    """Screen-space click rects for a packApunch rack whose buttons are baked into
+    the art at custom positions. Returns {"on": (x0,y0,x1,y1), "close": (...)} or
+    None when this rack/skin/state uses the normal rail buttons."""
+    cfg = PACKAPUNCH_BTN_HITBOXES.get(getattr(rack, "effect_type", None))
+    if not cfg or getattr(rack, "collapsed", False):
+        return None
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_hb
+        if _gas_hb() != "packapunch":
+            return None
+    except Exception:
+        return None
+    aw, ah = cfg["art"]
+    out = {}
+    for k in ("on", "close"):
+        x0, y0, x1, y1 = cfg[k]
+        out[k] = (rack_x + x0 / aw * rw, rack_y + (1.0 - y1 / ah) * rh,
+                  rack_x + x1 / aw * rw, rack_y + (1.0 - y0 / ah) * rh)
+    return out
+
+
 def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
     """Draw a fully expanded rack unit."""
     _rs = _get_racks_state()
@@ -647,13 +1044,42 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
             import traceback; traceback.print_exc()
     else:
         # Single band: 2x3 knob grid + spectrum + GR meters
-        # PNG background — blit first so all body content draws on top
+        # Which skin is active — checked once up front. Every other skin
+        # draws the PNG background first, same as always. PackAPunch draws
+        # it LAST instead (right before the glass overlay, below): its
+        # chassis art has the CRT screen cut out as a plain transparent
+        # hole, so putting the whole, un-cropped image on top of the
+        # trench sequence + graph lets that hole do the clipping for us —
+        # whatever's underneath shows through the hole, everything else
+        # (including any graph/sequence overflow past their tuned boxes)
+        # just lands under the opaque chassis pixels around it. No UV
+        # cropping or hole measurement needed — confirmed by compositing
+        # the actual PNG over test content: the hole clips to the real
+        # screen shape perfectly on its own.
+        #
+        # The one thing that full redraw WOULD also bury is the knobs —
+        # they're procedural (gpu circles + arc + label, not baked into
+        # the art) and sit in the same rx/ry/rw/rh rect as the screen, so
+        # a straight "draw background last" would cover their live value
+        # indicator along with everything else. _draw_sb_knobs() is a
+        # local closure so it can just be called again after the final
+        # background redraw for packapunch, instead of before it like
+        # every other skin — a reorder, not a crop.
+        _is_packapunch_sb = False
+        try:
+            from ui.mixer.texture_cache import get_active_skin as _gas_sb0
+            _is_packapunch_sb = _gas_sb0() == SB_SCREEN_SEQ_SKIN
+        except Exception:
+            pass
+
+        _sb_tex = None
         try:
             from ui.mixer.texture_cache import get_texture as _gtc_sb
             from ui.mixer.texture_cache import blit_texture as _blt_sb
             _sb_tex = _gtc_sb("rack_comp_single_bg")
             if _sb_tex:
-                _blt_sb(_sb_tex, rx, ry, rw, rh, key="rack_comp_single_bg")
+                if not _is_packapunch_sb:
+                    _blt_sb(_sb_tex, rx, ry, rw, rh, key="rack_comp_single_bg")
             else:
                 _draw_rect(rx, ry, rw, body_h, (0.07, 0.07, 0.07, 1.0))
         except Exception:
@@ -671,33 +1097,63 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
 
         _sb_x_offsets = [SB_KNOB_X_COL0, SB_KNOB_X_COL1, SB_KNOB_X_COL2]
         _sb_y_offsets = [SB_KNOB_Y_ROW0, SB_KNOB_Y_ROW1]
-
         param_order = [0,1,5, 2,3,4]
-        for idx, pi in enumerate(param_order):
-            col_i = idx % 3
-            row_i = idx // 3
-            kx    = knob_kx[col_i] + _sb_x_offsets[col_i] * scale
-            ky    = (ky0 if row_i == 0 else ky1) + _sb_y_offsets[row_i] * scale
-            if pi < len(params):
-                pkey, plabel, pmin, pmax, pdef, pfmt = params[pi]
-                norm   = getattr(rack, f'p{pi}', 0.0)
-                actual = pmin + norm*(pmax-pmin)
-                try:    val_str = pfmt.format(actual)
-                except: val_str = f"{actual:.1f}"
-                _draw_knob(kx, ky, knob_r, norm, col, plabel, val_str, scale)
-
         div_x = rx + KNOB_SECTION_W * scale
-        _draw_rect(div_x, ry+4*scale, max(1.0, scale),
-                   rh-RACK_RAIL_H*scale-8*scale, (0.2, 0.2, 0.2, 1.0))
+
+        def _draw_sb_knobs():
+            for idx, pi in enumerate(param_order):
+                col_i = idx % 3
+                row_i = idx // 3
+                kx    = knob_kx[col_i] + _sb_x_offsets[col_i] * scale
+                ky    = (ky0 if row_i == 0 else ky1) + _sb_y_offsets[row_i] * scale
+                if pi < len(params):
+                    pkey, plabel, pmin, pmax, pdef, pfmt = params[pi]
+                    norm   = getattr(rack, f'p{pi}', 0.0)
+                    actual = pmin + norm*(pmax-pmin)
+                    try:    val_str = pfmt.format(actual)
+                    except: val_str = f"{actual:.1f}"
+                    _draw_knob(kx, ky, knob_r, norm, col, plabel, val_str, scale)
+            _draw_rect(div_x, ry+4*scale, max(1.0, scale),
+                       rh-RACK_RAIL_H*scale-8*scale, (0.2, 0.2, 0.2, 1.0))
+
+        if not _is_packapunch_sb:
+            _draw_sb_knobs()
 
         spec_x = rx + SPEC_X * scale
         spec_y = ry + (body_h - spec_h) / 2 - 5*scale
         spec_w = SPEC_W * scale
+
+        # PackAPunch's narrowing (background sequence box + graph box) now
+        # happens INSIDE _draw_spectrum itself (see SB_BG_SEQ_*/SB_GRAPH_*
+        # constants), so this caller just passes the plain, un-narrowed
+        # reference box straight through.
         _draw_spectrum(spec_x, spec_y, spec_w, spec_h, rack_idx, scale)
 
-        assigned = get_rack_channels(rack)
-        gr_x     = spec_x + spec_w + 16*scale
-        _draw_gr_meters(gr_x, spec_y, spec_h, rack_idx, assigned, scale)
+        # Per-channel GR side meters don't fit the packapunch CRT design —
+        # skip them entirely on that skin.
+        if not _is_packapunch_sb:
+            assigned = get_rack_channels(rack)
+            gr_x     = spec_x + spec_w + 16*scale
+            _draw_gr_meters(gr_x, spec_y, spec_h, rack_idx, assigned, scale)
+
+        # PackAPunch background + knobs, drawn LAST — see the note above.
+        if _is_packapunch_sb and _sb_tex:
+            try:
+                from ui.mixer.texture_cache import blit_texture as _blt_sbtop
+                _blt_sbtop(_sb_tex, rx, ry, rw, rh, key="rack_comp_single_bg")
+                # Lights off: fade the lights-off copy of the chassis in over it.
+                _sb_off_a = 1.0 - _sb_lights_power(rack_idx, rack.enabled)
+                if _sb_off_a > 0.003:
+                    from ui.mixer.texture_cache import get_texture as _gtc_sboff
+                    from ui.mixer.texture_cache import blit_texture_tinted as _blt_sboff
+                    _sb_off_tex = _gtc_sboff("rack_comp_single_bg_off")
+                    if _sb_off_tex:
+                        _blt_sboff(_sb_off_tex, rx, ry, rw, rh,
+                                   color=(_sb_off_a, _sb_off_a, _sb_off_a, _sb_off_a),
+                                   blend="ALPHA_PREMULT", key="rack_comp_single_bg_off")
+            except Exception as _e_sboff:
+                print(f"[SKIN] singleband lights-off error: {_e_sboff}")
+            _draw_sb_knobs()
 
         # Glass overlay — composited on top of spectrum/GR meters, same rect as body PNG
         try:
@@ -734,7 +1190,11 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
     # Channel buttons always on right
     ch_right_x = rx + rw - 100*scale
     ch_top_y   = ry + rh - RACK_RAIL_H*scale - 20*scale
-    _draw_channel_buttons(ch_right_x, ch_top_y, rack, scale)
+    _pp_keys = packapunch_key_rects(rack, rx, ry, rw, rh)
+    if _pp_keys:
+        _draw_pp_keypad(rack, _pp_keys, scale)
+    else:
+        _draw_channel_buttons(ch_right_x, ch_top_y, rack, scale)
     fs_ch = max(1, int(8*scale))
     # --- TOP RAIL INTERACTIVE ELEMENTS (drawn last, always on top) ---
 
@@ -791,55 +1251,106 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
     p_box_y   = ry + rh - 26*scale
     p_box_h   = 16*scale
 
-    lax = p_box_x - 14*scale
-    lay = ry + rh - 18*scale
-    la  = [(lax, lay), (lax+10*scale, lay+6*scale), (lax+10*scale, lay-6*scale)]
-    batch = batch_for_shader(shader,"TRIS",{"pos":la})
-    shader.uniform_float("color",(0.4,0.4,0.4,1.0)); batch.draw(shader)
+    _pp_preset = packapunch_preset_rects(rack, rx, ry, rw, rh)
+    if _pp_preset:
+        import time as _time_pp
+        _draw_pp_preset(_pp_preset, p_name,
+                        _pp_preset_level(rack_idx, rack.enabled, _time_pp.monotonic()))
+    else:
+        lax = p_box_x - 14*scale
+        lay = ry + rh - 18*scale
+        la  = [(lax, lay), (lax+10*scale, lay+6*scale), (lax+10*scale, lay-6*scale)]
+        batch = batch_for_shader(shader,"TRIS",{"pos":la})
+        shader.uniform_float("color",(0.4,0.4,0.4,1.0)); batch.draw(shader)
 
-    _draw_rect(p_box_x, p_box_y, p_box_w, p_box_h, (0.07,0.07,0.07,1.0))
-    fs_p = max(1, int(9*scale))
-    tw   = _text_width(p_name, fs_p)
-    _draw_text(p_name, p_box_x + p_box_w/2 - tw/2,
-               p_box_y + p_box_h/2 - fs_p/2 + 1, fs_p, (0.7,0.7,0.7,1.0))
+        _draw_rect(p_box_x, p_box_y, p_box_w, p_box_h, (0.07,0.07,0.07,1.0))
+        fs_p = max(1, int(9*scale))
+        tw   = _text_width(p_name, fs_p)
+        _draw_text(p_name, p_box_x + p_box_w/2 - tw/2,
+                   p_box_y + p_box_h/2 - fs_p/2 + 1, fs_p, (0.7,0.7,0.7,1.0))
 
-    rax = p_box_x + p_box_w + 4*scale
-    ray = ry + rh - 18*scale
-    ra  = [(rax+10*scale, ray), (rax, ray+6*scale), (rax, ray-6*scale)]
-    batch = batch_for_shader(shader,"TRIS",{"pos":ra})
-    shader.uniform_float("color",(0.4,0.4,0.4,1.0)); batch.draw(shader)
+        rax = p_box_x + p_box_w + 4*scale
+        ray = ry + rh - 18*scale
+        ra  = [(rax+10*scale, ray), (rax, ray+6*scale), (rax, ray-6*scale)]
+        batch = batch_for_shader(shader,"TRIS",{"pos":ra})
+        shader.uniform_float("color",(0.4,0.4,0.4,1.0)); batch.draw(shader)
 
-    # --- ON/OFF + CLOSE BUTTONS (PNG) ---
-    # RackOff.png (100×38px source): OFF button + close X — always drawn when expanded
-    # RackOn.png  (100×38px source): ON button only — drawn on top if enabled
-    _btn_w = RACK_BTN_W * scale
-    _btn_h = RACK_BTN_H * scale
-    _btn_x = rx + rw - _btn_w + RACK_BTN_X_OFFSET * scale
-    _btn_y = ry + rh - (RACK_RAIL_H * scale + _btn_h) / 2 + RACK_BTN_Y_OFFSET * scale
-    try:
-        from ui.mixer.texture_cache import get_texture as _gtc_btn
-        from ui.mixer.texture_cache import blit_texture as _blt_btn
-        _tex_off = _gtc_btn("rack_btn_off")
-        if _tex_off:
-            _blt_btn(_tex_off, _btn_x, _btn_y, _btn_w, _btn_h, key="rack_btn_off")
-        else:
-            # GPU fallback — delete button
-            _draw_rect(del_x := rx+rw-26*scale, del_y := ry+rh-27*scale, 18*scale, 16*scale, (0.18,0.04,0.04,1.0))
-            fs_del = max(1, int(9*scale)); tw_del = _text_width("X", fs_del)
-            _draw_text("X", del_x+9*scale-tw_del/2, del_y+8*scale-fs_del/2+1, fs_del, (0.8,0.15,0.15,1.0))
-            # on/off fallback
-            _ox = rx+rw-68*scale; _oy = ry+rh-27*scale
-            _draw_rect(_ox, _oy, 40*scale, 16*scale,
-                       (0.0,0.13,0.0,1.0) if rack.enabled else (0.13,0.0,0.0,1.0))
-        if rack.enabled:
-            _tex_on = _gtc_btn("rack_btn_on")
-            if _tex_on:
-                _blt_btn(_tex_on, _btn_x, _btn_y, _btn_w, _btn_h, key="rack_btn_on")
-    except Exception:
-        pass
+    # PackAPunch racks with buttons baked into the art (see PACKAPUNCH_BAKED_BTNS).
+    _baked_btns = False
+    _baked_cfg  = PACKAPUNCH_BAKED_BTNS.get(etype)
+    if _baked_cfg:
+        try:
+            from ui.mixer.texture_cache import get_active_skin as _gas_btn
+            _baked_btns = _gas_btn() == "packapunch"
+        except Exception:
+            pass
+    if _baked_btns:
+        if not rack.enabled:
+            try:
+                from ui.mixer.texture_cache import get_texture as _gtc_ob
+                from ui.mixer.texture_cache import blit_texture as _blt_ob
+                _ob_key, (_ax0, _ay0, _ax1, _ay1), _art_w, _art_h = _baked_cfg
+                _tex_ob = _gtc_ob(_ob_key) if _ob_key else None
+                if _tex_ob:
+                    _blt_ob(_tex_ob,
+                            rx + _ax0 / _art_w * rw,
+                            ry + (1.0 - _ay1 / _art_h) * rh,
+                            (_ax1 - _ax0) / _art_w * rw,
+                            (_ay1 - _ay0) / _art_h * rh,
+                            key=_ob_key, blend="ALPHA")
+            except Exception as _e_ob:
+                print(f"[SKIN] off-button patch error: {_e_ob}")
+    else:
+        # --- ON/OFF + CLOSE BUTTONS (PNG) ---
+        # RackOff.png (100×38px source): OFF button + close X — always drawn when expanded
+        # RackOn.png  (100×38px source): ON button only — drawn on top if enabled
+        _btn_w = RACK_BTN_W * scale
+        _btn_h = RACK_BTN_H * scale
+        _btn_x = rx + rw - _btn_w + RACK_BTN_X_OFFSET * scale
+        _btn_y = ry + rh - (RACK_RAIL_H * scale + _btn_h) / 2 + RACK_BTN_Y_OFFSET * scale
+        try:
+            from ui.mixer.texture_cache import get_texture as _gtc_btn
+            from ui.mixer.texture_cache import blit_texture as _blt_btn
+            _tex_off = _gtc_btn("rack_btn_off")
+            if _tex_off:
+                _blt_btn(_tex_off, _btn_x, _btn_y, _btn_w, _btn_h, key="rack_btn_off")
+            else:
+                # GPU fallback — delete button
+                _draw_rect(del_x := rx+rw-26*scale, del_y := ry+rh-27*scale, 18*scale, 16*scale, (0.18,0.04,0.04,1.0))
+                fs_del = max(1, int(9*scale)); tw_del = _text_width("X", fs_del)
+                _draw_text("X", del_x+9*scale-tw_del/2, del_y+8*scale-fs_del/2+1, fs_del, (0.8,0.15,0.15,1.0))
+                # on/off fallback
+                _ox = rx+rw-68*scale; _oy = ry+rh-27*scale
+                _draw_rect(_ox, _oy, 40*scale, 16*scale,
+                           (0.0,0.13,0.0,1.0) if rack.enabled else (0.13,0.0,0.0,1.0))
+            if rack.enabled:
+                _tex_on = _gtc_btn("rack_btn_on")
+                if _tex_on:
+                    _blt_btn(_tex_on, _btn_x, _btn_y, _btn_w, _btn_h, key="rack_btn_on")
+        except Exception:
+            pass
+
+    # PackAPunch multiband power-down dimming — last thing drawn on the rack
+    if _baked_btns and etype == "COMP_MULTI":
+        try:
+            from ui.racks.rack_comp import mb_draw_power_dim as _mb_dim
+            _mb_dim(rx, ry, rw, rh, rack_idx)
+        except Exception as _e_dim:
+            print(f"[SKIN] power dim error: {_e_dim}")
 
     # Debug outlines — green = ON/OFF hitbox, red = close X hitbox
-    if RACK_BTN_DEBUG:
+    if RACK_BTN_DEBUG and packapunch_btn_hitboxes(rack, rx, ry, rw, rh):
+        try:
+            _sd = _get_shader()
+            _hbs = packapunch_btn_hitboxes(rack, rx, ry, rw, rh)
+            for _k, _col in (("on", (0.0, 1.0, 0.0, 1.0)), ("close", (1.0, 0.0, 0.0, 1.0))):
+                _x0, _y0, _x1, _y1 = _hbs[_k]
+                _sd.bind(); _sd.uniform_float("color", _col)
+                batch_for_shader(_sd, "LINE_STRIP", {"pos": [
+                    (_x0,_y0),(_x1,_y0),(_x1,_y1),(_x0,_y1),(_x0,_y0)]}).draw(_sd)
+        except Exception:
+            pass
+    elif RACK_BTN_DEBUG:
         try:
             _sd = _get_shader()
             _split = RACK_BTN_ONOFF_SPLIT

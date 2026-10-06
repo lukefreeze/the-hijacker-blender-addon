@@ -183,9 +183,20 @@ def _meter_timer():
         print(f"[METER] timer error: {e}")
 
     # Throttled HUD redraw — every other tick (10fps) to halve GPU draw load.
+    # PackAPunch is the exception: its racks play looping screen animations at
+    # 12fps, and a 10fps redraw can't show 12 frames a second — frames get
+    # skipped unevenly, which reads as a speed that keeps changing (the
+    # animation only looks right while something else, like playback or mouse
+    # movement, is forcing extra redraws). So that skin redraws every tick (20fps).
     global _redraw_counter
     _redraw_counter += 1
-    if _redraw_counter >= 2:
+    _full_rate = False
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_meter
+        _full_rate = _gas_meter() == "packapunch"
+    except Exception:
+        pass
+    if _full_rate or _redraw_counter >= 2:
         _redraw_counter = 0
         try:
             for window in bpy.context.window_manager.windows:

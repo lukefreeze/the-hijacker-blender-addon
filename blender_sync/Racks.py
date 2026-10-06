@@ -3683,6 +3683,17 @@ def rack_knob_hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
 
             elif rack.effect_type == "REVERB":
                 # 5 knobs: p0=Room, p1=Damp, p2=Wet, p3=Pre-dly, p4=Width
+                # PackAPunch skin: knobs sit where the baked art has them
+                _pp_kg = None
+                try:
+                    from ui.racks.rack_reverb import reverb_pp_knob_geom as _rv_kg
+                    _pp_kg = _rv_kg(rack_x, rack_y, rw, rh)
+                except Exception:
+                    _pp_kg = None
+                if _pp_kg:
+                    for _kk, _g in enumerate(_pp_kg):
+                        if math.dist((rx, ry), (_g[0], _g[1])) < _g[3]:
+                            return (i, _kk)
                 body_h_rv   = rh - RACK_RAIL_H * ui_scale
                 ch_btn_w_rv = 108 * ui_scale
                 margin_l_rv = 42 * ui_scale
@@ -3697,7 +3708,7 @@ def rack_knob_hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
                 row_knob_rv = knob_y_rv + knob_h_rv - row_slot_rv * 1.3
                 kr_rv       = min(max(13*ui_scale, col_w_rv*0.16), 20*ui_scale)
                 kr_rv       = min(kr_rv, row_slot_rv * 0.42)
-                for ki in range(N_KNOBS_RV):
+                for ki in (range(N_KNOBS_RV) if not _pp_kg else ()):
                     cx_rv = disp_x_rv + (ki + 0.5) * col_w_rv
                     if math.dist((rx, ry), (cx_rv, row_knob_rv)) < kr_rv + 8*ui_scale:
                         return (i, ki)
@@ -3925,6 +3936,21 @@ def _hit_test_rack_zones(rx, ry, i, rack, rack_x, rack_y, rw, rh, ui_scale, grou
             col_btn_y2 <= ry <= col_btn_y2 + col_btn_h2):
         return {'zone': 'collapse', 'rack_idx': i}
 
+    # PackAPunch racks with buttons baked into the art at custom positions
+    # (e.g. reverb): these click zones replace the generic rail zones below.
+    try:
+        from ui.racks.rack_base import packapunch_btn_hitboxes as _pp_hb
+        _pp_boxes = _pp_hb(rack, rack_x, rack_y, rw, rh)
+    except Exception:
+        _pp_boxes = None
+    if _pp_boxes:
+        _cb = _pp_boxes["close"]
+        if _cb[0] <= rx <= _cb[2] and _cb[1] <= ry <= _cb[3]:
+            return {'zone': 'delete_rack', 'rack_idx': i}
+        _ob = _pp_boxes["on"]
+        if _ob[0] <= rx <= _ob[2] and _ob[1] <= ry <= _ob[3]:
+            return {'zone': 'on_off', 'rack_idx': i}
+
     # Delete / ON-OFF hitboxes — derived from PNG blit geometry
     try:
         from ui.racks.rack_base import (RACK_BTN_W as _RBW, RACK_BTN_H as _RBH,
@@ -3939,7 +3965,7 @@ def _hit_test_rack_zones(rx, ry, i, rack, rack_x, rack_y, rw, rh, ui_scale, grou
     # Close X = right portion of PNG
     del_x = _rbx + _rbw * _RBSP
     del_y = _rby
-    if del_x <= rx <= _rbx + _rbw and del_y <= ry <= _rby + _rbh:
+    if not _pp_boxes and del_x <= rx <= _rbx + _rbw and del_y <= ry <= _rby + _rbh:
         return {'zone': 'delete_rack', 'rack_idx': i}
 
     # Rack number badge
@@ -3955,7 +3981,7 @@ def _hit_test_rack_zones(rx, ry, i, rack, rack_x, rack_y, rw, rh, ui_scale, grou
     # ON/OFF = left portion of PNG
     on_x = _rbx
     on_y = _rby
-    if on_x <= rx <= _rbx + _rbw * _RBSP and on_y <= ry <= _rby + _rbh:
+    if not _pp_boxes and on_x <= rx <= _rbx + _rbw * _RBSP and on_y <= ry <= _rby + _rbh:
         return {'zone': 'on_off', 'rack_idx': i}
 
     # Delete button (collapsed) — right portion of PNG, centred on collapsed rail
@@ -3985,14 +4011,39 @@ def _hit_test_rack_zones(rx, ry, i, rack, rack_x, rack_y, rw, rh, ui_scale, grou
         _PBXO = 0.0
     p_box_w = 160*ui_scale
     p_box_x = rack_x + (rw - p_box_w) / 2.0 + _PBXO*ui_scale
-    if rack_y+rh-30*ui_scale <= ry <= rack_y+rh-12*ui_scale:
+    # PackAPunch racks with a baked preset display (e.g. reverb): arrows live inside that box
+    try:
+        from ui.racks.rack_base import packapunch_preset_rects as _pp_pr
+        _pp_pre = _pp_pr(rack, rack_x, rack_y, rw, rh)
+    except Exception:
+        _pp_pre = None
+    if _pp_pre:
+        _pl, _pr = _pp_pre["left"], _pp_pre["right"]
+        if _pl[0] <= rx <= _pl[2] and _pl[1] <= ry <= _pl[3]:
+            return {'zone': 'preset_left', 'rack_idx': i}
+        if _pr[0] <= rx <= _pr[2] and _pr[1] <= ry <= _pr[3]:
+            return {'zone': 'preset_right', 'rack_idx': i}
+    if not _pp_pre and rack_y+rh-30*ui_scale <= ry <= rack_y+rh-12*ui_scale:
         if p_box_x-18*ui_scale <= rx <= p_box_x:
             return {'zone': 'preset_left', 'rack_idx': i}
         if p_box_x+p_box_w <= rx <= p_box_x+p_box_w+18*ui_scale:
             return {'zone': 'preset_right', 'rack_idx': i}
 
+    # PackAPunch racks with a baked keypad (e.g. reverb): the 9 keys replace the generic channel buttons
+    try:
+        from ui.racks.rack_base import packapunch_key_rects as _pp_kr
+        _pp_keys = _pp_kr(rack, rack_x, rack_y, rw, rh)
+    except Exception:
+        _pp_keys = None
+    if _pp_keys:
+        for _kl, _kr in enumerate(_pp_keys):
+            if _kr[0] <= rx <= _kr[2] and _kr[1] <= ry <= _kr[3]:
+                return {'zone': 'channel_btn',
+                        'rack_idx': i, 'ch_idx': _kl,
+                        'group_idx': group_idx}
+
     # Channel buttons (expanded only) — ch0-ch8 are LOCAL to the group
-    if not rack.collapsed:
+    if not rack.collapsed and not _pp_keys:
         ch_right_x = rack_x + rw - 100*ui_scale
         ch_top_y   = rack_y + rh - RACK_RAIL_H*ui_scale - 20*ui_scale
         btn_s      = CH_BTN_SIZE * ui_scale

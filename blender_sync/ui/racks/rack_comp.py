@@ -149,26 +149,472 @@ BAND_COLORS = [
 BAND_NAMES = ["Low", "L-Mid", "H-Mid", "High"]
 BAND_FREQS = ["<120Hz", "120-800Hz", "800Hz-5kHz", ">5kHz"]
 
+# ---------------------------------------------------------------------------
+# PackAPunch skin — one neon blue replaces the per-band red/green/blue/amber
+# everywhere a band colour is used (knobs, faders, the response curve and
+# its dots/labels). Colour sampled directly from Luke's new background art
+# (the knob-ring glow + circuit-board trace colour) rather than guessed.
+# The screen's own dark background rect is also skipped for this skin so
+# that art shows through instead of being painted over — see
+# _draw_multiband_body's _is_packapunch_mb check.
+# ---------------------------------------------------------------------------
+MB_PACKAPUNCH_SKIN  = "packapunch"
+MB_PACKAPUNCH_COLOR = (0.15, 0.85, 1.0, 0.85)   # neon blue, same alpha as BAND_COLORS
 
-def _draw_gr_meter_band(bx, by, bw, bh, gr_db, scale, signal_norm=0.0):
-    """Premier Pro style: green signal bar rising from bottom + red GR cap on top."""
+
+def _mb_lighten(rgb, t):
+    """Mix an (r,g,b) tuple toward white by fraction t (0=unchanged, 1=white).
+    Used to turn the single packapunch neon blue into a set of lighter
+    tints — same hue throughout, so the 4 bands (and the 3 crossover
+    blend layers between them) stay readable as distinct bands in the
+    audio-content spectrum display without reintroducing other hues."""
+    return tuple(c + (1.0 - c) * t for c in rgb)
+
+
+# One shade per band (0=base neon blue .. 3=lightest), plus the 3 in-between
+# shades used for the crossover blend layers in the 7-layer spectrum below.
+MB_PACKAPUNCH_BAND_SHADES  = [_mb_lighten(MB_PACKAPUNCH_COLOR[:3], t)
+                               for t in (0.0, 0.18, 0.36, 0.54)]
+MB_PACKAPUNCH_CROSS_SHADES = [_mb_lighten(MB_PACKAPUNCH_COLOR[:3], t)
+                               for t in (0.09, 0.27, 0.45)]
+
+
+#  PackAPunch meter colours — everything neon blue instead of the usual
+#  green signal / red GR-cap, per Luke's request. Peak/GR stays a lighter
+#  shade of the same blue rather than an identical flat colour to the
+#  signal portion, so the meter still reads as two things (how loud vs.
+#  how much is being pulled down) — same lighter-shade-per-element
+#  convention as the spectrum bands above, just within one hue now.
+MB_PACKAPUNCH_METER_SIGNAL    = (0.05, 0.45, 0.55, 0.85)
+MB_PACKAPUNCH_METER_SIGNAL_HI = (0.15, 0.85, 1.00, 0.95)
+MB_PACKAPUNCH_METER_PEAK      = (0.45, 0.80, 1.00, 0.90)
+MB_PACKAPUNCH_METER_PEAK_HI   = (0.65, 0.92, 1.00, 1.00)
+
+
+def _draw_gr_meter_band(bx, by, bw, bh, gr_db, scale, signal_norm=0.0, packapunch=False):
+    """Premier Pro style: signal bar rising from bottom + GR cap on top.
+    Default skin: green signal, red GR cap. packapunch=True: both neon
+    blue — see the MB_PACKAPUNCH_METER_* constants above."""
+    sig_col, sig_hi, gr_col, gr_hi = (
+        (MB_PACKAPUNCH_METER_SIGNAL, MB_PACKAPUNCH_METER_SIGNAL_HI,
+         MB_PACKAPUNCH_METER_PEAK, MB_PACKAPUNCH_METER_PEAK_HI) if packapunch else
+        ((0.05, 0.55, 0.25, 0.85), (0.1, 0.9, 0.4, 0.95),
+         (0.85, 0.15, 0.15, 0.9), (1.0, 0.35, 0.35, 1.0))
+    )
     _draw_rect(bx, by, bw, bh, (0.04, 0.04, 0.04, 1.0))
     sig_h = max(0.0, min(1.0, signal_norm)) * bh
     if sig_h > 0.5:
         gr_h    = max(0.0, min(1.0, gr_db / 24.0)) * sig_h  # 24dB full scale
         green_h = sig_h - gr_h
         if green_h > 0.5:
-            _draw_rect(bx, by, bw, green_h, (0.05, 0.55, 0.25, 0.85))
+            _draw_rect(bx, by, bw, green_h, sig_col)
             if green_h > 3*scale:
-                _draw_rect(bx, by + green_h - 2*scale, bw, 2*scale,
-                           (0.1, 0.9, 0.4, 0.95))
+                _draw_rect(bx, by + green_h - 2*scale, bw, 2*scale, sig_hi)
         if gr_h > 0.5:
-            _draw_rect(bx, by + green_h, bw, gr_h, (0.85, 0.15, 0.15, 0.9))
+            _draw_rect(bx, by + green_h, bw, gr_h, gr_col)
             if gr_h > 2*scale:
-                _draw_rect(bx, by + green_h + gr_h - 2*scale, bw, 2*scale,
-                           (1.0, 0.35, 0.35, 1.0))
+                _draw_rect(bx, by + green_h + gr_h - 2*scale, bw, 2*scale, gr_hi)
     for t in [0.25, 0.5, 0.75]:
         _draw_rect(bx, by + t*bh, bw, max(0.5, scale*0.5), (0.2, 0.2, 0.2, 1.0))
+
+
+
+# =============================================================================
+# PACKAPUNCH MULTIBAND LIFE — standalone ambient animation (runs whether or
+# not the timeline is playing, no audio needed):
+#   1. BREATHING GRID — a lines-only copy of the screen grid (rack_comp_multi_
+#      lines.png, same canvas as the background) is drawn ADDITIVELY over the
+#      background and its brightness slowly rises and falls like breathing.
+#   2. ELECTRIC BALL — a ball of light with a short fading trail runs along
+#      the circuit-board lines on the rack chassis (MB_PULSE_PATHS, traced
+#      once from the art), then pops up on a different line after a short rest.
+# Everything here is tuned by editing these constants and reloading the addon.
+# =============================================================================
+# Screen interior in the 1758x589 background art (px, top-left origin) — the
+# region the lines layer actually covers.
+MB_ART_W, MB_ART_H = 1758, 589
+MB_SCREEN_PX       = (46, 57, 1553, 276)       # x0, y0, x1, y1
+
+# 1. Breathing grid
+MB_GLOW_ENABLED = True
+MB_GLOW_PERIOD  = 4.5     # seconds per full breath (in + out)
+MB_GLOW_MIN     = 0.0     # glow brightness at the bottom of the breath (0 = off)
+MB_GLOW_MAX     = 0.60    # glow brightness at the top of the breath (1.0 = very hot)
+MB_GLOW_SPREAD  = 0.10    # phase lag left->right as a fraction of a breath; 0 = all lines breathe together
+MB_GLOW_STRIPS  = 24      # vertical strips used to apply the lag (only matters if SPREAD > 0)
+MB_GLOW_TINT    = (0.55, 0.95, 1.0)   # slight cyan push on the added light
+
+# 2. Electric ball
+MB_PULSE_ENABLED    = True
+MB_PULSE_COUNT      = 1        # balls running at once per rack
+MB_PULSE_SPEED      = 320.0    # art px per second along the line (1758px = rack width)
+MB_PULSE_GAP_MIN    = 0.35     # rest between runs (seconds)
+MB_PULSE_GAP_MAX    = 1.4
+MB_PULSE_HEAD_SIZE  = 34.0     # unscaled px, diameter of the head glow
+MB_PULSE_TRAIL_LEN  = 150.0    # art px of fading trail behind the head
+MB_PULSE_TRAIL_STEP = 6.0      # art px between trail glows (smaller = smoother streak)
+MB_PULSE_GAIN       = 2.0      # head brightness
+MB_PULSE_TINT       = (0.70, 0.96, 1.0)
+MB_PULSE_STRAIGHT   = 0.7      # chance of going straight on at a junction (else random branch)
+MB_PULSE_ROUTE_MAX  = 2600.0   # safety cap on how far one run may wander (art px)
+MB_PULSE_ROUTE_MIN  = 120.0    # ignore runs shorter than this
+
+# Circuit network traced from the art. NODES are the junctions / line ends,
+# EDGES are (node_a, node_b, [(x, y), ...]) polylines in art px (top-left
+# origin). The ball does not follow fixed lines: each run it starts at a line
+# end and walks the network, going straight on at junctions where it can, until
+# it reaches another line end - so it always travels a line all the way.
+MB_PULSE_NODES = [(1583,303), (1645,303), (1611,305), (1631,304), (1067,313), (1174,313), (320,314), (425,314), (693,314), (799,314), (1440,314), (1586,315), (1600,315), (1049,317), (1514,318), (1366,318), (1320,318), (1422,318), (1530,318), (1613,325), (1424,328), (1601,329), (1556,334), (1587,330), (1616,334), (1632,333), (1067,333), (215,335), (319,335), (589,335), (692,335), (963,335), (1440,335), (1337,336), (1587,346), (1600,346), (1067,411), (215,412), (589,412), (964,412), (1440,412), (1337,413), (319,414), (692,414), (1142,417), (393,418), (766,418), (309,424), (653,424), (682,424), (636,425), (646,425), (1533,428), (1422,431), (216,431), (1337,431), (1358,430), (1460,431), (1518,431), (589,432), (636,434), (650,434), (237,434), (303,434), (610,434), (674,434), (119,447), (1557,440), (1254,442), (1243,450), (104,453), (212,559), (708,559), (950,559), (1336,559), (1446,559), (572,560), (1085,560), (320,561), (987,564), (1569,564), (1586,564), (1048,563), (1,577), (1600,586), (435,587), (808,587), (1189,587)]
+MB_PULSE_EDGES = [
+    (0, 11, [(1583,303), (1587,307), (1586,315)]),
+    (2, 12, [(1611,305), (1605,303), (1601,307), (1600,315)]),
+    (1, 84, [(1645,303), (1648,306), (1647,415), (1601,463), (1600,586)]),
+    (2, 19, [(1611,305), (1617,308), (1617,324), (1613,325)]),
+    (3, 25, [(1631,304), (1633,306), (1632,333)]),
+    (4, 13, [(1067,313), (1052,314), (1049,317)]),
+    (5, 26, [(1174,313), (1170,314), (1165,320), (1082,322), (1074,331), (1067,333)]),
+    (6, 66, [(320,314), (99,313), (96,316), (96,404), (114,424), (114,443), (119,447)]),
+    (7, 28, [(425,314), (421,314), (414,321), (338,321), (333,323), (323,334), (319,335)]),
+    (8, 85, [(693,314), (479,313), (476,316), (476,404), (494,424), (494,437), (476,457), (476,549), (441,585), (435,587)]),
+    (9, 30, [(799,314), (795,314), (788,321), (710,321), (692,335)]),
+    (10, 17, [(1440,314), (1426,314), (1422,318)]),
+    (11, 12, [(1586,315), (1600,315)]),
+    (11, 23, [(1586,315), (1587,330)]),
+    (12, 21, [(1600,315), (1601,329)]),
+    (13, 86, [(1049,317), (1044,313), (855,313), (851,316), (851,404), (869,424), (869,437), (851,457), (851,549), (819,581), (808,587)]),
+    (13, 31, [(1049,317), (1045,322), (981,321), (966,335), (963,335)]),
+    (13, 26, [(1049,317), (1060,330), (1067,333)]),
+    (14, 18, [(1514,318), (1515,314), (1526,314), (1530,318)]),
+    (14, 18, [(1514,318), (1530,318), (1526,322), (1515,322), (1514,318), (1530,318)]),
+    (14, 32, [(1514,318), (1460,318), (1447,332), (1440,335)]),
+    (15, 16, [(1366,318), (1363,314), (1324,314), (1320,318)]),
+    (15, 33, [(1366,318), (1362,322), (1353,322), (1342,334), (1337,336)]),
+    (15, 17, [(1366,318), (1422,318)]),
+    (16, 68, [(1320,318), (1262,318), (1258,314), (1236,314), (1234,316), (1234,403), (1251,421), (1252,441), (1254,442)]),
+    (16, 33, [(1320,318), (1331,333), (1337,336)]),
+    (17, 20, [(1422,318), (1426,322), (1427,327), (1424,328)]),
+    (18, 22, [(1530,318), (1542,320), (1556,334)]),
+    (21, 19, [(1601,329), (1604,325), (1613,325)]),
+    (21, 23, [(1601,329), (1587,326), (1602,326), (1587,330)]),
+    (19, 24, [(1613,325), (1616,325), (1616,334)]),
+    (20, 32, [(1424,328), (1427,327), (1440,335)]),
+    (21, 24, [(1601,329), (1600,332), (1605,335), (1616,334)]),
+    (21, 23, [(1601,329), (1587,333), (1600,332), (1587,330)]),
+    (21, 35, [(1601,329), (1600,346)]),
+    (22, 52, [(1556,334), (1561,346), (1560,366), (1565,373), (1565,392), (1537,421), (1533,428)]),
+    (23, 34, [(1587,330), (1587,346)]),
+    (24, 25, [(1616,334), (1632,333)]),
+    (24, 80, [(1616,334), (1616,395), (1568,445), (1567,546), (1569,564)]),
+    (25, 81, [(1632,333), (1631,409), (1585,457), (1586,564)]),
+    (26, 36, [(1067,333), (1067,411)]),
+    (27, 66, [(215,335), (198,321), (114,321), (109,324), (106,328), (106,399), (124,418), (124,437), (119,447)]),
+    (27, 28, [(215,335), (218,335), (234,321), (302,321), (319,335)]),
+    (27, 37, [(215,335), (215,412)]),
+    (28, 42, [(319,335), (319,414)]),
+    (29, 76, [(589,335), (571,321), (494,321), (486,327), (485,332), (486,399), (504,418), (504,442), (489,458), (489,550), (498,559), (572,560)]),
+    (29, 30, [(589,335), (607,321), (675,321), (692,335)]),
+    (29, 38, [(589,335), (589,412)]),
+    (30, 43, [(692,335), (692,414)]),
+    (31, 73, [(963,335), (946,321), (869,321), (861,328), (861,398), (880,419), (880,442), (864,459), (864,549), (873,559), (950,559)]),
+    (31, 39, [(963,335), (964,412)]),
+    (32, 40, [(1440,335), (1440,412)]),
+    (33, 41, [(1337,336), (1337,413)]),
+    (34, 35, [(1587,346), (1587,344), (1600,344), (1600,346)]),
+    (34, 35, [(1587,346), (1587,349), (1600,349), (1600,346)]),
+    (34, 52, [(1587,346), (1585,392), (1548,430), (1537,431), (1533,428)]),
+    (35, 67, [(1600,346), (1599,398), (1557,440)]),
+    (36, 39, [(1067,411), (1052,424), (979,424), (964,412)]),
+    (36, 44, [(1067,411), (1069,411), (1082,424), (1135,424), (1142,417)]),
+    (37, 62, [(215,412), (202,425), (203,440), (209,446), (224,446), (237,434)]),
+    (37, 47, [(215,412), (219,413), (231,424), (309,424)]),
+    (38, 64, [(589,412), (576,424), (576,440), (583,446), (597,446), (610,434)]),
+    (38, 50, [(589,412), (604,424), (636,425)]),
+    (39, 77, [(964,412), (961,413), (950,426), (950,439), (957,446), (972,446), (980,438), (1146,437), (1169,459), (1170,536), (1148,559), (1085,560)]),
+    (40, 53, [(1440,412), (1429,421), (1422,431)]),
+    (40, 57, [(1440,412), (1447,415), (1460,431)]),
+    (41, 56, [(1337,413), (1335,413), (1323,426), (1323,438), (1329,445), (1344,446), (1360,431), (1358,430)]),
+    (41, 56, [(1337,413), (1340,413), (1350,421), (1358,430)]),
+    (42, 47, [(319,414), (309,424)]),
+    (42, 45, [(319,414), (326,416), (334,424), (387,424), (393,418)]),
+    (43, 49, [(692,414), (682,424)]),
+    (43, 46, [(692,414), (699,416), (707,424), (760,424), (766,418)]),
+    (47, 63, [(309,424), (308,429), (303,434)]),
+    (48, 51, [(653,424), (646,425)]),
+    (48, 49, [(653,424), (682,424)]),
+    (48, 61, [(653,424), (653,434), (650,434)]),
+    (49, 65, [(682,424), (680,430), (674,434)]),
+    (50, 51, [(636,425), (646,425)]),
+    (50, 60, [(636,425), (636,434)]),
+    (51, 61, [(646,425), (646,434), (650,434)]),
+    (52, 58, [(1533,428), (1521,428), (1518,431)]),
+    (56, 55, [(1358,430), (1337,431)]),
+    (53, 56, [(1422,431), (1358,430)]),
+    (53, 57, [(1422,431), (1460,431), (1457,434), (1424,434), (1422,431), (1460,431)]),
+    (54, 62, [(216,431), (234,431), (237,434)]),
+    (57, 58, [(1460,431), (1518,431)]),
+    (58, 75, [(1518,431), (1524,441), (1542,460), (1542,537), (1520,559), (1446,559)]),
+    (59, 64, [(589,432), (607,431), (610,434)]),
+    (60, 64, [(636,434), (610,434)]),
+    (60, 61, [(636,434), (650,434)]),
+    (61, 65, [(650,434), (674,434)]),
+    (62, 63, [(237,434), (303,434)]),
+    (63, 78, [(303,434), (305,437), (399,438), (420,460), (420,537), (398,559), (323,559), (320,561)]),
+    (65, 72, [(674,434), (676,437), (773,438), (794,460), (794,537), (772,559), (708,559)]),
+    (68, 69, [(1254,442), (1252,441), (1243,450)]),
+    (66, 70, [(119,447), (107,449), (104,453)]),
+    (66, 71, [(119,447), (115,456), (116,551), (125,559), (212,559)]),
+    (69, 87, [(1243,450), (1239,449), (1233,455), (1233,547), (1193,586), (1189,587)]),
+    (69, 74, [(1243,450), (1245,451), (1245,550), (1254,559), (1336,559)]),
+    (70, 83, [(104,453), (101,451), (96,457), (96,538), (65,570), (3,570), (1,572), (1,577)]),
+    (70, 83, [(104,453), (107,456), (107,542), (68,581), (2,582), (1,577)]),
+]
+
+import time as _time_mb
+import random as _random_mb
+import bisect as _bisect_mb
+
+_mb_rng      = _random_mb.Random()
+_mb_runs     = {}       # rack_idx -> [[pts, cum, start_time, speed], ...]
+_mb_net      = None     # (nodes, edges, adjacency, endpoints), built on first use
+
+
+def _mb_screen_uv():
+    x0, y0, x1, y1 = MB_SCREEN_PX
+    # v=0 is the BOTTOM of the image, so image-row y maps to 1 - y/H
+    return x0 / MB_ART_W, 1.0 - y1 / MB_ART_H, x1 / MB_ART_W, 1.0 - y0 / MB_ART_H
+
+
+# --- Power state (rack switched on / off) -----------------------------------
+# OFF: the breathing glow and the ball stop, and the whole rack is dimmed.
+# ON again: the rack "powers up" - the light stutters through MB_POWER_FLICKER
+# (time in seconds since switch-on, brightness 0..1, linear in between) and then
+# settles at full brightness. Also scales the glow and ball while it plays.
+MB_POWER_ENABLED  = True
+MB_POWER_OFF_DIM  = 0.62    # how dark the rack goes when OFF (0 = no dimming, 1 = black)
+MB_POWER_DOWN_SEC = 0.55    # fade-out time when switched off
+MB_POWER_FLOOR    = 0.45    # lowest brightness the power-up flicker dips to (0 = as dark as OFF, 1 = no flicker)
+MB_POWER_FLICKER  = [
+    (0.00, 0.00), (0.10, 0.00), (0.12, 0.80), (0.21, 0.80), (0.23, 0.08),
+    (0.36, 0.08), (0.38, 0.95), (0.46, 0.95), (0.48, 0.20), (0.58, 0.20),
+    (0.60, 1.00), (0.74, 1.00), (0.76, 0.45), (0.84, 0.45), (0.86, 1.00),
+]
+_mb_power = {}      # rack_idx -> {"en", "t0", "p0", "p"}
+
+
+def _mb_flicker(dt):
+    k = MB_POWER_FLICKER
+    if dt <= k[0][0]:
+        return k[0][1]
+    for (ta, pa), (tb, pb) in zip(k, k[1:]):
+        if dt <= tb:
+            f = 0.0 if tb <= ta else (dt - ta) / (tb - ta)
+            return pa + (pb - pa) * f
+    return 1.0
+
+
+def _mb_power_level(rack_idx, enabled, now):
+    """Current brightness 0..1 of this rack (1 = fully powered)."""
+    if not MB_POWER_ENABLED:
+        return 1.0
+    st = _mb_power.get(rack_idx)
+    if st is None:                                   # first sight: no animation
+        st = {"en": bool(enabled), "t0": now - 999.0,
+              "p0": 1.0 if enabled else 0.0, "p": 1.0 if enabled else 0.0}
+        _mb_power[rack_idx] = st
+    if bool(enabled) != st["en"]:
+        st["en"], st["t0"], st["p0"] = bool(enabled), now, st["p"]
+    dt = now - st["t0"]
+    if st["en"]:
+        fl = MB_POWER_FLOOR + (1.0 - MB_POWER_FLOOR) * _mb_flicker(dt)   # dips to the floor, never to the OFF look
+        p = max(fl, st["p0"] * max(0.0, 1.0 - dt / 0.15))
+    else:
+        p = st["p0"] * max(0.0, 1.0 - dt / max(0.01, MB_POWER_DOWN_SEC))
+    st["p"] = p
+    return p
+
+
+def mb_draw_power_dim(rx, ry, rw, rh, rack_idx):
+    """Dark overlay over the whole rack, strength = how powered-down it is.
+    Called by rack_base after everything else is drawn so nothing escapes it."""
+    try:
+        st = _mb_power.get(rack_idx)
+        if not MB_POWER_ENABLED or st is None:
+            return
+        a = (1.0 - st["p"]) * MB_POWER_OFF_DIM
+        if a <= 0.004:
+            return
+        # draw_rect never sets a blend mode itself, so without this the overlay
+        # was drawn with whatever state the last draw left behind - opaque
+        # (a solid black rack) whenever nothing before it had set ALPHA.
+        gpu.state.blend_set("ALPHA")
+        _draw_rect(rx, ry, rw, rh, (0.0, 0.01, 0.015, a))
+    except Exception as e:
+        print(f"[MB] power dim error: {e}")
+
+
+_mb_glow_warned = False
+
+def _draw_mb_grid_pulse(rx, ry, rw, rh, power=1.0):
+    """Breathing additive glow on the packapunch screen grid."""
+    global _mb_glow_warned
+    if power <= 0.01:
+        return
+    try:
+        from ui.mixer.texture_cache import get_texture, blit_texture_tinted
+        tex = get_texture("rack_comp_multi_glow")
+        if not tex:
+            if not _mb_glow_warned:
+                _mb_glow_warned = True
+                print("[MB] breathing glow: texture 'rack_comp_multi_glow' is not loaded "
+                      "(check packapunch/rack_comp_multi_glow.png exists)")
+            return
+        if not _mb_glow_warned:
+            _mb_glow_warned = True
+            print("[MB] breathing glow: drawing (texture loaded)")
+        u0, v0, u1, v1 = _mb_screen_uv()
+        t   = _time_mb.perf_counter()
+        n   = max(1, int(MB_GLOW_STRIPS)) if MB_GLOW_SPREAD > 0 else 1
+        du  = (u1 - u0) / n
+        y   = ry + v0 * rh
+        h   = (v1 - v0) * rh
+        tau = 2.0 * math.pi
+        for i in range(n):
+            f      = (i + 0.5) / n
+            breath = 0.5 - 0.5 * math.cos(tau * (t / MB_GLOW_PERIOD - MB_GLOW_SPREAD * f))
+            k      = max(0.0, MB_GLOW_MIN + (MB_GLOW_MAX - MB_GLOW_MIN) * breath) * power
+            su0    = u0 + i * du
+            blit_texture_tinted(tex, rx + su0 * rw, y, du * rw + 0.5, h,
+                                color=(k * MB_GLOW_TINT[0], k * MB_GLOW_TINT[1],
+                                       k * MB_GLOW_TINT[2], 1.0),
+                                uv=(su0, v0, su0 + du, v1),
+                                key="rack_comp_multi_glow")
+    except Exception as e:
+        print(f"[MB] grid breathe error: {e}")
+
+
+def _mb_network():
+    global _mb_net
+    if _mb_net is None:
+        adj = {}
+        for ei, (u, v, pts) in enumerate(MB_PULSE_EDGES):
+            adj.setdefault(u, []).append((ei, 1))      # walk the polyline forwards
+            adj.setdefault(v, []).append((ei, -1))     # ... or backwards
+        ends = [n for n, lst in adj.items() if len(lst) == 1]
+        _mb_net = (MB_PULSE_NODES, MB_PULSE_EDGES, adj, ends or list(adj))
+    return _mb_net
+
+
+def _mb_heading(pts, i0, i1):
+    dx, dy = pts[i1][0] - pts[i0][0], pts[i1][1] - pts[i0][1]
+    d = math.hypot(dx, dy) or 1.0
+    return dx / d, dy / d
+
+
+def _mb_build_route():
+    """Random walk over the circuit network: start at a line end, keep going
+    (straight on where possible) until a dead end. Returns (pts, cum)."""
+    nodes, edges, adj, ends = _mb_network()
+    node = _mb_rng.choice(ends)
+    route = [nodes[node]]
+    heading = None
+    used = set()
+    total = 0.0
+    while total < MB_PULSE_ROUTE_MAX:
+        cands = [(ei, d) for ei, d in adj.get(node, ()) if ei not in used]
+        if not cands:
+            break                                      # reached the end of the line
+        scored = []
+        for ei, d in cands:
+            u, v, pts = edges[ei]
+            p = pts if d > 0 else pts[::-1]
+            h = _mb_heading(p, 0, min(len(p) - 1, 1))
+            align = 1.0 if heading is None else heading[0] * h[0] + heading[1] * h[1]
+            scored.append((align, ei, d, p))
+        scored.sort(key=lambda t: -t[0])
+        pick = scored[0] if (len(scored) == 1 or _mb_rng.random() < MB_PULSE_STRAIGHT) \
+            else _mb_rng.choice(scored)
+        _, ei, d, p = pick
+        used.add(ei)
+        for q in p[1:]:
+            total += math.hypot(q[0] - route[-1][0], q[1] - route[-1][1])
+            route.append(q)
+        heading = _mb_heading(route, max(0, len(route) - 2), len(route) - 1)
+        u, v, _pts = edges[ei]
+        node = v if d > 0 else u
+    cum = [0.0]
+    for (xa, ya), (xb, yb) in zip(route, route[1:]):
+        cum.append(cum[-1] + math.hypot(xb - xa, yb - ya))
+    return route, cum
+
+
+def _mb_point_on_path(geo, s):
+    """(x, y) in art px at arclength s along a route (clamped)."""
+    pts, cum = geo
+    s = max(0.0, min(cum[-1], s))
+    i = min(len(pts) - 2, max(0, _bisect_mb.bisect_right(cum, s) - 1))
+    seg = cum[i + 1] - cum[i]
+    f = 0.0 if seg <= 0 else (s - cum[i]) / seg
+    (xa, ya), (xb, yb) = pts[i], pts[i + 1]
+    return xa + (xb - xa) * f, ya + (yb - ya) * f
+
+
+def _mb_new_run(now, first=False):
+    gap = _mb_rng.uniform(0.0, MB_PULSE_GAP_MAX) if first else \
+          _mb_rng.uniform(MB_PULSE_GAP_MIN, MB_PULSE_GAP_MAX)
+    for _ in range(6):                                 # skip degenerate (tiny) routes
+        pts, cum = _mb_build_route()
+        if cum[-1] >= MB_PULSE_ROUTE_MIN:
+            break
+    return [pts, cum, now + gap, MB_PULSE_SPEED * _mb_rng.uniform(0.85, 1.15)]
+
+
+def _draw_mb_pulse(rx, ry, rw, rh, scale, rack_idx, power=1.0):
+    """A ball of light + fading trail running along the circuit network."""
+    if power <= 0.02:
+        _mb_runs.pop(rack_idx, None)       # rack is off: forget the run, start fresh on power-up
+        return
+    try:
+        from ui.mixer.texture_cache import get_texture, blit_texture_tinted
+        tex = get_texture("rack_pulse_glow")
+        if not tex or not MB_PULSE_EDGES:
+            return
+        now  = _time_mb.perf_counter()
+        runs = _mb_runs.get(rack_idx)
+        if runs is None or len(runs) != MB_PULSE_COUNT:
+            runs = []
+            for _ in range(MB_PULSE_COUNT):
+                runs.append(_mb_new_run(now, first=True))
+            _mb_runs[rack_idx] = runs
+        for ri, run in enumerate(runs):
+            pts, cum, t0, speed = run
+            if now < t0:
+                continue
+            length  = cum[-1]
+            d_head  = (now - t0) * speed                  # distance travelled so far
+            if d_head > length + MB_PULSE_TRAIL_LEN:      # trail has fully left the line
+                runs[ri] = _mb_new_run(now)
+                continue
+            n_tr = int(MB_PULSE_TRAIL_LEN / MB_PULSE_TRAIL_STEP)
+            for k in range(n_tr, -1, -1):                 # tail first, head drawn last (on top)
+                d = d_head - k * MB_PULSE_TRAIL_STEP
+                if d < 0.0 or d > length:
+                    continue
+                ax, ay = _mb_point_on_path((pts, cum), d)
+                f   = 1.0 - k * MB_PULSE_TRAIL_STEP / MB_PULSE_TRAIL_LEN
+                env = f ** 1.8
+                size = MB_PULSE_HEAD_SIZE * scale * (0.30 + 0.70 * f)
+                if k == 0:
+                    size *= 1.35
+                    env = 1.0
+                b = env * MB_PULSE_GAIN * (0.30 if k else 1.0) * power
+                cx = rx + ax / MB_ART_W * rw
+                cy = ry + (1.0 - ay / MB_ART_H) * rh
+                blit_texture_tinted(tex, cx - size * 0.5, cy - size * 0.5, size, size,
+                                    color=(b * MB_PULSE_TINT[0], b * MB_PULSE_TINT[1],
+                                           b * MB_PULSE_TINT[2], 1.0),
+                                    key="rack_pulse_glow")
+    except Exception as e:
+        print(f"[MB] electric ball error: {e}")
 
 
 def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
@@ -184,6 +630,25 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
     get_rack_channels = _racks_mod.get_rack_channels
     rail_h       = RACK_RAIL_H * scale
     body_h       = rh - rail_h
+
+    # PackAPunch — checked once up front. Its own chassis art already has a
+    # background baked into the screen area (no hole needed here, unlike the
+    # singleband CRT rack — the screen isn't cut out, it's just art), so the
+    # flat dark rect this function normally paints over the spectrum area
+    # (further down) gets skipped for this skin so that art stays visible.
+    # Every band-coloured element (knobs, faders, response curve + its dots
+    # and labels) also collapses to one neon blue via _band_col() below
+    # instead of the usual per-band red/green/blue/amber.
+    _is_packapunch_mb = False
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_mb0
+        _is_packapunch_mb = _gas_mb0() == MB_PACKAPUNCH_SKIN
+    except Exception:
+        pass
+
+    def _band_col(i):
+        return MB_PACKAPUNCH_COLOR if _is_packapunch_mb else BAND_COLORS[i]
+
     # PNG background — blit first, everything draws on top
     try:
         from ui.mixer.texture_cache import get_texture as _gtc_bg
@@ -195,6 +660,12 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
             _draw_rect(rx, ry, rw, body_h, (0.07, 0.07, 0.07, 1.0))
     except Exception:
         _draw_rect(rx, ry, rw, body_h, (0.07, 0.07, 0.07, 1.0))
+    # PackAPunch ambient grid glow — behind the live graph, on top of the art
+    _mb_pwr = 1.0
+    if _is_packapunch_mb:
+        _mb_pwr = _mb_power_level(rack_idx, rack.enabled, _time_mb.perf_counter())
+    if _is_packapunch_mb and MB_GLOW_ENABLED:
+        _draw_mb_grid_pulse(rx, ry, rw, rh, _mb_pwr)
     spec_zone_h  = body_h * 0.48
     fader_zone_h = body_h * 0.52
 
@@ -219,8 +690,11 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
     spec_w = content_w
     spec_h = spec_zone_h - 8*scale
 
-    # Background
-    _draw_rect(spec_x, spec_y, spec_w, spec_h, (0.04, 0.04, 0.04, 1.0))
+    # Background — skipped for packapunch so its own baked-in screen art
+    # (behind the chassis blit above) stays visible instead of being
+    # painted over with a flat dark rect.
+    if not _is_packapunch_mb:
+        _draw_rect(spec_x, spec_y, spec_w, spec_h, (0.04, 0.04, 0.04, 1.0))
     bv = [(spec_x,spec_y),(spec_x+spec_w,spec_y),
           (spec_x+spec_w,spec_y+spec_h),(spec_x,spec_y+spec_h),(spec_x,spec_y)]
     bb = batch_for_shader(shader,"LINE_STRIP",{"pos":bv})
@@ -299,20 +773,39 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
     # No trig, no log10, no lambda, no shader construction per frame.
     # Only the vertex positions are recomputed (128 muls per layer).
     # ----------------------------------------------------------------
-    bc = BAND_COLORS
-    layer_colors = [
-        ((bc[0][0]*0.5, bc[0][1]*0.5, bc[0][2]*0.5, 0.80),
-         (bc[0][0]*0.9+0.05, bc[0][1]*0.9+0.05, bc[0][2]*0.9+0.05, 1.0)),
-        ((0.05, 0.55, 0.65, 0.75), (0.1, 0.75, 0.85, 1.0)),
-        ((bc[1][0]*0.5, bc[1][1]*0.5, bc[1][2]*0.5, 0.80),
-         (bc[1][0]*0.9+0.05, bc[1][1]*0.9+0.05, bc[1][2]*0.9+0.05, 1.0)),
-        ((0.65, 0.58, 0.05, 0.75), (0.85, 0.78, 0.1, 1.0)),
-        ((bc[2][0]*0.5, bc[2][1]*0.5, bc[2][2]*0.5, 0.80),
-         (bc[2][0]*0.9+0.05, bc[2][1]*0.9+0.05, bc[2][2]*0.9+0.05, 1.0)),
-        ((0.55, 0.1, 0.65, 0.75), (0.75, 0.2, 0.85, 1.0)),
-        ((bc[3][0]*0.5, bc[3][1]*0.5, bc[3][2]*0.5, 0.80),
-         (bc[3][0]*0.9+0.05, bc[3][1]*0.9+0.05, bc[3][2]*0.9+0.05, 1.0)),
-    ]
+    if _is_packapunch_mb:
+        # Same 4-band / 3-crossover layer order as the default skin below,
+        # but every hue collapses to shades of the one neon blue — lighter
+        # per band so the 4 bands stay distinguishable without the usual
+        # red/green/amber/blue mix. fill/edge follow the same *0.5 (dim,
+        # translucent) / *0.9+0.05 (bright, opaque) relationship as the
+        # default skin's formula, just applied to a shade instead of a hue.
+        bs, cs = MB_PACKAPUNCH_BAND_SHADES, MB_PACKAPUNCH_CROSS_SHADES
+        def _mb_layer(shade):
+            r, g, b_s = shade
+            return ((r*0.5, g*0.5, b_s*0.5, 0.80),
+                    (min(1.0, r*0.9+0.05), min(1.0, g*0.9+0.05), min(1.0, b_s*0.9+0.05), 1.0))
+        layer_colors = [
+            _mb_layer(bs[0]), _mb_layer(cs[0]),
+            _mb_layer(bs[1]), _mb_layer(cs[1]),
+            _mb_layer(bs[2]), _mb_layer(cs[2]),
+            _mb_layer(bs[3]),
+        ]
+    else:
+        bc = BAND_COLORS
+        layer_colors = [
+            ((bc[0][0]*0.5, bc[0][1]*0.5, bc[0][2]*0.5, 0.80),
+             (bc[0][0]*0.9+0.05, bc[0][1]*0.9+0.05, bc[0][2]*0.9+0.05, 1.0)),
+            ((0.05, 0.55, 0.65, 0.75), (0.1, 0.75, 0.85, 1.0)),
+            ((bc[1][0]*0.5, bc[1][1]*0.5, bc[1][2]*0.5, 0.80),
+             (bc[1][0]*0.9+0.05, bc[1][1]*0.9+0.05, bc[1][2]*0.9+0.05, 1.0)),
+            ((0.65, 0.58, 0.05, 0.75), (0.85, 0.78, 0.1, 1.0)),
+            ((bc[2][0]*0.5, bc[2][1]*0.5, bc[2][2]*0.5, 0.80),
+             (bc[2][0]*0.9+0.05, bc[2][1]*0.9+0.05, bc[2][2]*0.9+0.05, 1.0)),
+            ((0.55, 0.1, 0.65, 0.75), (0.75, 0.2, 0.85, 1.0)),
+            ((bc[3][0]*0.5, bc[3][1]*0.5, bc[3][2]*0.5, 0.80),
+             (bc[3][0]*0.9+0.05, bc[3][1]*0.9+0.05, bc[3][2]*0.9+0.05, 1.0)),
+        ]
 
     # x positions are constant for a given spec_w — precompute once per draw
     x_positions = [spec_x + ((_MB_LOG_HZ[i] - _MB_LOG_MIN) / _MB_LOG_RNG) * spec_w
@@ -455,23 +948,26 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
         py = _db_to_y(db_here)
         curve_pts.append((px, py, bi))
 
-    # Fill between curve and the -18dB reference line
-    for i in range(len(curve_pts) - 1):
-        px1, py1, bi = curve_pts[i]
-        px2, py2, _  = curve_pts[i + 1]
-        col           = BAND_COLORS[bi]
-        r, g, b_c, _a = col
-        y_lo = min(py1, ref_y);  y_hi = max(py1, ref_y)
-        fh   = y_hi - y_lo
-        if fh > 0.5:
-            _draw_rect(px1, y_lo, max(px2 - px1, 0.5), fh,
-                       (r * 0.45, g * 0.45, b_c * 0.45, 0.45))
+    # Fill between curve and the -18dB reference line — dropped for
+    # packapunch so the background art shows through the graph instead of
+    # getting washed out by a translucent block sitting over it.
+    if not _is_packapunch_mb:
+        for i in range(len(curve_pts) - 1):
+            px1, py1, bi = curve_pts[i]
+            px2, py2, _  = curve_pts[i + 1]
+            col           = _band_col(bi)
+            r, g, b_c, _a = col
+            y_lo = min(py1, ref_y);  y_hi = max(py1, ref_y)
+            fh   = y_hi - y_lo
+            if fh > 0.5:
+                _draw_rect(px1, y_lo, max(px2 - px1, 0.5), fh,
+                           (r * 0.45, g * 0.45, b_c * 0.45, 0.45))
 
     # Curve line — coloured by band
     for i in range(len(curve_pts) - 1):
         px1, py1, bi = curve_pts[i]
         px2, py2, _  = curve_pts[i + 1]
-        col           = BAND_COLORS[bi]
+        col           = _band_col(bi)
         r, g, b_c, _a = col
         _draw_line(px1, py1, px2, py2,
                    (min(1.0, r*1.4), min(1.0, g*1.4), min(1.0, b_c*1.4), 1.0),
@@ -483,7 +979,7 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
         bx_c  = _freq_to_x(band_centres_hz[band])
         py_c  = _db_to_y(band_out_db[band])
         py_c  = max(spec_y + 4*scale, min(spec_y + spec_h - 4*scale, py_c))
-        col   = BAND_COLORS[band]
+        col   = _band_col(band)
         r, g, b_c, _a = col
         _draw_circle(bx_c, py_c, 5*scale,
                      (min(1.0, r*1.5), min(1.0, g*1.5), min(1.0, b_c*1.5), 1.0))
@@ -496,7 +992,7 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
 
     # Band name labels at bottom of spectrum
     for band in range(4):
-        col  = BAND_COLORS[band]
+        col  = _band_col(band)
         bx_c = _freq_to_x(band_centres_hz[band])
         fs_bn = max(1, int(8*scale))
         tw_bn = _text_width(BAND_NAMES[band], fs_bn)
@@ -535,7 +1031,7 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
     for band in range(4):
       try:
         bx  = content_x + band * band_w
-        col = BAND_COLORS[band]
+        col = _band_col(band)
         col_rgb = col[:3]  # _draw_knob expects 3-tuple; col has alpha
 
         # Band name + freq label at bottom — suppressed when baked into PNG
@@ -639,7 +1135,7 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
 
         _draw_gr_meter_band(gr_meter_x, gr_meter_y, gr_meter_w,
                             gr_meter_h, gr_db_band, scale,
-                            signal_norm=sig_norm)
+                            signal_norm=sig_norm, packapunch=_is_packapunch_mb)
 
         # Thin divider after fader strip
         div_x = bx + fader_strip_w
@@ -708,6 +1204,10 @@ def _draw_multiband_body(rx, ry, rw, rh, rack, rack_idx, scale):
         import traceback
         print(f"[MB] band {band} draw error: {e}")
         print(traceback.format_exc())
+
+    # PackAPunch electric ball — on top of the art, graph and knobs
+    if _is_packapunch_mb and MB_PULSE_ENABLED:
+        _draw_mb_pulse(rx, ry, rw, rh, scale, rack_idx, _mb_pwr)
 
     # ── Full-rack PNG blit — drawn LAST so it paints over body content.
     # Glass overlay — composited on top of spectrum/knobs/faders, same rect as body PNG

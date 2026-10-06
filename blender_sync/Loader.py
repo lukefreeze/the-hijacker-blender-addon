@@ -48,6 +48,7 @@ from core.engine import get_engine, reset_engine, PEDALBOARD_AVAILABLE, HIJACKER
 from core.properties import register_properties, unregister_properties
 import core.perf_monitor as _perf_mod
 import core.packapunch as _pap_mod
+import core.rack_screen_sequence as _rackseq_mod
 
 # Re-export constants that Racks.py imports from Loader
 from core.constants import FADER_TRACK_BOTTOM, NUMBOX_H, NUMBOX_Y_OFFSET
@@ -61,6 +62,7 @@ from ui.mixer.channel_strip import send_section_height as _send_section_height
 from core.audio import (
     _pb_engine_enable, _pb_engine_disable, _pb_recover_stuck_audio,
     _fft_timeline, _fft_timeline_full, _gr_timeline,
+    stop_all_oneshots,
 )
 
 from core.meters import (
@@ -173,6 +175,14 @@ class VSE_OT_TogglePBGui(bpy.types.Operator):
             save_ui_state()
             _cancel_meter_timer()
             _pb_engine_disable()
+            # Turning the HUD off is "closing the tool" from Luke's side —
+            # Blender keeps running and the file doesn't change, so neither
+            # the addon's unregister() nor on_load_post() fires. Without
+            # this, a still-playing one-shot cue (e.g. PACK-A-PUNCH's audio)
+            # had nothing telling it to stop, even though the HUD (and the
+            # skin it swapped) had just gone away.
+            stop_all_oneshots()
+            _pap_mod.reset()
 
         for area in context.screen.areas:
             area.tag_redraw()
@@ -244,6 +254,15 @@ def on_load_post(filepath, *args):
     from core.audio  import _pb_recover_stuck_audio as _recover
     _disable()
     _recover()
+    # Switching files (or File > New) doesn't call the addon's own
+    # unregister() — only quitting Blender or disabling the addon does —
+    # so a still-playing one-shot cue (e.g. PACK-A-PUNCH's audio) had
+    # nothing telling it to stop when Luke just changed files. This is
+    # the same orphaned-subprocess issue stop_all_oneshots() already
+    # solves for addon-disable and Blender-quit; load_post is the missing
+    # third case.
+    stop_all_oneshots()
+    _pap_mod.reset()
     clear_texture_cache()
     reset_engine()
     load_ui_state()
@@ -325,11 +344,13 @@ def register():
         "core.properties",
         "core.perf_monitor",
         "core.packapunch",
+        "core.rack_screen_sequence",
         "Racks",
         "ui.racks.rack_base",
         "ui.racks.rack_comp",
         "ui.racks.rack_delay",
         "ui.racks.rack_mixdown",
+        "ui.racks.rack_eq",
     ]
     importlib.invalidate_caches()
     # Force Racks.py to reload by removing it from sys.modules first
@@ -396,9 +417,14 @@ def unregister():
     global _handle, _icons
     _cancel_meter_timer()
     _pb_engine_disable()
+    # Kill any still-running one-shot audio subprocess (e.g. a PackAPunch
+    # cue) — see core/audio.py's atexit registration for why this is also
+    # needed here, not just at Blender quit.
+    stop_all_oneshots()
     unregister_racks()
     _perf_mod.unregister()
     _pap_mod.unregister()
+    _rackseq_mod.clear_all()
 
     if on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(on_load_post)
