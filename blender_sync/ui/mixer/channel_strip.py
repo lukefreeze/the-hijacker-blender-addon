@@ -57,6 +57,7 @@ from core.constants import (
     SEND_MIN_SLOTS,
 )
 from ui.mixer.texture_cache import get_texture, get_active_skin, blit_texture
+from ui.mixer.knob_fx import art_knobs_active as _art_knobs_active
 from ui.mixer.draw_utils import (
     draw_circle,
     draw_circle_knob,
@@ -364,7 +365,8 @@ def draw_channel_strip(
     knob_cy = sec_bot + (SEC_GAIN_H * scale) * 0.55 + _gain_ky
     gain_norm = (track.gain - GAIN_MIN) / (GAIN_MAX - GAIN_MIN)
     gain_db = round(20 * math.log10(max(0.001, track.gain)), 1)
-    draw_circle_knob(
+    if not _art_knobs_active():   # packApunch: the knob caps are in the art, live pointers are drawn by knob_fx
+      draw_circle_knob(
         kx + _gain_kx,
         knob_cy,
         KNOB_GAIN_R * scale,
@@ -463,7 +465,8 @@ def draw_channel_strip(
     ]
     for idx, (norm, col, lbl) in enumerate(eq_configs):
         ky = sec_top - (idx + 0.5) * eq_spacing + _eq_ky
-        draw_circle_knob(kx + _eq_kx, ky, KNOB_EQ_R * scale, norm, col, lbl, ui_scale=scale)
+        if not _art_knobs_active():
+            draw_circle_knob(kx + _eq_kx, ky, KNOB_EQ_R * scale, norm, col, lbl, ui_scale=scale)
 
     cursor = sec_bot
 
@@ -486,7 +489,8 @@ def draw_channel_strip(
         else f"R{int((pan_val - 0.5) * 200)}"
     )
     pan_cy = sec_bot + (SEC_PAN_H * scale) * 0.55 + _pan_ky
-    draw_circle_knob(
+    if not _art_knobs_active():
+      draw_circle_knob(
         kx + _pan_kx,
         pan_cy,
         KNOB_PAN_R * scale,

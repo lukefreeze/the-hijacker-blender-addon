@@ -1,5 +1,5 @@
 """
-Racks.py — Pedalboard effects rack UI
+Racks.py — The Hijacker effects rack UI
 Imported by Loader.py.
 
 Draws a Reason-style rack of effect units below the mixer fader section.
@@ -3670,7 +3670,18 @@ def rack_knob_hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
                 row_freq_eq  = row_gain_eq - kr_gain_eq - 10 * ui_scale - kr_small_eq
                 row_q_eq     = row_freq_eq - kr_small_eq - 8  * ui_scale - kr_small_eq
                 tol_eq       = 6 * ui_scale
-                for bi in range(N_BANDS_HT):
+                # PackAPunch skin: knobs sit where the baked art has them
+                _pp_kge = None
+                try:
+                    from ui.racks.rack_eq import eq_pp_knob_geom as _eq_kg
+                    _pp_kge = _eq_kg(rack_x, rack_y, rw, rh)
+                except Exception:
+                    _pp_kge = None
+                if _pp_kge:
+                    for _ke, _ge in _pp_kge.items():
+                        if math.dist((rx, ry), (_ge[0], _ge[1])) < _ge[4]:
+                            return (i, _ke)
+                for bi in (range(N_BANDS_HT) if not _pp_kge else ()):
                     col_cx_eq = disp_x_eq + (bi + 0.5) * col_w_eq
                     if math.dist((rx, ry), (col_cx_eq, row_gain_eq)) < kr_gain_eq + tol_eq:
                         return (i, bi)
@@ -3715,6 +3726,17 @@ def rack_knob_hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
 
             elif rack.effect_type == "NOISE_GATE":
                 # 5 knobs: p0=Threshold, p1=Attack, p2=Hold, p3=Release, p4=Range
+                # PackAPunch skin: knobs sit where the baked art has them
+                _pp_kgn = None
+                try:
+                    from ui.racks.rack_noisegate import noisegate_pp_knob_geom as _ng_kg
+                    _pp_kgn = _ng_kg(rack_x, rack_y, rw, rh)
+                except Exception:
+                    _pp_kgn = None
+                if _pp_kgn:
+                    for _kn, _gn in enumerate(_pp_kgn):
+                        if math.dist((rx, ry), (_gn[0], _gn[1])) < _gn[3]:
+                            return (i, _kn)
                 body_h_ng   = rh - RACK_RAIL_H * ui_scale
                 disp_x_ng   = rack_x + 42 * ui_scale
                 disp_w_ng   = rw - 42*ui_scale - 108*ui_scale - 8*ui_scale
@@ -3725,13 +3747,24 @@ def rack_knob_hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
                 row_knob_ng = knob_y_ng + knob_h_ng - row_slot_ng * 1.3
                 kr_ng       = min(max(13*ui_scale, col_w_ng*0.16), 20*ui_scale)
                 kr_ng       = min(kr_ng, row_slot_ng * 0.42)
-                for ki in range(5):
+                for ki in (range(5) if not _pp_kgn else ()):
                     cx_ng = disp_x_ng + (ki + 0.5) * col_w_ng
                     if math.dist((rx, ry), (cx_ng, row_knob_ng)) < kr_ng + 8*ui_scale:
                         return (i, ki)
 
             elif rack.effect_type == "DELAY":
                 # 5 knobs: p0=Time, p1=Feedback, p2=Mix, p3=Spread, p4=Filter
+                # PackAPunch skin: knobs sit where the baked art has them
+                _pp_kgd = None
+                try:
+                    from ui.racks.rack_delay import delay_pp_knob_geom as _dl_kg
+                    _pp_kgd = _dl_kg(rack_x, rack_y, rw, rh)
+                except Exception:
+                    _pp_kgd = None
+                if _pp_kgd:
+                    for _kd, _gd in enumerate(_pp_kgd):
+                        if math.dist((rx, ry), (_gd[0], _gd[1])) < _gd[3]:
+                            return (i, _kd)
                 body_h_dl   = rh - RACK_RAIL_H * ui_scale
                 disp_x_dl   = rack_x + 42 * ui_scale
                 disp_w_dl   = rw - 42*ui_scale - 108*ui_scale - 8*ui_scale
@@ -3742,7 +3775,7 @@ def rack_knob_hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
                 row_knob_dl = knob_y_dl + knob_h_dl - row_slot_dl * 1.3
                 kr_dl       = min(max(13*ui_scale, col_w_dl*0.16), 20*ui_scale)
                 kr_dl       = min(kr_dl, row_slot_dl * 0.42)
-                for ki in range(5):
+                for ki in (range(5) if not _pp_kgd else ()):
                     cx_dl = disp_x_dl + (ki + 0.5) * col_w_dl
                     if math.dist((rx, ry), (cx_dl, row_knob_dl)) < kr_dl + 8*ui_scale:
                         return (i, ki)
@@ -3753,7 +3786,16 @@ def rack_knob_hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
                 knob_cx   = rack_x + left_w_bo * 0.5
                 knob_cy   = rack_y + body_h_bo * 0.52
                 knob_r_bo = min(left_w_bo * 0.30, body_h_bo * 0.35)
-                if math.dist((rx, ry), (knob_cx, knob_cy)) < knob_r_bo + 6*ui_scale:
+                # PackAPunch skin: knob sits where the baked art has it
+                try:
+                    from ui.racks.rack_booster import booster_pp_knob_geom as _bo_kg
+                    _pp_kgb = _bo_kg(rack_x, rack_y, rw, rh)
+                except Exception:
+                    _pp_kgb = None
+                if _pp_kgb:
+                    if math.dist((rx, ry), (_pp_kgb[0], _pp_kgb[1])) < _pp_kgb[3]:
+                        return (i, 0)
+                elif math.dist((rx, ry), (knob_cx, knob_cy)) < knob_r_bo + 6*ui_scale:
                     return (i, 0)
 
             else:
@@ -3767,7 +3809,18 @@ def rack_knob_hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
                 kxs       = [rack_x + (KNOB_START_X + c*KNOB_SPACING)*ui_scale
                              for c in range(3)]
                 param_order = [0, 1, 5,  2, 3, 4]
-                for idx, pi in enumerate(param_order):
+                # PackAPunch skin: knobs sit where the baked art has them
+                _pp_kgs = None
+                try:
+                    from ui.racks.rack_base import singleband_pp_knob_geom as _sb_kg
+                    _pp_kgs = _sb_kg(rack_x, rack_y, rw, rh) if rack.effect_type == "COMP_SINGLE" else None
+                except Exception:
+                    _pp_kgs = None
+                if _pp_kgs:
+                    for _ks, _gs in enumerate(_pp_kgs):
+                        if math.dist((rx, ry), (_gs[0], _gs[1])) < _gs[3]:
+                            return (i, _ks)
+                for idx, pi in enumerate(param_order if not _pp_kgs else ()):
                     col_i = idx % 3
                     row_i = idx // 3
                     kx    = kxs[col_i]
@@ -5205,6 +5258,30 @@ def _draw_ai_rack_expanded(rx, ry, rw, rh, rack, ai_idx, scale):
         _draw_rect(rx, ry+rh-rail_h, rw, rail_h, HAL_RAIL)
         _draw_rect(rx, ry+rh-rail_h-2*scale, rw, 2*scale, (0.06, 0.04, 0.04, 1.0))
 
+    # kNN-VC on the packApunch skin: the art carries its own buttons, keys, screen and knobs at their own
+    # positions, so the whole rack is drawn by rack_knnvc.knnvc_pp_draw (instead of the rail layout below).
+    if rack.ai_type == "RVC" and _ai_bg_tex is not None:
+        try:
+            from ui.racks.rack_knnvc import knnvc_pp_active as _kn_pp_on, knnvc_pp_draw as _kn_pp_draw
+            if _kn_pp_on():
+                _kn_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale)
+                return
+        except Exception as _e_knpp:
+            print(f"[AI RACKS] kNN-VC packApunch draw error rack {ai_idx}: {_e_knpp}")
+            import traceback; traceback.print_exc()
+
+    # Piper on the packApunch skin (HAL 9000): same idea — the art carries its own keys, CRTs, eye and knobs, so the
+    # whole rack is drawn by rack_piper.piper_pp_draw instead of the rail layout below.
+    if rack.ai_type == "PIPER_TTS" and _ai_bg_tex is not None:
+        try:
+            from ui.racks.rack_piper import piper_pp_active as _pp_on_pi, piper_pp_draw as _pp_draw_pi
+            if _pp_on_pi():
+                _pp_draw_pi(rx, ry, rw, rh, rack, ai_idx, scale)
+                return
+        except Exception as _e_pipp:
+            print(f"[AI RACKS] Piper packApunch draw error rack {ai_idx}: {_e_pipp}")
+            import traceback; traceback.print_exc()
+
     col_x = rx + 4*scale
     col_y = ry + rh - 28*scale
     col_w = 24*scale
@@ -5828,6 +5905,24 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
         if not (rack_x <= mouse_x <= rack_x + rw and rack_y <= mouse_y <= rack_top):
             y_cur -= rack_h + RACK_GAP * scale
             continue
+
+        # kNN-VC on the packApunch skin: its own click zones (art positions), nothing else on the rail applies
+        if rack.ai_type == "RVC" and not rack.collapsed:
+            try:
+                from ui.racks.rack_knnvc import knnvc_pp_active as _kn_pp_on2, knnvc_pp_hit as _kn_pp_hit
+                if _kn_pp_on2():
+                    return _kn_pp_hit(mouse_x, mouse_y, rack, ai_idx, rack_x, rack_y, rw, rack_h)
+            except Exception as _e_knh:
+                print(f"[AI RACKS] kNN-VC packApunch hit-test error: {_e_knh}")
+
+        # Piper on the packApunch skin: art-coordinate click zones (rack_piper.piper_pp_hit)
+        if rack.ai_type == "PIPER_TTS" and not rack.collapsed:
+            try:
+                from ui.racks.rack_piper import piper_pp_active as _pi_pp_on2, piper_pp_hit as _pi_pp_hit
+                if _pi_pp_on2():
+                    return _pi_pp_hit(mouse_x, mouse_y, rack, ai_idx, rack_x, rack_y, rw, rack_h)
+            except Exception as _e_pih:
+                print(f"[AI RACKS] Piper packApunch hit-test error: {_e_pih}")
 
         # Collapse button
         col_x = rack_x + 4*scale

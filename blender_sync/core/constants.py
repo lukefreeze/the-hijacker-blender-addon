@@ -1,6 +1,6 @@
 # =============================================================================
 # core/constants.py
-# All layout constants for the Pedalboard HUD in one place.
+# All layout constants for The Hijacker HUD in one place.
 # Dimensions are UNSCALED pixels — multiply by UI_SCALE at draw time.
 # To resize any UI element, change its constant here and nowhere else.
 # =============================================================================

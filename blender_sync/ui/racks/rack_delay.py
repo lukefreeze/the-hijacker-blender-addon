@@ -41,23 +41,147 @@ except ImportError:
 RACK_RAIL_H = 32  # duplicated from Racks.py to avoid circular import
 
 # =============================================================================
-# DELAY KNOB TUNING
-# All values are unscaled px — multiplied by scale at draw time.
-#
-# DL_KNOB_SCALE : size multiplier for all 5 knobs (1.0 = no change)
-# DL_KNOB_X     : per-knob X nudge [Time, Feedback, Mix, Spread, Filter]
-# DL_KNOB_Y     : per-knob Y nudge [Time, Feedback, Mix, Spread, Filter]
-# Positive X = right, Negative X = left.
-# Positive Y = up,    Negative Y = down.
+# PACKAPUNCH (Back to the Future) SKIN
+# Everything below is in art pixels of rack_delay_bg.png (1758 x 468, top-left origin).
 # =============================================================================
-DL_KNOB_SCALE = 0.75
-#                   Time  Feedback   Mix  Spread  Filter
-DL_KNOB_X = [      0.0,    0.0,    -1.0,   -1.0,   -2.0]
-DL_KNOB_Y = [      0.0,    0.0,    0.0,   0.0,   0.0]
+import os
+try:
+    from core.constants import ASSETS_DIR as _DL_ASSETS_DIR
+except Exception:
+    _DL_ASSETS_DIR = ""
 
-# Value text nudge — shifts all 5 value readouts independently of the knobs.
-# Negative = move down, positive = move up.
-DL_VALUE_Y_OFFSET = -4.0
+DL_ART_W, DL_ART_H = 1758.0, 468.0
+DL_PP_SKIN   = "packapunch"
+DL_PP_SCREEN = (200.0, 84.0, 1052.0, 268.0)     # the black display (x0, y0, x1, y1), a little inside the metal frame
+
+# Knob caps: centre of each cap in the art (Time, Feedback, Mix, Spread, Filter).
+# Knob faces (exported art, one per knob, in rack_delay_knob_<n>.png): the cap's centre in the art, its size, and
+# the angle (degrees, clockwise from straight up) the line on the face points at in the image as exported.
+# The face is turned so that line sits at -135 deg (lower left) at minimum and +135 deg (lower right) at maximum.
+DL_PP_KNOB_POS   = ((283.5, 371.0), (588.0, 368.0), (861.0, 372.0), (1128.0, 376.0), (1406.0, 370.0))
+DL_PP_KNOB_SIZE  = ((59.0, 56.0), (58.0, 56.0), (58.0, 56.0), (58.0, 56.0), (58.0, 56.0))
+DL_PP_KNOB_LINE  = (-42.0, -46.0, -34.0, -1.0, -4.0)
+DL_PP_KNOB_KEYS  = ("rack_delay_knob_1", "rack_delay_knob_2", "rack_delay_knob_3", "rack_delay_knob_4", "rack_delay_knob_5")
+DL_PP_PTR_LEN    = 25.0                          # (only used if a knob image is missing: fallback pointer)
+DL_PP_PTR_WIDTH  = 3.2
+DL_PP_HIT_R      = 40.0                          # click radius (art px)
+DL_PP_SWEEP      = 270.0                         # degrees min -> max
+DL_PP_START_DEG  = 225.0                         # fallback pointer angle at minimum
+DL_PP_PTR_COLS   = ((0.40, 0.88, 1.00), (1.00, 0.58, 0.22), (0.50, 0.95, 0.52),
+                    (0.92, 0.45, 1.00), (1.00, 0.90, 0.68))
+
+# Value readouts under each knob label (the baked ones are painted out of the art).
+DL_PP_VALUE_CY   = 456.0
+DL_PP_VALUE_PX   = 15.0
+DL_PP_VALUE_COL  = (0.16, 0.13, 0.10, 0.92)
+
+# Graph curve glow (0 = no glow) and line width (unscaled px)
+DL_PP_GLOW_GAIN  = 1.0
+DL_PP_LINE_W     = 1.8
+
+# Flux capacitor: looping frame sequence laid additively over the unlit chamber in the art.
+DL_PP_FLUX_DIR   = os.path.join(_DL_ASSETS_DIR, "packapunch", "DelayFlux_frames")
+DL_PP_FLUX_RECT  = (1160.0, 44.0, 1376.0, 320.0)  # where frame 0 sits (x0, y0, x1, y1)
+DL_PP_FLUX_FPS   = 20.0
+DL_PP_FLUX_GAIN  = 1.0                            # >1 = brighter glow, <1 = softer
+
+
+def _dl_thick(pts, width, color, additive=False):
+    """One thick polyline as a single triangle strip (line_width_set is not reliable on every GPU backend)."""
+    n = len(pts)
+    if n < 2:
+        return
+    hw = width * 0.5
+    verts = []
+    for i in range(n):
+        if i == 0:
+            dx, dy = pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]
+        elif i == n - 1:
+            dx, dy = pts[-1][0] - pts[-2][0], pts[-1][1] - pts[-2][1]
+        else:
+            dx, dy = pts[i + 1][0] - pts[i - 1][0], pts[i + 1][1] - pts[i - 1][1]
+        L = math.hypot(dx, dy) or 1.0
+        nx, ny = -dy / L * hw, dx / L * hw
+        verts.append((pts[i][0] + nx, pts[i][1] + ny))
+        verts.append((pts[i][0] - nx, pts[i][1] - ny))
+    sh = _get_shader()
+    gpu.state.blend_set("ADDITIVE" if additive else "ALPHA")
+    sh.bind(); sh.uniform_float("color", color)
+    batch_for_shader(sh, "TRI_STRIP", {"pos": verts}).draw(sh)
+    gpu.state.blend_set("ALPHA")
+
+
+def _dl_pp_active():
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_dl
+        return _gas_dl() == DL_PP_SKIN
+    except Exception:
+        return False
+
+
+def delay_pp_knob_geom(rack_x, rack_y, rw, rh):
+    """Screen-space layout of the 5 packApunch delay knobs, indexed by parameter number:
+    list of (cx, cy, pointer_length, hit_radius), or None when the packApunch skin is not active."""
+    if not _dl_pp_active():
+        return None
+    sx, sy = rw / DL_ART_W, rh / DL_ART_H
+    sr = min(sx, sy)
+    return [(rack_x + ax * sx, rack_y + (1.0 - ay / DL_ART_H) * rh,
+             DL_PP_PTR_LEN * sr, DL_PP_HIT_R * sr) for ax, ay in DL_PP_KNOB_POS]
+
+
+def _dl_pp_draw_flux(rx, ry, rw, rh, rack, rack_idx):
+    """Flux capacitor glow: pre-rendered loop, added over the dark chamber. Independent of audio."""
+    try:
+        import time as _t
+        from ui.racks.rack_base import _pp_preset_level as _ppl
+        from core.rack_screen_sequence import get_sequence_frame as _gsf
+        from ui.mixer.texture_cache import blit_texture_tinted as _blt_t
+        lv = _ppl(rack_idx, rack.enabled, _t.monotonic())
+        if lv <= 0.01:
+            return
+        tex = _gsf("delay_packapunch_flux", DL_PP_FLUX_DIR, fps=DL_PP_FLUX_FPS,
+                   speed=1.0, phase_key=rack_idx)
+        if tex is None:
+            return
+        x0, y0, x1, y1 = DL_PP_FLUX_RECT
+        sx, sy = rw / DL_ART_W, rh / DL_ART_H
+        k = lv * DL_PP_FLUX_GAIN
+        _blt_t(tex, rx + x0 * sx, ry + (1.0 - y1 / DL_ART_H) * rh, (x1 - x0) * sx, (y1 - y0) * sy,
+               color=(k, k, k, k), blend="ADDITIVE_PREMULT", key="delay_packapunch_flux")
+    except Exception as _e_fx:
+        print(f"[DELAY] flux draw error: {_e_fx}")
+
+
+def _dl_pp_draw_knobs(rx, ry, rw, rh, rack, rack_idx, vals, scale):
+    """Knob face images turned to the value, plus the live value text under each label."""
+    try:
+        import time as _t
+        from ui.racks.rack_base import _sb_draw_pointer as _ptr, _pp_preset_level as _ppl
+        from ui.mixer.texture_cache import get_texture as _gtc_k, blit_texture_rotated as _blt_rot
+        geom = delay_pp_knob_geom(rx, ry, rw, rh)
+        if not geom:
+            return
+        lv = _ppl(rack_idx, rack.enabled, _t.monotonic())
+        sx, sy = rw / DL_ART_W, rh / DL_ART_H
+        sr = min(sx, sy)
+        vy = ry + (1.0 - DL_PP_VALUE_CY / DL_ART_H) * rh
+        fs = max(1, int(DL_PP_VALUE_PX * rh / DL_ART_H))
+        for ki, (g, (v, vs)) in enumerate(zip(geom, vals)):
+            v = max(0.0, min(1.0, v))
+            tex = _gtc_k(DL_PP_KNOB_KEYS[ki])
+            if tex:
+                ang = math.radians((0.5 - v) * DL_PP_SWEEP + DL_PP_KNOB_LINE[ki])
+                kw, kh = DL_PP_KNOB_SIZE[ki]
+                _blt_rot(tex, g[0], g[1], kw * sx, kh * sy, ang, blend="ALPHA_PREMULT", key=DL_PP_KNOB_KEYS[ki])
+            else:
+                _ptr(g[0], g[1], g[2], DL_PP_PTR_WIDTH * sr, DL_PP_START_DEG - DL_PP_SWEEP * v,
+                     DL_PP_PTR_COLS[ki], 0.30 + 0.70 * lv)
+            tw = _text_width(vs, fs)
+            c = DL_PP_VALUE_COL
+            _draw_text(vs, g[0] - tw / 2, vy - fs / 2, fs, (c[0], c[1], c[2], c[3] * (0.55 + 0.45 * lv)))
+    except Exception as _e_kn:
+        print(f"[DELAY] knob draw error: {_e_kn}")
 
 
 def _draw_delay_body(rx, ry, rw, rh, rack, rack_idx, scale):
@@ -111,6 +235,29 @@ def _draw_delay_body(rx, ry, rw, rh, rack, rack_idx, scale):
     knob_h    = body_h * 0.42 - 4 * ui
     knob_y    = ry + 2 * ui
 
+    # PackAPunch: the display, knobs, keys etc. sit where the art has them
+    _pp = _dl_pp_active()
+    if _pp:
+        _sx_pp, _sy_pp = rw / DL_ART_W, rh / DL_ART_H
+        _sx0, _sy0, _sx1, _sy1 = DL_PP_SCREEN
+        disp_x = rx + _sx0 * _sx_pp
+        disp_w = (_sx1 - _sx0) * _sx_pp
+        disp_y = ry + (1.0 - _sy1 / DL_ART_H) * rh
+        disp_h = (_sy1 - _sy0) * _sy_pp
+        _dl_pp_draw_flux(rx, ry, rw, rh, rack, rack_idx)
+    # PackAPunch power: everything on the screen fades out when the rack is switched off (and back in when it is on)
+    _lv = 1.0
+    if _pp:
+        try:
+            import time as _t_dl
+            from ui.racks.rack_base import _pp_preset_level as _ppl_dl
+            _lv = _ppl_dl(rack_idx, rack.enabled, _t_dl.monotonic())
+        except Exception:
+            _lv = 1.0 if rack.enabled else 0.0
+    def _F(c, k=None):
+        k = _lv if k is None else k
+        return (c[0], c[1], c[2], c[3] * k)
+
     # ── Knob values — identical to previous version ───────────────────────────
     time_norm  = getattr(rack, 'p0', 0.121)
     fb_norm    = getattr(rack, 'p1', 0.40)
@@ -132,7 +279,8 @@ def _draw_delay_body(rx, ry, rw, rh, rack, rack_idx, scale):
     shader = _get_shader()
 
     # ── Display background ────────────────────────────────────────────────────
-    _draw_rect(disp_x, disp_y, disp_w, disp_h, (0.035, 0.040, 0.055, 1.0))
+    if not _pp:
+        _draw_rect(disp_x, disp_y, disp_w, disp_h, (0.035, 0.040, 0.055, 1.0))
 
     # Subtle grid lines
     for _gfrac in (0.25, 0.50, 0.75):
@@ -140,7 +288,7 @@ def _draw_delay_body(rx, ry, rw, rh, rack, rack_idx, scale):
         _ggb = batch_for_shader(shader, "LINES",
                                 {"pos": [(disp_x, _gly), (disp_x + disp_w, _gly)]})
         shader.bind()
-        shader.uniform_float("color", (0.10, 0.11, 0.16, 1.0))
+        shader.uniform_float("color", _F((0.10, 0.11, 0.16, 1.0)))
         _ggb.draw(shader)
 
     # ── Impulse response curve ────────────────────────────────────────────────
@@ -244,8 +392,17 @@ def _draw_delay_body(rx, ry, rw, rh, rack, rack_idx, scale):
             if len(_fv) >= 4:
                 _bf = batch_for_shader(shader, "TRI_STRIP", {"pos": _fv})
                 shader.bind()
-                shader.uniform_float("color", fill_col)
+                shader.uniform_float("color", _F(fill_col))
                 _bf.draw(shader)
+            if _pp:
+                # glowing line: a wide soft halo and a tighter one under a crisp core (all fade with the power level)
+                _g = DL_PP_GLOW_GAIN * _lv * _lv
+                for _pts_g in (top_pts, bot_pts):
+                    if _g > 0.002:
+                        _dl_thick(_pts_g, DL_PP_LINE_W * ui * 5.0, (line_col[0], line_col[1], line_col[2], 0.07 * _g), True)
+                        _dl_thick(_pts_g, DL_PP_LINE_W * ui * 2.6, (line_col[0], line_col[1], line_col[2], 0.17 * _g), True)
+                    _dl_thick(_pts_g, DL_PP_LINE_W * ui, _F((line_col[0], line_col[1], line_col[2], 0.95)))
+                return
             # Top edge line
             gpu.state.line_width_set(max(1.5, ui))
             _bl = batch_for_shader(shader, "LINE_STRIP", {"pos": top_pts})
@@ -293,14 +450,14 @@ def _draw_delay_body(rx, ry, rw, rh, rack, rack_idx, scale):
         _ppb = batch_for_shader(shader, "LINES", {"pos": _ppv})
         gpu.state.line_width_set(max(1.2, ui))
         shader.bind()
-        shader.uniform_float("color", (0.75, 0.20, 0.85, 0.50))
+        shader.uniform_float("color", _F((0.75, 0.20, 0.85, 0.50)))
         _ppb.draw(shader)
         gpu.state.line_width_set(1.0)
         _fs_pp = max(1, int(7 * ui))
         _draw_text("L", disp_x + 3*ui, disp_y + disp_h * 0.25 - _fs_pp*0.5,
-                   _fs_pp, (0.30, 0.65, 0.95, 0.65))
+                   _fs_pp, _F((0.30, 0.65, 0.95, 0.65)))
         _draw_text("R", disp_x + 3*ui, disp_y + disp_h * 0.75 - _fs_pp*0.5,
-                   _fs_pp, (0.72, 0.20, 0.88, 0.65))
+                   _fs_pp, _F((0.72, 0.20, 0.88, 0.65)))
     else:
         # Single stereo envelope — cyan fill with brighter edge
         _draw_envelope(pts_top, pts_bot,
@@ -325,17 +482,17 @@ def _draw_delay_body(rx, ry, rw, rh, rack, rack_idx, scale):
         gpu.state.line_width_set(max(1.0, ui * 0.7))
         shader.bind()
         if ping_pong and _tn % 2 == 0:
-            shader.uniform_float("color", (0.72, 0.20, 0.88, _alpha * 0.55))
+            shader.uniform_float("color", _F((0.72, 0.20, 0.88, _alpha * 0.55)))
         else:
-            shader.uniform_float("color", (0.15, 0.58, 0.92, _alpha * 0.55))
+            shader.uniform_float("color", _F((0.15, 0.58, 0.92, _alpha * 0.55)))
         _tb2.draw(shader)
         gpu.state.line_width_set(1.0)
         # Tap number label on first few taps
         if _tn <= 5:
             _draw_text(str(_tn), _tap_x + 2*ui, disp_y + 3*ui,
                        _fs_tap,
-                       (0.72, 0.20, 0.88, _alpha * 0.7) if (ping_pong and _tn % 2 == 0)
-                       else (0.15, 0.58, 0.92, _alpha * 0.7))
+                       _F((0.72, 0.20, 0.88, _alpha * 0.7)) if (ping_pong and _tn % 2 == 0)
+                       else _F((0.15, 0.58, 0.92, _alpha * 0.7)))
         tap_lp2 *= lp_atten
 
     # ── LP filter cutoff marker — amber dashed vertical ───────────────────────
@@ -355,21 +512,27 @@ def _draw_delay_body(rx, ry, rw, rh, rack, rack_idx, scale):
         _bfc = batch_for_shader(shader, "LINES", {"pos": _segs_fc})
         gpu.state.line_width_set(max(1.2, ui))
         shader.bind()
-        shader.uniform_float("color", (0.90, 0.60, 0.12, 0.65))
+        shader.uniform_float("color", _F((0.90, 0.60, 0.12, 0.65)))
         _bfc.draw(shader)
         gpu.state.line_width_set(1.0)
 
     # ── Info labels ───────────────────────────────────────────────────────────
     _fs8 = max(1, int(8 * ui))
     _draw_text(f"t = {delay_str}", disp_x + 4*ui,
-               disp_y + disp_h - _fs8 - 3*ui, _fs8, (0.25, 0.68, 0.95, 0.85))
+               disp_y + disp_h - _fs8 - 3*ui, _fs8, _F((0.25, 0.68, 0.95, 0.85)))
     _tw_f = _text_width(filt_str, _fs8)
     _draw_text(filt_str, disp_x + disp_w - _tw_f - 4*ui,
-               disp_y + disp_h - _fs8 - 3*ui, _fs8, (0.90, 0.60, 0.12, 0.80))
+               disp_y + disp_h - _fs8 - 3*ui, _fs8, _F((0.90, 0.60, 0.12, 0.80)))
     _draw_text(f"fb {int(feedback * 100)}%", disp_x + 4*ui,
-               disp_y + 3*ui, _fs8, (0.25, 0.68, 0.95, 0.75))
+               disp_y + 3*ui, _fs8, _F((0.25, 0.68, 0.95, 0.75)))
 
     # ── Knob strip ────────────────────────────────────────────────────────────
+    if _pp:
+        _dl_pp_draw_knobs(rx, ry, rw, rh, rack, rack_idx,
+                          ((time_norm, delay_str), (fb_norm, f"{int(feedback*100)}%"),
+                           (mix_norm, f"{int(mix*100)}%"), (spread_n, f"{int(spread_n*100)}%"),
+                           (filt_norm, filt_str)), ui)
+        return
     _N_dl  = 5
     _cw_dl = disp_w / _N_dl
     _rk_dl = knob_y + knob_h * 0.68

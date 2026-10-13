@@ -175,6 +175,67 @@ SB_KNOB_X_COL2  = 1.5   # p5 Knee      (top) / p4 Gain    (bottom)
 SB_KNOB_Y_ROW0  = 4.5   # top row    — positive moves up
 SB_KNOB_Y_ROW1  = -5.0   # bottom row — positive moves up
 
+# --- PackAPunch singleband: the knobs are baked into the background art, so only a pointer line is drawn on each one.
+# Positions are the centres of the knob caps IN THE ART (art px of rack_comp_single_bg.png, y down), found by measuring the
+# image, so they stay on the knobs at any rack size. Order = parameter index p0..p5.
+SB_ART_W, SB_ART_H = 2240.0, 479.0
+SB_PP_KNOB_POS = {                       # param index -> (x, y) of the cap centre in the art (matched against the exported cap images)
+    0: (98.5, 205.0),  1: (226.5, 205.0),  5: (360.5, 204.0),      # top row:    Threshold, Ratio, Knee
+    2: (97.0, 331.0),  3: (226.0, 330.0),  4: (359.0, 330.0),      # bottom row: Attack, Release, Gain
+}
+SB_PP_PTR_LEN    = 22.0                  # pointer length from the cap centre (art px)
+SB_PP_PTR_START  = 0.30                  # where the line starts, as a fraction of its length (leaves the centre clear)
+SB_PP_PTR_WIDTH  = 3.2                   # line thickness (art px)
+SB_PP_PTR_COL_TOP = (0.80, 0.72, 0.60)   # pointer colour on the top row (the steel of those knobs, lifted so it reads)
+SB_PP_PTR_COL_BOT = (0.60, 0.25, 0.18)   # pointer colour on the bottom row (the maroon of those knobs, lifted)
+SB_PP_KNOB_HIT_R = 36.0                  # click radius (art px)
+SB_PP_SWEEP      = 270.0                 # degrees from minimum to maximum
+SB_PP_START_DEG  = 225.0                 # pointer angle at minimum (lower left; turns clockwise)
+
+
+def singleband_pp_knob_geom(rack_x, rack_y, rw, rh):
+    """Screen-space layout of the 6 packApunch singleband knobs, indexed by parameter number:
+    list of (cx, cy, pointer_length, hit_radius), or None when the packApunch skin is not active."""
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_sg
+        if _gas_sg() != SB_SCREEN_SEQ_SKIN:
+            return None
+    except Exception:
+        return None
+    sx, sy = rw / SB_ART_W, rh / SB_ART_H
+    sr = min(sx, sy)
+    out = []
+    for pi in range(6):
+        ax, ay = SB_PP_KNOB_POS[pi]
+        out.append((rack_x + ax * sx, rack_y + (1.0 - ay / SB_ART_H) * rh,
+                    SB_PP_PTR_LEN * sr, SB_PP_KNOB_HIT_R * sr))
+    return out
+
+
+def _sb_draw_pointer(cx, cy, length, width, ang_deg, col, alpha):
+    """One pointer line (dark outline under a light core) as thick quads in the knob's turn direction."""
+    try:
+        import gpu as _gpu
+        from gpu_extras.batch import batch_for_shader as _bfs
+        a = math.radians(ang_deg)
+        ca, sa = math.cos(a), math.sin(a)
+        x0, y0 = cx + ca * length * SB_PP_PTR_START, cy + sa * length * SB_PP_PTR_START
+        x1, y1 = cx + ca * length, cy + sa * length
+        sh = _gpu.shader.from_builtin("UNIFORM_COLOR")
+        _gpu.state.blend_set("ALPHA")
+        for w, c in ((width * 1.9, (0.0, 0.0, 0.0, 0.55 * alpha)), (width, (*col, alpha))):
+            hw = w * 0.5
+            nx, ny = -sa * hw, ca * hw
+            q = [(x0 + nx, y0 + ny), (x0 - nx, y0 - ny), (x1 + nx, y1 + ny),
+                 (x0 - nx, y0 - ny), (x1 - nx, y1 - ny), (x1 + nx, y1 + ny)]
+            b = _bfs(sh, "TRIS", {"pos": q})
+            sh.bind()
+            sh.uniform_float("color", c)
+            b.draw(sh)
+    except Exception:
+        pass
+
+
 # =============================================================================
 # PackAPunch COMP_SINGLE screen — looping "trench" image sequence behind the
 # spectrum graph, plus a narrower graph box to match the smaller CRT screen
@@ -788,11 +849,43 @@ PACKAPUNCH_BAKED_BTNS = {
     # Reverb: buttons sit in a different place from the generic rail buttons,
     # so it also has click zones (PACKAPUNCH_BTN_HITBOXES below).
     "REVERB":      ("rack_reverb_off_btn",    (1512, 42, 1676, 148), 1908, 544),
+    # Noise gate: ON / close sit top right of the art, away from the generic rail buttons.
+    "NOISE_GATE":  ("rack_noisegate_off_btn", (1738, 4, 1819, 52),   1864, 503),
+    # Delay: the lit ON glass top right; the patch is the same glass with the light turned off
+    "DELAY":       ("rack_delay_off_btn",     (1556, 4, 1680, 120),  1758, 468),
 }
 
 # Click zones for baked buttons that are NOT where the generic rail buttons are.
 #   effect type -> {"on": rect, "close": rect, "art": (W, H)}  rects in art px (x0, y0, x1, y1, top-left origin)
 PACKAPUNCH_BTN_HITBOXES = {
+    "NOISE_GATE": {
+        "on":    (1750, 16, 1814, 47),    # the red ON glass
+        "close": (1820, 16, 1849, 44),    # the X
+        "art":   (1864, 503),
+        # 3x3 channel keypad (centres of the key faces, row-major)
+        "keys":  {"cx": (1718.0, 1766.0, 1814.0), "cy": (106.0, 152.0, 198.0), "w": 38.0, "h": 36.0},
+        # preset display: the dark box between the two bone ends (arrow zones are the outer ends)
+        "preset": {"box": (771.0, 17.0, 1078.0, 46.0), "arrow_w": 26.0},
+    },
+    # Singleband: only the channel keys and the preset display are listed here (its ON / close buttons keep using the
+    # normal rail click zones, so there are no "on" / "close" entries).
+    "COMP_SINGLE": {
+        "art":   (2240, 479),
+        # 3x3 channel keypad (centres of the key faces, row-major), measured from the art
+        "keys":  {"cx": (2072.0, 2128.5, 2184.5), "cy": (118.5, 176.0, 231.5), "w": 44.0, "h": 40.0},
+        # preset display: the dark green box. The two arrows are baked into the bone either side of it (outside the box),
+        # so the click zones are the strips beside the box and no arrows are drawn.
+        "preset": {"box": (1129.0, 15.0, 1397.0, 48.0), "arrow_w": 34.0, "arrows_outside": True},
+    },
+    "DELAY": {
+        "on":    (1581, 16, 1658, 104),   # the lit ON glass
+        "close": (1680, 28, 1708, 70),    # the small red button
+        "art":   (1758, 468),
+        # 3x3 channel keypad (centres of the key faces, row-major), measured from the art
+        "keys":  {"cx": (1522.0, 1583.0, 1643.0), "cy": (200.0, 263.0, 325.0), "w": 50.0, "h": 44.0},
+        # preset display: the dark box; the two arrows are baked into the metal either side of it
+        "preset": {"box": (783.0, 12.0, 986.0, 41.0), "arrow_w": 34.0, "arrows_outside": True},
+    },
     "REVERB": {
         "on":    (1537, 60, 1651, 126),   # the lit ON glass
         "close": (1691, 59, 1759, 130),   # the red square button
@@ -823,9 +916,20 @@ def packapunch_preset_rects(rack, rack_x, rack_y, rw, rh):
     X = lambda ax: rack_x + ax / aw * rw
     Y = lambda ay: rack_y + (1.0 - ay / ah) * rh
     box = (X(x0), Y(y1), X(x1), Y(y0))
+    if cfg["preset"].get("arrows_outside"):
+        return {"box": box, "arrows_outside": True,
+                "left":  (X(x0 - aw_arrow), Y(y1), X(x0), Y(y0)),
+                "right": (X(x1), Y(y1), X(x1 + aw_arrow), Y(y0))}
     return {"box": box,
             "left":  (X(x0), Y(y1), X(x0 + aw_arrow), Y(y0)),
             "right": (X(x1 - aw_arrow), Y(y1), X(x1), Y(y0))}
+
+
+# Racks whose packApunch art has its own number plate for the rack number:
+#   effect type -> ((centre x, centre y) in art px, art w, art h, digit height in art px, colour)
+PACKAPUNCH_BADGE = {
+    "DELAY": ((116.0, 27.0), 1758, 468, 26.0, (0.86, 0.86, 0.82, 1.0)),
+}
 
 
 # Look of the packApunch preset display (text + arrows drawn inside the baked box)
@@ -834,6 +938,117 @@ PP_PRESET_ARROW_COL  = (1.00, 0.62, 0.15, 0.90)   # the two arrows
 PP_PRESET_UPPERCASE  = True                       # the baked box style is all caps
 PP_PRESET_TEXT_FRAC  = 0.50                       # text height as a fraction of the box height
 
+
+# Per-rack look of the baked preset display + keypad text. Racks not listed use the amber defaults above
+# (and the normal Blender font). "font": None = normal font, "auto" = fonts/<rack type>.ttf|.otf (e.g. noise_gate.ttf),
+# or an exact file name in ui/assets/skins/packapunch/fonts/ (see pp_text.py). Each rack can use its own font.
+PACKAPUNCH_RACK_THEME = {
+    "NOISE_GATE": {
+        "font": "auto",                                # fonts/noise_gate.ttf (or .otf); None = normal font
+        "glow": 0.9,                                   # text glow strength (0 = none)
+        "preset_col":   (1.00, 0.30, 0.24, 1.00),
+        "arrow_col":    (0.95, 0.20, 0.17, 0.95),
+        "arrow_size":   0.38,
+        "text_frac":    0.58,                          # preset name height (normal font)
+        "preset_font":  False,                         # True = draw the preset name in the rack's themed font too
+        "text_frac_themed": 0.78,                      # preset name height when drawn in the themed font
+        "key_on_text":  (1.00, 0.34, 0.28, 1.00),
+        "key_off_text": (0.72, 0.17, 0.14, 0.90),
+        "key_glow":     (1.00, 0.10, 0.06, 0.16),      # additive light on an assigned key
+        "key_frac":     0.90,
+    },
+}
+
+
+# Multiband: the neon blue of the rest of the rack (rack_comp.py MB_PACKAPUNCH_COLOR) with a soft glow on the preset name.
+PACKAPUNCH_RACK_THEME["COMP_MULTI"] = {
+    "font": None,
+    "glow": 0.6,
+    "preset_col": (0.15, 0.85, 1.00, 1.00),
+}
+
+
+PACKAPUNCH_RACK_THEME["COMP_SINGLE"] = {
+    "font": None,                                      # normal font
+    "glow": 0.55,
+    "preset_col":   (0.50, 1.00, 0.45, 1.00),          # the green of the baked display
+    "arrow_col":    (0.50, 1.00, 0.45, 0.95),          # (arrows are baked on this rack - not drawn)
+    "text_frac":    0.66,                              # preset name height as a fraction of the display height
+    "preset_font":  False,
+    "uppercase":    False,                             # the display shows the name as written
+    "key_on_text":  (0.20, 0.09, 0.04, 1.00),          # dark brown on the pale keys: assigned channel
+    "key_off_text": (0.30, 0.17, 0.10, 0.78),          # a softer brown: unassigned
+    "key_glow":     (1.00, 0.62, 0.20, 0.10),          # faint warm light on an assigned key
+    "key_frac":     0.62,
+}
+
+
+PACKAPUNCH_RACK_THEME["DELAY"] = {
+    "font": None,
+    "glow": 0.55,
+    "preset_col":   (0.55, 0.88, 1.00, 1.00),          # the cold blue of the flux capacitor
+    "arrow_col":    (0.55, 0.88, 1.00, 0.95),          # (arrows are baked on this rack - not drawn)
+    "text_frac":    0.62,
+    "preset_font":  False,
+    "uppercase":    False,
+    "key_on_text":  (0.13, 0.07, 0.05, 0.95),          # dark digit on a lit key, like the baked art had
+    "key_off_text": (0.09, 0.08, 0.07, 0.62),          # fainter on a dark key
+    "key_glow":     (0.0, 0.0, 0.0, 0.0),              # the lit key image does the lighting
+    "key_frac":     0.58,
+    "key_lit_prefix": "rack_delay_key",                # lit key textures: rack_delay_key<N>_lit
+    "key_lit_patch":  (66.0, 60.0, 50.0, 44.0),        # lit image size / key face size, art px (w, h, key w, key h)
+}
+
+
+def _pp_theme(rack):
+    """Look of the packApunch text for this rack, with the amber defaults filled in."""
+    t = PACKAPUNCH_RACK_THEME.get(getattr(rack, "effect_type", None), {})
+    fid, prof = 0, None
+    spec = t.get("font")
+    if spec:
+        try:
+            from ui.racks.pp_text import font_id as _pp_fid, font_profile as _pp_prof
+            fid = _pp_fid(spec, getattr(rack, "effect_type", ""))
+            prof = _pp_prof(spec, getattr(rack, "effect_type", "")) if fid else None
+        except Exception:
+            fid, prof = 0, None
+    return {
+        "fid":          fid,
+        "prof":         prof,
+        "glow":         t.get("glow", 0.0),
+        "preset_col":   t.get("preset_col", PP_PRESET_COL),
+        "arrow_col":    t.get("arrow_col", PP_PRESET_ARROW_COL),
+        "arrow_size":   t.get("arrow_size", PP_PRESET_ARROW_SIZE),
+        "text_frac":    t.get("text_frac", PP_PRESET_TEXT_FRAC),
+        "preset_font":  t.get("preset_font", True),
+        "text_frac_themed": t.get("text_frac_themed", t.get("text_frac", PP_PRESET_TEXT_FRAC)),
+        "key_on_text":  t.get("key_on_text", PP_KEY_ON_TEXT),
+        "key_off_text": t.get("key_off_text", PP_KEY_OFF_TEXT),
+        "key_glow":     t.get("key_glow", PP_KEY_ON_GLOW),
+        "key_frac":     t.get("key_frac", 0.42),
+        "uppercase":    t.get("uppercase", PP_PRESET_UPPERCASE),
+        "key_lit_prefix": t.get("key_lit_prefix"),
+        "key_lit_patch":  t.get("key_lit_patch"),
+    }
+
+
+def _pp_draw_text(text, x, y, size, color, th):
+    if th["fid"] or th["glow"] > 0:
+        from ui.racks.pp_text import draw_text as _pdt
+        _pdt(text, x, y, size, color, glow=th["glow"], fid=th["fid"], prof=th["prof"])
+    else:
+        _draw_text(text, x, y, size, color)
+
+
+def _pp_text_width(text, size, th):
+    if th["fid"]:
+        from ui.racks.pp_text import text_width as _ptw
+        return _ptw(text, size, th["fid"], th["prof"])
+    return _text_width(text, size)
+
+
+# Racks (packApunch skin) whose art has the preset arrows baked in: the generic drawn arrows are skipped for them.
+PACKAPUNCH_BAKED_PRESET_ARROWS = ("COMP_MULTI",)
 
 PP_PRESET_ARROW_SIZE = 0.30                       # arrow size as a fraction of the box height (was 0.42)
 PP_PRESET_FADE_SEC   = 0.9                        # seconds for the name + arrows to fade out when the rack is switched off
@@ -858,35 +1073,58 @@ def _pp_preset_level(rack_idx, enabled, now):
     return lv
 
 
-def _draw_pp_preset(rects, name, level=1.0):
-    """Preset name and arrows inside the baked amber box."""
+def _draw_pp_preset(rects, name, level=1.0, rack=None):
+    """Preset name and arrows inside the baked box (look comes from PACKAPUNCH_RACK_THEME)."""
     if level <= 0.01:
         return
+    th = _pp_theme(rack)
     x0, y0, x1, y1 = rects["box"]
     h = y1 - y0
     cy = (y0 + y1) / 2
     shader = _get_shader()
     gpu.state.blend_set("ALPHA")
-    # arrows (centred in the end zones)
-    ah_, aw_ = h * PP_PRESET_ARROW_SIZE, h * PP_PRESET_ARROW_SIZE * 0.72
+    # arrows (centred in the end zones); skipped when they are baked into the art outside the box
+    outside = bool(rects.get("arrows_outside"))
+    ah_, aw_ = h * th["arrow_size"], h * th["arrow_size"] * 0.72
     lx0, lx1 = rects["left"][0], rects["left"][2]
     rx0, rx1 = rects["right"][0], rects["right"][2]
+    if outside:
+        lx1, rx0 = x0 + h * 0.3, x1 - h * 0.3             # text span = the box itself
     lcx, rcx = (lx0 + lx1) / 2, (rx0 + rx1) / 2
     left_tri  = [(lcx - aw_, cy), (lcx + aw_, cy + ah_), (lcx + aw_, cy - ah_)]
     right_tri = [(rcx + aw_, cy), (rcx - aw_, cy + ah_), (rcx - aw_, cy - ah_)]
-    shader.bind()
-    shader.uniform_float("color", (*PP_PRESET_ARROW_COL[:3], PP_PRESET_ARROW_COL[3] * level))
-    batch_for_shader(shader, "TRIS", {"pos": left_tri}).draw(shader)
-    batch_for_shader(shader, "TRIS", {"pos": right_tri}).draw(shader)
+    ac = th["arrow_col"]
+    if outside:
+        pass
+    elif th["glow"] > 0:                                    # soft halo behind the arrows
+        gpu.state.blend_set("ADDITIVE")
+        shader.bind()
+        shader.uniform_float("color", (ac[0], ac[1], ac[2], ac[3] * level * 0.22 * th["glow"]))
+        g = 1.0 + 0.55
+        for tri, c in ((left_tri, lcx), (right_tri, rcx)):
+            big = [(c + (px - c) * g, cy + (py - cy) * g) for px, py in tri]
+            batch_for_shader(shader, "TRIS", {"pos": big}).draw(shader)
+        gpu.state.blend_set("ALPHA")
+    if not outside:
+        shader.bind()
+        shader.uniform_float("color", (*ac[:3], ac[3] * level))
+        batch_for_shader(shader, "TRIS", {"pos": left_tri}).draw(shader)
+        batch_for_shader(shader, "TRIS", {"pos": right_tri}).draw(shader)
     # name, centred between the arrows
-    label = name.upper() if PP_PRESET_UPPERCASE else name
-    fs = max(1, int(h * PP_PRESET_TEXT_FRAC))
+    label = name.upper() if th["uppercase"] else name
+    if not th["preset_font"]:                             # preset name in the normal font (still glowing)
+        th = dict(th, fid=0, prof=None)
+        frac = th["text_frac"]
+    else:
+        frac = th["text_frac_themed"]
+    fs = max(1, int(h * frac))
     max_w = (rx0 - lx1) * 0.96
-    while fs > 6 and _text_width(label, fs) > max_w:
+    while fs > 6 and _pp_text_width(label, fs, th) > max_w:
         fs -= 1
-    tw = _text_width(label, fs)
-    _draw_text(label, (lx1 + rx0) / 2 - tw / 2, cy - fs / 2 + 1, fs,
-               (*PP_PRESET_COL[:3], PP_PRESET_COL[3] * level))
+    tw = _pp_text_width(label, fs, th)
+    pc = th["preset_col"]
+    _pp_draw_text(label, (lx1 + rx0) / 2 - tw / 2, cy - fs / 2 + 1, fs,
+                  (*pc[:3], pc[3] * level), th)
 
 
 def packapunch_key_rects(rack, rack_x, rack_y, rw, rh):
@@ -920,24 +1158,40 @@ PP_KEY_ON_GLOW   = (1.00, 0.55, 0.10, 0.20)   # additive amber light on an assig
 
 
 def _draw_pp_keypad(rack, key_rects, scale):
-    """Channel numbers (and a soft amber light on assigned keys) over the baked keypad."""
+    """Channel numbers (and a soft light on assigned keys) over the baked keypad."""
     group_idx = getattr(rack, 'group_idx', 0)
+    th = _pp_theme(rack)
+    kg = th["key_glow"]
     shader = _get_shader()
+    lit_prefix = th.get("key_lit_prefix")
     for local_idx, (x0, y0, x1, y1) in enumerate(key_rects):
         assigned = getattr(rack, f'ch{local_idx}', False)
-        if assigned and PP_KEY_ON_GLOW[3] > 0:
+        if assigned and lit_prefix and getattr(rack, "enabled", True):
+            # lit key image over the dark key of the art
+            try:
+                from ui.mixer.texture_cache import get_texture as _gtc_kl
+                from ui.mixer.texture_cache import blit_texture as _blt_kl
+                _kt = _gtc_kl(f"{lit_prefix}{local_idx + 1}_lit")
+                if _kt:
+                    pw, ph, kw, kh = th["key_lit_patch"]
+                    ex, ey = (x1 - x0) * (pw / kw - 1.0) * 0.5, (y1 - y0) * (ph / kh - 1.0) * 0.5
+                    _blt_kl(_kt, x0 - ex, y0 - ey, (x1 - x0) + 2 * ex, (y1 - y0) + 2 * ey,
+                            key=f"{lit_prefix}{local_idx + 1}_lit", blend="ALPHA")
+            except Exception as _e_kl:
+                print(f"[SKIN] lit key error: {_e_kl}")
+        elif assigned and kg[3] > 0:
             ix, iy = (x1 - x0) * 0.12, (y1 - y0) * 0.12
             a, b, c, d = (x0 + ix, y0 + iy), (x1 - ix, y0 + iy), (x1 - ix, y1 - iy), (x0 + ix, y1 - iy)
             gpu.state.blend_set("ADDITIVE")
             shader.bind()
-            shader.uniform_float("color", PP_KEY_ON_GLOW)
+            shader.uniform_float("color", kg)
             batch_for_shader(shader, "TRIS", {"pos": [a, b, c, a, c, d]}).draw(shader)
             gpu.state.blend_set("ALPHA")
         label = str(group_idx * 9 + local_idx + 1)
-        fs = max(1, int((y1 - y0) * 0.42))
-        tw = _text_width(label, fs)
-        _draw_text(label, (x0 + x1) / 2 - tw / 2, (y0 + y1) / 2 - fs / 2 + 1,
-                   fs, PP_KEY_ON_TEXT if assigned else PP_KEY_OFF_TEXT)
+        fs = max(1, int((y1 - y0) * th["key_frac"]))
+        tw = _pp_text_width(label, fs, th)
+        _pp_draw_text(label, (x0 + x1) / 2 - tw / 2, (y0 + y1) / 2 - fs / 2 + 1, fs,
+                      th["key_on_text"] if assigned else th["key_off_text"], th)
 
 
 def packapunch_btn_hitboxes(rack, rack_x, rack_y, rw, rh):
@@ -945,7 +1199,7 @@ def packapunch_btn_hitboxes(rack, rack_x, rack_y, rw, rh):
     the art at custom positions. Returns {"on": (x0,y0,x1,y1), "close": (...)} or
     None when this rack/skin/state uses the normal rail buttons."""
     cfg = PACKAPUNCH_BTN_HITBOXES.get(getattr(rack, "effect_type", None))
-    if not cfg or getattr(rack, "collapsed", False):
+    if not cfg or "on" not in cfg or "close" not in cfg or getattr(rack, "collapsed", False):
         return None
     try:
         from ui.mixer.texture_cache import get_active_skin as _gas_hb
@@ -1116,6 +1370,7 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
             _draw_rect(div_x, ry+4*scale, max(1.0, scale),
                        rh-RACK_RAIL_H*scale-8*scale, (0.2, 0.2, 0.2, 1.0))
 
+        _sb_geom = singleband_pp_knob_geom(rx, ry, rw, rh) if _is_packapunch_sb else None
         if not _is_packapunch_sb:
             _draw_sb_knobs()
 
@@ -1153,7 +1408,15 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
                                    blend="ALPHA_PREMULT", key="rack_comp_single_bg_off")
             except Exception as _e_sboff:
                 print(f"[SKIN] singleband lights-off error: {_e_sboff}")
-            _draw_sb_knobs()
+            if _sb_geom is not None:
+                _sb_la = _sb_lights_power(rack_idx, rack.enabled)
+                for _pi, _g in enumerate(_sb_geom):
+                    _nv = max(0.0, min(1.0, getattr(rack, f'p{_pi}', 0.0)))
+                    _sb_draw_pointer(_g[0], _g[1], _g[2], SB_PP_PTR_WIDTH * min(rw / SB_ART_W, rh / SB_ART_H),
+                                     SB_PP_START_DEG - SB_PP_SWEEP * _nv,
+                                     SB_PP_PTR_COL_TOP if _pi in (0, 1, 5) else SB_PP_PTR_COL_BOT, 0.30 + 0.70 * _sb_la)
+            else:
+                _draw_sb_knobs()
 
         # Glass overlay — composited on top of spectrum/GR meters, same rect as body PNG
         try:
@@ -1231,10 +1494,26 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
 
     # Badge rect, border and dropdown arrow suppressed — baked into background PNG
     # Only draw the number text
-    tw_b = _text_width(badge_label, badge_fs)
-    _draw_text(badge_label, badge_x + badge_w/2 - tw_b/2,
-               badge_y + badge_h/2 - badge_fs/2,
-               badge_fs, (0.35, 0.7, 1.0, 1.0))
+    _bd_pp = PACKAPUNCH_BADGE.get(etype)
+    if _bd_pp:
+        try:
+            from ui.mixer.texture_cache import get_active_skin as _gas_bd
+            if _gas_bd() != "packapunch":
+                _bd_pp = None
+        except Exception:
+            _bd_pp = None
+    if _bd_pp:
+        # packApunch: the rack number sits in the art's own number plate (the baked digit is painted out of the art)
+        (_bcx, _bcy), _baw, _bah, _bpx, _bcol = _bd_pp
+        badge_fs = max(1, int(_bpx * rh / _bah))
+        tw_b = _text_width(badge_label, badge_fs)
+        _draw_text(badge_label, rx + _bcx / _baw * rw - tw_b / 2,
+                   ry + (1.0 - _bcy / _bah) * rh - badge_fs / 2 + 1, badge_fs, _bcol)
+    else:
+        tw_b = _text_width(badge_label, badge_fs)
+        _draw_text(badge_label, badge_x + badge_w/2 - tw_b/2,
+                   badge_y + badge_h/2 - badge_fs/2,
+                   badge_fs, (0.35, 0.7, 1.0, 1.0))
     badge_w = badge_w + 6*scale
 
     if etype not in ("COMP_MULTI", "COMP_SINGLE", "EQ", "REVERB", "NOISE_GATE", "DELAY", "BOOSTER", "MIXDOWN"):  # suppressed — label baked into background PNG
@@ -1255,25 +1534,42 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
     if _pp_preset:
         import time as _time_pp
         _draw_pp_preset(_pp_preset, p_name,
-                        _pp_preset_level(rack_idx, rack.enabled, _time_pp.monotonic()))
+                        _pp_preset_level(rack_idx, rack.enabled, _time_pp.monotonic()), rack)
     else:
+        # Racks whose packApunch art already has the preset arrows baked in: don't draw ours (the click zones are unchanged)
+        _pp_no_arrows = False
+        if etype in PACKAPUNCH_BAKED_PRESET_ARROWS:
+            try:
+                from ui.mixer.texture_cache import get_active_skin as _gas_pa
+                _pp_no_arrows = _gas_pa() == "packapunch"
+            except Exception:
+                pass
         lax = p_box_x - 14*scale
         lay = ry + rh - 18*scale
         la  = [(lax, lay), (lax+10*scale, lay+6*scale), (lax+10*scale, lay-6*scale)]
-        batch = batch_for_shader(shader,"TRIS",{"pos":la})
-        shader.uniform_float("color",(0.4,0.4,0.4,1.0)); batch.draw(shader)
+        if not _pp_no_arrows:
+            batch = batch_for_shader(shader,"TRIS",{"pos":la})
+            shader.uniform_float("color",(0.4,0.4,0.4,1.0)); batch.draw(shader)
 
         _draw_rect(p_box_x, p_box_y, p_box_w, p_box_h, (0.07,0.07,0.07,1.0))
         fs_p = max(1, int(9*scale))
         tw   = _text_width(p_name, fs_p)
-        _draw_text(p_name, p_box_x + p_box_w/2 - tw/2,
-                   p_box_y + p_box_h/2 - fs_p/2 + 1, fs_p, (0.7,0.7,0.7,1.0))
+        if _pp_no_arrows and rack.effect_type in PACKAPUNCH_RACK_THEME:
+            # packApunch: the rack's own preset colour with its soft glow (see PACKAPUNCH_RACK_THEME)
+            _th_m = _pp_theme(rack)
+            tw = _pp_text_width(p_name, fs_p, _th_m)
+            _pp_draw_text(p_name, p_box_x + p_box_w/2 - tw/2,
+                          p_box_y + p_box_h/2 - fs_p/2 + 1, fs_p, _th_m["preset_col"], _th_m)
+        else:
+            _draw_text(p_name, p_box_x + p_box_w/2 - tw/2,
+                       p_box_y + p_box_h/2 - fs_p/2 + 1, fs_p, (0.7,0.7,0.7,1.0))
 
         rax = p_box_x + p_box_w + 4*scale
         ray = ry + rh - 18*scale
         ra  = [(rax+10*scale, ray), (rax, ray+6*scale), (rax, ray-6*scale)]
-        batch = batch_for_shader(shader,"TRIS",{"pos":ra})
-        shader.uniform_float("color",(0.4,0.4,0.4,1.0)); batch.draw(shader)
+        if not _pp_no_arrows:
+            batch = batch_for_shader(shader,"TRIS",{"pos":ra})
+            shader.uniform_float("color",(0.4,0.4,0.4,1.0)); batch.draw(shader)
 
     # PackAPunch racks with buttons baked into the art (see PACKAPUNCH_BAKED_BTNS).
     _baked_btns = False

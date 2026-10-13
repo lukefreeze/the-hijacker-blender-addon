@@ -50,6 +50,71 @@ except ImportError:
 RACK_RAIL_H = 32
 
 # =============================================================================
+# PACKAPUNCH SKIN — relit knob sprites (12 frames, pointer angle measured per frame)
+# Art coordinates are in rack_booster_bg.png space (1988 x 528).
+# =============================================================================
+BST_PP_SKIN       = "packapunch"
+BST_PP_ART_W      = 1988.0
+BST_PP_ART_H      = 528.0
+BST_PP_KNOB_POS   = (319.5, 288.5)   # centre of the baked knob disc
+BST_PP_KNOB_SIZE  = (281.0, 285.0)   # sprite draw size (art px); disc edge lands at r≈140, just inside the gold teeth
+BST_PP_HIT_R      = 140.0            # hit radius (art px)
+BST_PP_SWEEP      = 270.0            # degrees of travel, min = lower-left (-135), max = lower-right (+135)
+BST_PP_KNOB_KEY   = "rack_booster_knob"
+BST_PP_KNOB_LINE  = 36.0             # angle of the red line in the sprite, degrees clockwise from up
+BST_PP_VALUE_POS  = (314.0, 504.5)   # centre of the "+6.0 dB" readout (art px)
+BST_PP_VALUE_PX   = 21.0             # readout font size (art px)
+BST_PP_VALUE_COL  = (0.80, 0.79, 0.76, 0.95)
+
+
+def _bst_pp_active():
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_bs
+        return _gas_bs() == BST_PP_SKIN
+    except Exception:
+        return False
+
+
+def booster_pp_knob_geom(rack_x, rack_y, rw, rh):
+    """(cx, cy, radius, hit_radius) of the packApunch booster knob in screen space, or None
+    when the packApunch skin is not active."""
+    if not _bst_pp_active():
+        return None
+    sx, sy = rw / BST_PP_ART_W, rh / BST_PP_ART_H
+    sr = min(sx, sy)
+    return (rack_x + BST_PP_KNOB_POS[0] * sx,
+            rack_y + (1.0 - BST_PP_KNOB_POS[1] / BST_PP_ART_H) * rh,
+            BST_PP_KNOB_SIZE[0] * 0.5 * sr, BST_PP_HIT_R * sr)
+
+
+def _bst_pp_draw_knob(rx, ry, rw, rh, boost_norm, boost_str):
+    """packApunch knob: lit sprite turned to the value, plus the live readout. Returns True if drawn."""
+    try:
+        from ui.mixer.texture_cache import get_texture as _gtc_k, blit_texture_rotated as _blt_rot
+        g = booster_pp_knob_geom(rx, ry, rw, rh)
+        if not g:
+            return False
+        key = BST_PP_KNOB_KEY
+        tex = _gtc_k(key)
+        if not tex:
+            return False
+        sx, sy = rw / BST_PP_ART_W, rh / BST_PP_ART_H
+        v = max(0.0, min(1.0, boost_norm))
+        ang = math.radians((0.5 - v) * BST_PP_SWEEP + BST_PP_KNOB_LINE)
+        _blt_rot(tex, g[0], g[1], BST_PP_KNOB_SIZE[0] * sx, BST_PP_KNOB_SIZE[1] * sy,
+                 ang, blend="ALPHA_PREMULT", key=key)
+        fs = max(1, int(BST_PP_VALUE_PX * rh / BST_PP_ART_H))
+        vx = rx + BST_PP_VALUE_POS[0] * sx
+        vy = ry + (1.0 - BST_PP_VALUE_POS[1] / BST_PP_ART_H) * rh
+        tw = _text_width(boost_str, fs)
+        _draw_text(boost_str, vx - tw / 2, vy - fs / 2, fs, BST_PP_VALUE_COL)
+        return True
+    except Exception as _e_bk:
+        print(f"[BOOSTER] knob draw error: {_e_bk}")
+        return False
+
+
+# =============================================================================
 # BOOSTER LAYOUT TUNING — all values unscaled px, multiplied by scale at draw time.
 # Every section has fully INDEPENDENT position + size constants.
 # Nothing derives from another section — change one without affecting others.
@@ -290,13 +355,14 @@ def _draw_booster_body(rx, ry, rw, rh, rack, rack_idx, scale):
     knob_r  = min(left_w * 0.30, body_h * 0.35) * BST_KNOB_SCALE
     # "BOOST" label suppressed — baked into background PNG
     # Draw knob with empty label; value text drawn manually below for X control
-    _draw_knob(knob_cx, knob_cy, knob_r,
+    if not (_bst_pp_active() and _bst_pp_draw_knob(rx, ry, rw, rh, boost_norm, boost_str)):
+      _draw_knob(knob_cx, knob_cy, knob_r,
                boost_norm, (_AMBER[0], _AMBER[1], _AMBER[2]),
                "", "", scale)
-    # +6.0 dB value text — position and size controlled by BST_KNOB_VAL_* constants
-    _fs_val = max(1, int((BST_KNOB_FS if BST_KNOB_FS > 0 else 8) * scale))
-    _tw_val = _text_width(boost_str, _fs_val)
-    _draw_text(boost_str,
+      # +6.0 dB value text — position and size controlled by BST_KNOB_VAL_* constants
+      _fs_val = max(1, int((BST_KNOB_FS if BST_KNOB_FS > 0 else 8) * scale))
+      _tw_val = _text_width(boost_str, _fs_val)
+      _draw_text(boost_str,
                knob_cx - _tw_val/2 + BST_KNOB_VAL_X * scale,
                knob_cy - knob_r - _fs_val * 2 - 4*scale + BST_KNOB_VAL_Y * scale,
                _fs_val, (0.8, 0.8, 0.8, 1.0))

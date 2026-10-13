@@ -345,6 +345,361 @@ def _rv_clip_uv(pts, cut):
     return out if len(out) >= 2 else []
 
 
+# ── packApunch: ambient motion-tracker display in the corner of the screen (decorative, ignores the audio) ──
+# Drawn after the film-style tracker: a half-disc of rings and spokes, a slow scan arm, a soft "ping" dome that
+# swells out of the centre about once a second, and a red range counter in a notch in the bottom band.
+RV_PP_TRK_ON      = True
+RV_PP_TRK_RIGHT   = 0.984             # right edge of the panel on the glass (0..1 across the screen)
+RV_PP_TRK_V       = (0.15, 0.975)     # bottom / top of the panel (0..1 up the screen); the width follows from the aspect
+RV_PP_TRK_SCW, RV_PP_TRK_SCH = 1211.0, 200.0   # screen size in art px (to size the panel's contents)
+RV_PP_TRK_THEME   = "film"            # "film" = blue with red digits (like the film), "amber" = the screen's own colour
+RV_PP_TRK_PING_S  = 1.05              # seconds between pings
+RV_PP_TRK_PING_D  = 0.42              # seconds a ping takes to swell and fade
+RV_PP_TRK_ARM_DPS = 9.0               # degrees per second the scan arm turns (clockwise)
+RV_PP_TRK_TEXT_L  = "TRK 5.547.6"  # small text on the left of the bottom band
+RV_PP_TRK_TEXT_R  = "CX 54/38.04"   # ... and on the right
+RV_PP_TRK_BAND_A  = 0.92              # how solid the bottom band is (lower it if the blue is too bright)
+
+_RV_TRK_COLS = {
+    "film":  {"core": (0.30, 0.60, 1.00), "glow": (0.10, 0.38, 1.00), "arm": (0.55, 0.88, 1.00),
+              "band": (0.12, 0.55, 1.00), "notch": (0.020, 0.095, 0.185), "back": (0.0, 0.012, 0.035),
+              "haze": (0.04, 0.17, 0.34), "text": (0.86, 0.94, 1.00), "digit": (1.00, 0.13, 0.12)},
+    "amber": {"core": (1.00, 0.76, 0.22), "glow": (1.00, 0.52, 0.06), "arm": (1.00, 0.92, 0.60),
+              "band": (0.80, 0.46, 0.06), "notch": (0.10, 0.055, 0.01), "back": (0.02, 0.012, 0.004),
+              "haze": (0.30, 0.17, 0.03), "text": (1.00, 0.90, 0.60), "digit": (1.00, 0.20, 0.10)},
+}
+
+# geometry, in pixels of the reference picture the display was modelled on (origin top-left)
+_G_X0, _G_X1, _G_Y0, _G_Y1 = 14.0, 306.0, 20.0, 200.0     # the part of that picture that is used
+_G_OX, _G_OY = 160.0, 167.0                                 # centre of the rings
+_G_BAND_TOP = 165.0
+
+
+def _rv_trk_hash(n, k=0):
+    v = math.sin(n * 12.9898 + k * 78.233) * 43758.5453
+    return v - math.floor(v)
+
+
+def _rv_trk_smooth(x):
+    x = max(0.0, min(1.0, x))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _rv_trk_disc(cx, cy, r, color, additive, seg=14):
+    shader = _get_shader()
+    verts = []
+    for i in range(seg):
+        a0 = 2 * math.pi * i / seg
+        a1 = 2 * math.pi * (i + 1) / seg
+        verts += [(cx, cy), (cx + r * math.cos(a0), cy + r * math.sin(a0)),
+                  (cx + r * math.cos(a1), cy + r * math.sin(a1))]
+    gpu.state.blend_set("ADDITIVE" if additive else "ALPHA")
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch_for_shader(shader, "TRIS", {"pos": verts}).draw(shader)
+    gpu.state.blend_set("ALPHA")
+
+
+def _rv_draw_tracker_proc(P, scale, cut, now):
+    """Motion-tracker display drawn entirely in code (fallback when the tracker images are missing)."""
+    lvl = _rv_trk_smooth((cut - 0.72) / 0.26)          # the power-down wipe (right to left) reaches it first
+    if lvl <= 0.01:
+        return
+    C = _RV_TRK_COLS.get(RV_PP_TRK_THEME, _RV_TRK_COLS["film"])
+    core, glow = C["core"], C["glow"]
+    v0, v1 = RV_PP_TRK_V
+    Hp = (v1 - v0) * RV_PP_TRK_SCH                      # panel height, art px
+    gw, gh = _G_X1 - _G_X0, _G_Y1 - _G_Y0
+    k = Hp / gh                                         # art px per reference px
+    Wp = gw * k
+    u1 = RV_PP_TRK_RIGHT
+    u0 = u1 - Wp / RV_PP_TRK_SCW
+
+    def G(gx, gy):                                      # reference px -> screen
+        return P(u0 + (gx - _G_X0) * k / RV_PP_TRK_SCW, v0 + (_G_Y1 - gy) * k / RV_PP_TRK_SCH)
+
+    sp = math.hypot(G(100, 100)[0] - G(0, 100)[0], G(100, 100)[1] - G(0, 100)[1]) / 100.0   # screen px per ref px
+    lw = lambda w: max(1.5, w * sp * 1.35)
+
+    # ping timing
+    pt = now % RV_PP_TRK_PING_S
+    pn = int(now // RV_PP_TRK_PING_S)
+    pp = pt / RV_PP_TRK_PING_D                          # 0..1 while a ping is alive, >1 after
+    boost = math.exp(-pt / 0.22)                        # the lines flare as a ping starts
+
+    def arc(rx, ry, a0, a1, n=40):
+        return [G(_G_OX + rx * math.cos(math.radians(a0 + (a1 - a0) * i / n)),
+                  _G_OY - ry * math.sin(math.radians(a0 + (a1 - a0) * i / n))) for i in range(n + 1)]
+
+    def glow_line(pts, w, a=1.0, col=core, gl=glow, gain=1.0):
+        al = a * lvl
+        _rv_thick(pts, lw(w) * 5.0, (*gl, 0.075 * gain * al), additive=True)
+        _rv_thick(pts, lw(w) * 2.5, (*gl, 0.20 * gain * al), additive=True)
+        _rv_thick(pts, lw(w), (*col, min(1.0, 0.92 * al)))
+
+    # dark glass behind the whole thing, and a faint blue haze inside the dial
+    edge = lambda a, b: [(a[0] + (b[0] - a[0]) * i / 6.0, a[1] + (b[1] - a[1]) * i / 6.0) for i in range(7)]
+    top = [G(*q) for q in edge((_G_X0, _G_Y0), (_G_X1, _G_Y0))]
+    bot = [G(*q) for q in edge((_G_X0, _G_Y1), (_G_X1, _G_Y1))]
+    _rv_fill(top, bot, (*C["back"], 0.94 * lvl))
+    for rr, a in ((128.0, 0.30), (56.0, 0.42)):
+        rim = arc(rr, rr * 1.04, 0.0, 180.0, 36)
+        _rv_fill(rim, [G(_G_OX, _G_OY)] * len(rim), (*C["haze"], a * lvl))
+
+    boostk = 1.0 + 0.9 * boost
+    # outer ring and the partial arcs just inside it
+    glow_line(arc(123.0, 130.0, 0.0, 180.0, 60), 2.3, 1.0, gain=boostk)
+    glow_line(arc(106.0, 112.0, 62.0, 118.0, 20), 1.6, 0.95, gain=boostk)
+    glow_line(arc(104.0, 110.0, 155.0, 180.0, 10), 1.6, 0.95, gain=boostk)
+    glow_line(arc(104.0, 110.0, 0.0, 25.0, 10), 1.6, 0.95, gain=boostk)
+    # inner ring + the stepped arcs just outside it
+    glow_line(arc(55.0, 56.0, 0.0, 180.0, 40), 1.9, 1.0, gain=boostk)
+    for a0, a1 in ((112.0, 159.0), (21.0, 68.0)):
+        glow_line(arc(63.0, 64.0, a0, a1, 16), 1.8, 0.95, gain=boostk)
+        for aa in (a0, a1):                              # little end ticks back to the inner ring
+            glow_line([G(_G_OX + 63.0 * math.cos(math.radians(aa)), _G_OY - 64.0 * math.sin(math.radians(aa))),
+                       G(_G_OX + 56.0 * math.cos(math.radians(aa)), _G_OY - 57.0 * math.sin(math.radians(aa)))],
+                      1.5, 0.9, gain=boostk)
+    # spokes: straight up, and 45 degrees either side
+    for deg, r0, r1 in ((90.0, 40.0, 126.0), (135.0, 64.0, 121.0), (45.0, 64.0, 121.0)):
+        ca, sa = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+        sp_pts = [G(_G_OX + r0 * ca, _G_OY - r0 * sa), G(_G_OX + r1 * ca, _G_OY - r1 * sa)]
+        _rv_thick(sp_pts, lw(7.0), (*glow, 0.10 * lvl * boostk), additive=True)      # wide soft body
+        _rv_thick(sp_pts, lw(2.2), (*core, min(1.0, 0.55 * lvl * boostk)))
+    # marker dot on the vertical spoke, and the two dots either side of the counter
+    mx, my = G(_G_OX, 127.5)
+    _rv_trk_disc(mx, my, lw(7.5), (*glow, 0.20 * lvl), True)
+    _rv_trk_disc(mx, my, lw(3.4), (*C["arm"], 0.95 * lvl), False)
+    for dx in (-40.0, 41.0):
+        ex, ey = G(_G_OX + dx, 165.5)
+        _rv_trk_disc(ex, ey, lw(2.6), (*C["arm"], 0.9 * lvl), False)
+
+    # slow scan arm (turns clockwise; hidden while it is below the band)
+    ang = (4.6 - RV_PP_TRK_ARM_DPS * now) % 360.0
+    if 0.5 < ang < 179.5:
+        ca, sa = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+        pts = [G(_G_OX + 40.0 * ca, _G_OY - 40.0 * sa), G(_G_OX + 124.0 * ca, _G_OY - 130.0 * sa)]
+        glow_line(pts, 1.8, 0.95, col=C["arm"], gain=1.0 + 0.8 * boost)
+
+    # ping: a soft dome swelling out of the centre
+    if pp < 1.0:
+        r = 28.0 + 128.0 * pp ** 0.85
+        a = 0.30 * min(1.0, pp / 0.12) * (1.0 - pp) ** 0.7
+        rim = arc(r, r * 1.04, 0.0, 180.0, 44)
+        _rv_fill(rim, [G(_G_OX, _G_OY)] * len(rim), (*C["arm"], a * 0.55 * lvl))
+        _rv_thick(rim, lw(3.0), (*C["arm"], min(1.0, a * 1.6 * lvl)), additive=True)
+
+    # bottom band, with a notch for the counter
+    bx0, bx1, by0, by1 = 18.0, 302.0, _G_BAND_TOP, 200.0
+    btop = [G(bx0 + (bx1 - bx0) * i / 12.0, by0) for i in range(13)]
+    bbot = [G(bx0 + (bx1 - bx0) * i / 12.0, by1) for i in range(13)]
+    _rv_fill(btop, bbot, (*C["band"], RV_PP_TRK_BAND_A * lvl))
+    nt = [G(100.0, by0), G(220.0, by0)]
+    nb = [G(121.0, 198.0), G(199.0, 198.0)]
+    _rv_fill(nt, nb, (*C["notch"], 0.97 * lvl))
+    edge_pts = [G(100.0, by0), G(121.0, 198.0), G(199.0, 198.0), G(220.0, by0)]
+    _rv_thick(edge_pts, lw(1.2), (*core, 0.55 * lvl))
+
+    # text: side labels and the red counter
+    fs_small = max(6, int(8.5 * sp))
+    tx, ty = G(24.0, 186.0)
+    _draw_text(RV_PP_TRK_TEXT_L, tx, ty, fs_small, (*C["text"], 0.95 * lvl))
+    tw_r = _text_width(RV_PP_TRK_TEXT_R, fs_small)
+    tx, ty = G(297.0, 186.0)
+    _draw_text(RV_PP_TRK_TEXT_R, tx - tw_r, ty, fs_small, (*C["text"], 0.95 * lvl))
+    # counter: mostly 00.00, with now and then a reading
+    cyc = now / 6.3
+    cn = int(cyc)
+    blink = (cyc - cn) < 0.085
+    left = f"{int(_rv_trk_hash(cn, 9) * 29) + 1:02d}" if blink else "00"
+    right = "01" if (pn % 4 == 1 and pt < 0.16) else "00"
+    dc = (*C["digit"], 0.95 * lvl)
+    lx, ly = G(127.0, 195.0)
+    _draw_text(left, lx, ly, max(7, int(24.0 * sp)), dc)
+    dx_, dy_ = G(158.0, 193.0)
+    _draw_text("..", dx_, dy_, max(6, int(10.0 * sp)), (*C["digit"], 0.7 * lvl))
+    rx_, ry_ = G(166.0, 190.0)
+    _draw_text(right, rx_, ry_, max(6, int(15.0 * sp)), dc)
+    mx_, my_ = G(186.0, 196.0)
+    _draw_text("m", mx_, my_, max(5, int(7.5 * sp)), (*C["digit"], 0.8 * lvl))
+
+
+# ── motion tracker built from your own layers: rotating ring + matte + band, with a pulse and a fading blob ──
+RV_PP_TRK_FRAME      = (320.0, 240.0)       # size of the animation frame the layers were built in
+RV_PP_TRK_RING_AT    = (160.0, 167.0)       # where the ring's centre sits in that frame
+RV_PP_TRK_RING_SIZE  = (328.0, 325.0)       # ring image size
+RV_PP_TRK_RING_CTR   = (164.0, 162.5)       # ring image: the point the rings are centred on
+RV_PP_TRK_EXT        = (17.0, 302.0)        # the part of the frame the art really covers, left..right (frame px): sets the size on the glass
+RV_PP_TRK_FRAME_V    = (0.04, 0.96)         # bottom / top of that part on the glass (0..1 up the screen)
+RV_PP_TRK_RIGHT_U    = 0.992                # where the band's outer edge sits across the screen (0..1; 1 = the right edge of the glass)
+RV_PP_TRK_EDGE_Y     = 233.0                # the frame row that is the band's outer edge (its lowest point)
+RV_PP_TRK_CUT_Y      = 228.0                # nothing is drawn below this row of the frame (the band's lowest edge is ~226 at its corners)
+RV_PP_TRK_SPIN       = ((34.0, 40.0, 0.0), (6.0, 9.0, 1.1))   # ring rotation = sum of slow swings: (degrees, seconds per swing, phase)
+RV_PP_TRK_PULSE_S    = 3.4                  # seconds between pulses
+RV_PP_TRK_PULSE_D    = 1.0                  # seconds a pulse takes to swell out and fade
+RV_PP_TRK_PULSE_R    = (22.0, 152.0)        # pulse radius at the start / end (frame px)
+RV_PP_TRK_RING_TINT  = (1.00, 0.86, 1.00)   # multiplies the ring image: pulls its olive-yellow towards the curve's orange-yellow
+RV_PP_TRK_BAND_TINT  = (1.16, 0.86, 1.60)   # multiplies the band image the same way
+RV_PP_TRK_PULSE_COL  = (1.00, 0.62, 0.12)   # pulse colour (the curve's glow)
+RV_PP_TRK_FLARE      = 0.55                 # how much the ring brightens as a pulse leaves the centre (0 = no flare)
+RV_PP_TRK_BLOB_COL   = (1.00, 0.80, 0.34)   # the blob the pulse reveals
+RV_PP_TRK_BLOB_R     = 6.0                  # blob radius (frame px)
+RV_PP_TRK_BLOB_FADE  = 0.95                 # seconds the blob takes to fade out
+RV_PP_TRK_BACK_COL   = (0.030, 0.020, 0.004)  # what the matte is drawn in (the dark glass behind the band)
+RV_PP_TRK_TXT_BAND   = (0.17, 0.11, 0.00)   # side text colour on the band
+RV_PP_TRK_TXT_DIGIT  = (1.00, 0.22, 0.10)   # red counter
+
+
+def _rv_trk_spin_deg(t):
+    return sum(a * math.sin(2.0 * math.pi * t / T + ph) for a, T, ph in RV_PP_TRK_SPIN)
+
+
+def _rv_text_rot(text, x, y, size, color):
+    """Text turned a quarter turn counter-clockwise (reads bottom to top), left end of the baseline at (x, y)."""
+    try:
+        import blf
+        blf.size(0, max(1, int(size)))
+        blf.color(0, *color)
+        blf.enable(0, blf.ROTATION)
+        blf.rotation(0, math.pi * 0.5)
+        blf.position(0, x, y, 0)
+        blf.draw(0, text)
+        blf.rotation(0, 0.0)
+        blf.disable(0, blf.ROTATION)
+    except Exception:
+        pass
+
+
+def _rv_draw_tracker(P, scale, cut, now):
+    """Animated motion tracker from the three layer images, turned a quarter turn so its dome points left (at the start of
+    the curve) with the band against the right edge of the glass. Own clock, ignores the audio."""
+    lvl = _rv_trk_smooth((cut - 0.72) / 0.26)          # the power-down wipe (right to left) reaches it first
+    if lvl <= 0.01:
+        return
+    try:
+        from ui.mixer.texture_cache import get_texture as _gt, blit_texture_tinted as _bt, blit_texture_rotated as _br
+        t_ring = _gt("rack_reverb_trk_ring")
+        t_mask = _gt("rack_reverb_trk_mask")
+        t_band = _gt("rack_reverb_trk_motion")
+    except Exception:
+        t_ring = t_mask = t_band = None
+    if not (t_ring and t_mask and t_band):
+        return
+
+    fw, fh = RV_PP_TRK_FRAME
+    e0, e1 = RV_PP_TRK_EXT
+    gxc, gyc = (e0 + e1) * 0.5, fh * 0.5                # the point of the frame that is placed at the middle of the panel's height
+    v0, v1 = RV_PP_TRK_FRAME_V
+    ru = RV_PP_TRK_RIGHT_U
+    yb, yt = P(ru, v0)[1], P(ru, v1)[1]
+    F = abs(yt - yb) / (e1 - e0)                        # screen px per frame px
+    Cy = (yb + yt) * 0.5
+    Cx = P(ru, 0.5)[0] - F * (RV_PP_TRK_EDGE_Y - gyc)
+    # frame (gx right, gy down)  ->  screen: a quarter turn counter-clockwise (the frame's top ends up on the left)
+    T = lambda gx, gy: (Cx + F * (gy - gyc), Cy + F * (gx - gxc))
+    R = lambda dx, dy: (-dy, dx)                        # the same turn for an offset (y up)
+    QT = math.pi * 0.5
+    ox, oy = T(*RV_PP_TRK_RING_AT)
+    cut_x = T(0.0, RV_PP_TRK_CUT_Y)[0]
+    lvls = (lvl, lvl, lvl, lvl)
+
+    # --- pulse timing (every RV_PP_TRK_PULSE_S seconds)
+    pt = now % RV_PP_TRK_PULSE_S
+    pn = int(now // RV_PP_TRK_PULSE_S)
+    pp = pt / RV_PP_TRK_PULSE_D
+    boost = math.exp(-pt / 0.28)
+
+    # --- the ring, turning slowly and reversing now and then
+    ang = math.radians(_rv_trk_spin_deg(now))
+    A = ang + QT
+    rw_, rh_ = RV_PP_TRK_RING_SIZE[0] * F, RV_PP_TRK_RING_SIZE[1] * F
+    cdx = (RV_PP_TRK_RING_SIZE[0] * 0.5 - RV_PP_TRK_RING_CTR[0]) * F      # image centre vs. the point the rings are centred on
+    cdy = (RV_PP_TRK_RING_CTR[1] - RV_PP_TRK_RING_SIZE[1] * 0.5) * F
+    ca, sa = math.cos(A), math.sin(A)
+    icx, icy = ox + cdx * ca - cdy * sa, oy + cdx * sa + cdy * ca         # keep the rings' centre fixed while the image turns
+    rt = RV_PP_TRK_RING_TINT
+    _br(t_ring, icx, icy, rw_, rh_, A, blend="ALPHA_PREMULT", key="rack_reverb_trk_ring",
+        color=(lvl * rt[0], lvl * rt[1], lvl * rt[2], lvl), clip_xmax=cut_x)
+    if RV_PP_TRK_FLARE > 0 and boost > 0.02:                                # the rings flare as a pulse leaves the centre
+        fl = RV_PP_TRK_FLARE * boost * lvl
+        _br(t_ring, icx, icy, rw_, rh_, A, blend="ADDITIVE_PREMULT",
+            color=(fl * rt[0], fl * rt[1], fl * rt[2], fl), clip_xmax=cut_x)
+
+    # --- pulse: a soft half-disc swelling out of the centre towards the left, bright at its rim
+    pr0, pr1 = RV_PP_TRK_PULSE_R
+    if pp < 1.0:
+        r = (pr0 + (pr1 - pr0) * pp ** 0.85) * F
+        a = 0.34 * min(1.0, pp / 0.10) * (1.0 - pp) ** 0.7
+        col = RV_PP_TRK_PULSE_COL
+        arc = []
+        for i in range(65):
+            th = math.pi * i / 64
+            rx_, ry_ = R(r * math.cos(th), r * math.sin(th))
+            arc.append((ox + rx_, oy + ry_))
+        _rv_fill(arc, [(ox, oy)] * len(arc), (*col, a * 0.50 * lvl))
+        _rv_thick(arc, max(1.5, 3.2 * F), (*RV_PP_CORE, min(1.0, a * 2.2) * lvl), additive=True)
+
+    # --- blob: a contact the pulse lights up as its rim passes; it fades; a new place every pulse
+    def blob(n, age_now):
+        h1, h2 = _rv_trk_hash(n, 11), _rv_trk_hash(n, 12)
+        bearing = math.radians(18.0 + 144.0 * h1)                       # the dome side only (the other half is behind the band)
+        rng = 38.0 + 86.0 * h2                                          # frame px from the ring centre
+        hit_pp = ((rng - pr0) / (pr1 - pr0)) ** (1.0 / 0.85)
+        age = age_now - hit_pp * RV_PP_TRK_PULSE_D                      # seconds since the rim passed it
+        if age < 0.0:
+            return
+        a = math.exp(-age / RV_PP_TRK_BLOB_FADE)                        # full at once, then fades
+        a *= 1.0 + 0.5 * math.exp(-age / 0.10)                          # a brief flash as it is hit
+        if a < 0.02:
+            return
+        vx, vy = R(rng * F * math.cos(bearing), rng * F * math.sin(bearing))
+        bx, by = ox + vx, oy + vy
+        r = RV_PP_TRK_BLOB_R * F
+        c = RV_PP_TRK_BLOB_COL
+        al = min(1.0, a) * lvl
+        _rv_trk_disc(bx, by, r * 3.4, (*c, 0.10 * al), True)
+        _rv_trk_disc(bx, by, r * 1.9, (*c, 0.28 * al), True)
+        _rv_trk_disc(bx, by, r, (*c, min(1.0, 0.95 * al)), False)
+        _rv_trk_disc(bx, by, r * 0.45, (1.0, 0.97, 0.78, min(1.0, al)), False)
+    blob(pn, pt)
+    blob(pn - 1, pt + RV_PP_TRK_PULSE_S)                                # last pulse's blob, still fading out
+
+    # --- matte: hides whatever sticks out behind the band (drawn in the dark glass colour)
+    bc = RV_PP_TRK_BACK_COL
+    cy_ = RV_PP_TRK_CUT_Y
+    mx0, my0 = T(fw * 0.5, cy_ * 0.5)
+    _br(t_mask, mx0, my0, fw * F, cy_ * F, QT, blend="ALPHA_PREMULT", key="rack_reverb_trk_mask",
+        uv=(0.0, 1.0 - cy_ / fh, 1.0, 1.0), color=(bc[0] * lvl, bc[1] * lvl, bc[2] * lvl, lvl))
+    # --- band on top
+    bt = RV_PP_TRK_BAND_TINT
+    bx0, by0 = T(fw * 0.5, fh * 0.5)
+    _br(t_band, bx0, by0, fw * F, fh * F, QT, blend="ALPHA_PREMULT", key="rack_reverb_trk_motion",
+        color=(lvl * bt[0], lvl * bt[1], lvl * bt[2], lvl))
+
+    # --- text on the band (turned with it): side labels (dark on the yellow) and the red counter in the notch
+    fs_small = max(6, int(9.0 * F))
+    tc = RV_PP_TRK_TXT_BAND
+    tx, ty = T(26.0, 188.0)
+    _rv_text_rot(RV_PP_TRK_TEXT_L, tx, ty, fs_small, (*tc, 0.95 * lvl))
+    tw_r = _text_width(RV_PP_TRK_TEXT_R, fs_small)
+    tx, ty = T(296.0, 188.0)
+    _rv_text_rot(RV_PP_TRK_TEXT_R, tx, ty - tw_r, fs_small, (*tc, 0.95 * lvl))
+    cyc = now / 6.3
+    cn = int(cyc)
+    blink = (cyc - cn) < 0.085
+    left = f"{int(_rv_trk_hash(cn, 9) * 29) + 1:02d}" if blink else "00"
+    right = "01" if (pn % 4 == 1 and pt < 0.16) else "00"
+    dc = (*RV_PP_TRK_TXT_DIGIT, 0.95 * lvl)
+    lx, ly = T(124.0, 194.0)
+    _rv_text_rot(left, lx, ly, max(7, int(24.0 * F)), dc)
+    dx_, dy_ = T(156.0, 192.0)
+    _rv_text_rot("..", dx_, dy_, max(6, int(10.0 * F)), (*RV_PP_TRK_TXT_DIGIT, 0.7 * lvl))
+    rx_, ry_ = T(164.0, 189.0)
+    _rv_text_rot(right, rx_, ry_, max(6, int(15.0 * F)), dc)
+    mx_, my_ = T(184.0, 195.0)
+    _rv_text_rot("m", mx_, my_, max(5, int(7.5 * F)), (*RV_PP_TRK_TXT_DIGIT, 0.8 * lvl))
+
+
 def _draw_reverb_screen_pp(rx, ry, rw, rh, rack, rack_idx, scale, get_rack_channels,
                            room_sz, damping, wet, pre_d):
     """PackAPunch reverb screen: dry waveform + reverb tail, bent onto the CRT glass."""
@@ -356,6 +711,14 @@ def _draw_reverb_screen_pp(rx, ry, rw, rh, rack, rack_idx, scale, get_rack_chann
     pre_frac = pre_d * 0.20
     cut = _rv_power_cut(rack_idx, rack.enabled, _time.monotonic())
     animating = 0.002 < cut < 0.998
+
+    # Ambient motion tracker at the right of the glass, BEHIND the grid and the curve (decoration only; own clock, fades
+    # with the power-down wipe)
+    if RV_PP_TRK_ON and cut > 0.002:
+        try:
+            _rv_draw_tracker(P, scale, cut, _time.monotonic())
+        except Exception:
+            pass
 
     # Faint grid (the screen's own art stays visible - no background is drawn)
     for v in (0.25, 0.5, 0.75):
@@ -423,7 +786,7 @@ def _draw_reverb_screen_pp(rx, ry, rw, rh, rack, rack_idx, scale, get_rack_chann
     if rt60_frac > 0 and cut > 0.93:
         rt60_ms = rt60_frac * 1000
         rt60_str = f"{rt60_ms:.0f}ms" if rt60_ms < 1000 else f"{rt60_ms / 1000:.1f}s"
-        lx, ly = P(0.90, 0.07)
+        lx, ly = P(0.76 if RV_PP_TRK_ON else 0.90, 0.07)
         _draw_text(f"RT60 {rt60_str}", lx, ly, fs, (*RV_PP_CORE, 0.85))
     if cut > 0.05:
         lx, ly = P(0.012, 0.07)

@@ -1,5 +1,5 @@
 """
-Loader.py — slim orchestrator for the Pedalboard HUD addon.
+Loader.py — slim orchestrator for The Hijacker addon.
 
 Responsibilities:
   - sys.path bootstrap (adds blender_sync/ and subpackages)
@@ -9,7 +9,7 @@ Responsibilities:
 
 Everything else lives in:
   core/constants.py    — every layout number
-  core/engine.py       — .pyd import, pedalboard wheel install
+  core/engine.py       — native engine import (hijacker_native/)
   core/audio.py        — DSP, playback handlers, effect chain
   core/meters.py       — VU meter timer, envelope cache
   core/properties.py   — PB_TrackSettings, scene props
@@ -44,7 +44,7 @@ if _ADDON_DIR not in sys.path:
 # ---------------------------------------------------------------------------
 # Core imports
 # ---------------------------------------------------------------------------
-from core.engine import get_engine, reset_engine, PEDALBOARD_AVAILABLE, HIJACKER_AVAILABLE
+from core.engine import get_engine, reset_engine, HIJACKER_AVAILABLE
 from core.properties import register_properties, unregister_properties
 import core.perf_monitor as _perf_mod
 import core.packapunch as _pap_mod
@@ -207,7 +207,7 @@ class VSE_OT_RefreshPBTracks(bpy.types.Operator):
 # ---------------------------------------------------------------------------
 # Panel
 # ---------------------------------------------------------------------------
-class VSE_PT_Pedalboard_Panel(bpy.types.Panel):
+class VSE_PT_Hijacker_Panel(bpy.types.Panel):
     bl_label       = "The Hijacker"
     bl_space_type  = "SEQUENCE_EDITOR"
     bl_region_type = "UI"
@@ -300,7 +300,7 @@ classes = (
     VSE_OT_TogglePBGui,
     VSE_OT_RefreshPBTracks,
     VSE_OT_PB_Interaction,
-    VSE_PT_Pedalboard_Panel,
+    VSE_PT_Hijacker_Panel,
 )
 
 _handle = None

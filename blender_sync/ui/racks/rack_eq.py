@@ -62,6 +62,50 @@ EQ_KNOB_SCALE    = 0.7
 EQ_KNOB_X_OFFSET = 0.0
 
 # =============================================================================
+# PACKAPUNCH KNOBS
+# The knobs are baked into rack_eq_bg.png; on that skin the live knobs are the exported knob-face images
+# (rack_eq_knob_*.png) drawn at the exact spot of the baked ones and turned to show the value. Positions are the
+# centres of the faces in the art (art px, y down), measured by matching each exported image against the background.
+# =============================================================================
+EQ_ART_W, EQ_ART_H = 1488.0, 719.0
+EQ_PP_KNOB_SWEEP   = 270.0     # degrees of turn from minimum to maximum
+EQ_PP_KNOB_OFFSET  = 0.0       # extra turn in degrees (+ = anticlockwise)
+EQ_PP_HIT_GAIN     = 30.0      # click radius of the big (gain) knobs, art px
+EQ_PP_HIT_SMALL    = 21.0      # click radius of the small (freq / Q) knobs, art px
+# parameter index -> (texture key, centre x, centre y, image width, image height)  (art px)
+EQ_PP_KNOBS = {
+    0:  ("rack_eq_knob_g0",  145.0, 514.0, 50, 48),   1:  ("rack_eq_knob_g1",  332.0, 514.0, 50, 48),
+    2:  ("rack_eq_knob_g2",  515.0, 514.0, 50, 48),   3:  ("rack_eq_knob_g3",  700.0, 516.0, 50, 48),
+    4:  ("rack_eq_knob_g4",  884.0, 514.0, 50, 48),   5:  ("rack_eq_knob_g5", 1070.0, 515.0, 50, 48),
+    6:  ("rack_eq_knob_g6", 1255.0, 515.0, 50, 48),
+    7:  ("rack_eq_knob_f0",  146.0, 594.5, 32, 31),   8:  ("rack_eq_knob_f1",  332.0, 594.5, 32, 31),
+    9:  ("rack_eq_knob_f2",  515.0, 594.5, 32, 31),   10: ("rack_eq_knob_f3",  700.0, 593.5, 32, 31),
+    11: ("rack_eq_knob_f4",  884.0, 595.5, 32, 31),   12: ("rack_eq_knob_f5", 1070.0, 595.5, 32, 31),
+    13: ("rack_eq_knob_f6", 1255.0, 595.5, 32, 31),
+    15: ("rack_eq_knob_q1",  332.0, 671.5, 32, 31),   16: ("rack_eq_knob_q2",  516.0, 672.5, 32, 31),
+    17: ("rack_eq_knob_q3",  700.0, 670.5, 32, 31),   18: ("rack_eq_knob_q4",  885.0, 672.5, 32, 31),
+    19: ("rack_eq_knob_q5", 1070.0, 671.5, 32, 31),
+}
+
+
+def eq_pp_knob_geom(rack_x, rack_y, rw, rh):
+    """Screen-space layout of the packApunch EQ knobs: {param_index: (cx, cy, w, h, hit_radius, texture_key)},
+    or None when the packApunch skin is not active. (The shelves have no Q knob: params 14 and 20 are absent.)"""
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_eqk
+        if _gas_eqk() != EQ_SCREEN_SEQ_SKIN:
+            return None
+    except Exception:
+        return None
+    sx, sy = rw / EQ_ART_W, rh / EQ_ART_H
+    sr = min(sx, sy)
+    out = {}
+    for pi, (key, ax, ay, aw, ah) in EQ_PP_KNOBS.items():
+        hit = EQ_PP_HIT_GAIN if pi < 7 else EQ_PP_HIT_SMALL
+        out[pi] = (rack_x + ax * sx, rack_y + (1.0 - ay / EQ_ART_H) * rh, aw * sx, ah * sy, hit * sr, key)
+    return out
+
+# =============================================================================
 # PACKAPUNCH SCREEN SEQUENCE
 # Animated vortex background drawn behind the frequency display, only while
 # the "packapunch" skin is active (default skin is untouched — see the
@@ -718,6 +762,9 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
 
     fs_lbl = max(1, int(11 * scale))
 
+    _pp_kg = eq_pp_knob_geom(rx, ry, rw, rh) if _is_packapunch else None
+    _pp_ktex_cache = {}
+
     for bi in range(N_BANDS):
         gdb_b, fhz_b, q_b, gn_b, fn_b, qn_b = band_params[bi]
         bname_b, bcol_b, bftype_b = EQ7_BANDS[bi][0], EQ7_BANDS[bi][1], EQ7_BANDS[bi][2]
@@ -731,6 +778,26 @@ def _draw_eq_body(rx, ry, rw, rh, rack, rack_idx, scale):
                        col_cx - tw_l * 0.5 + EQ_LABEL_X[bi] * scale,
                        row_lbl - fs_lbl    + EQ_LABEL_Y[bi] * scale,
                        fs_lbl, (*bcol_b, 1.0))
+
+        if _pp_kg:
+            # packApunch: the knob-face images, turned to the value, sitting on the baked knobs
+            for _pi, _nv in ((bi, gn_b), (bi + 7, fn_b), (bi + 14, qn_b)):
+                _g = _pp_kg.get(_pi)
+                if not _g:
+                    continue
+                _tex = _pp_ktex_cache.get(_g[5])
+                if _tex is None:
+                    try:
+                        from ui.mixer.texture_cache import get_texture as _gtc_ek
+                        _tex = _gtc_ek(_g[5])
+                    except Exception:
+                        _tex = None
+                    _pp_ktex_cache[_g[5]] = _tex
+                _ang = math.radians((0.5 - max(0.0, min(1.0, _nv))) * EQ_PP_KNOB_SWEEP + EQ_PP_KNOB_OFFSET)
+                if _tex:
+                    from ui.mixer.texture_cache import blit_texture_rotated as _blt_rot_eq
+                    _blt_rot_eq(_tex, _g[0], _g[1], _g[2], _g[3], _ang, blend="ALPHA_PREMULT", key=_g[5])
+            continue                 # baked column dividers / labels / shelf plates: nothing else to draw
 
         # Gain knob
         gain_str = f"{gdb_b:+.1f}dB"

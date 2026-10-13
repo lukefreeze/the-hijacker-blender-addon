@@ -6,10 +6,11 @@
 #   - Reference voice cards have ▶ preview button each
 #   - Centre panel shows useful state info instead of empty waveform box
 #   - "ADD FROM TIMELINE" section with separate channel selector + name input
-#   - All audio preview via core.audio.play_oneshot (pedalboard engine device)
+#   - All audio preview via core.audio.play_oneshot (Hijacker engine device)
 # =============================================================================
 
 import os
+import math
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
@@ -910,3 +911,547 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
         }
         _draw_circle(sbar_x+sbar_w-9*scale, sbar_y+sbar_h/2,
                      3.5*scale, dot_cols.get(status,_AMBER))
+
+# =============================================================================
+# PACKAPUNCH SKIN  (rack_knnvc_bg.png, 1759 x 526 art px)
+# Everything below is laid out in ART pixels (top-left origin) and scaled to the
+# rack at draw time, so drawing and click zones always agree and a tweak here
+# moves both. Used only while the packApunch skin is active and PyTorch is found.
+# =============================================================================
+KN_PP_SKIN  = "packapunch"
+KN_ART_W    = 1759.0
+KN_ART_H    = 526.0
+
+# rects are (x0, y0, x1, y1) in art px
+KN_COLLAPSE   = (115.0, 15.5, 142.5, 45.0)       # the dark button with the red triangle
+KN_BADGE      = (151.0, 15.5, 179.0, 45.0)       # the lit red square (rack number)
+KN_ON         = (1568.0, 13.5, 1623.0, 43.0)     # green ON glass
+KN_CLOSE      = (1625.5, 13.5, 1653.0, 43.0)     # red power button (removes the rack)
+KN_OFF_PATCH  = (1563, 9, 1627, 53)              # dimmed ON glass image is laid here while the rack is off
+KN_TOPKEY_X0  = 868.0                            # channel keys above the screen
+KN_TOPKEY_PITCH = 27.75
+KN_TOPKEY_W   = 24.0
+KN_TOPKEY_Y   = (21.5, 48.5)
+KN_SOURCE     = (130.0, 71.0, 361.0, 90.5)       # SOURCE read-out bar
+KN_VOICE_X    = (127.0, 552.0)                   # reference-voice rows
+KN_VOICE_Y0   = 122.7
+KN_VOICE_PITCH = 49.4
+KN_VOICE_H    = 47.3
+KN_VOICE_ROWS = 4
+KN_VOICE_BTN_X = (516.0, 546.7)                  # the small preview buttons
+KN_VOICE_BTN_DY = (8.3, 39.0)                    # button top / bottom relative to its row top
+KN_ARROW_UP   = (512.0, 92.0, 532.0, 112.0)
+KN_ARROW_DN   = (532.0, 92.0, 552.0, 112.0)
+KN_SCREEN     = (574.0, 72.0, 1232.0, 257.0)     # the big black screen
+KN_GENERATE   = (571.0, 261.0, 949.0, 310.0)
+KN_PREVIEW    = (951.0, 262.0, 1182.0, 311.0)
+KN_OUT_DEC    = (616.0, 312.0, 644.0, 350.0)     # < > around the output-channel box
+KN_OUT_BOX    = (646.0, 313.0, 687.0, 348.0)
+KN_OUT_INC    = (690.0, 312.0, 716.0, 350.0)
+KN_SRCKEY_X0  = 156.5                            # SRC keys (add-from-timeline channel)
+KN_SRCKEY_PITCH = 24.5
+KN_SRCKEY_W   = 21.5
+KN_SRCKEY_Y   = (359.5, 382.5)
+KN_NAME       = (134.0, 387.7, 551.0, 405.0)     # name field
+KN_ADD        = (134.0, 410.7, 550.0, 441.7)     # ADD TO VOICES
+KN_KNOBS      = ((1373.0, 168.0), (1538.0, 165.0))   # TOPK, REF SECS centres
+KN_KNOB_HIT_R = 52.0
+KN_KNOB_PTR_LEN = 30.0                           # pointer length (art px)
+KN_KNOB_PTR_W   = 4.6                            # pointer width (art px)
+KN_KNOB_START_DEG = 225.0                        # pointer angle at minimum (lower left; turns clockwise)
+KN_KNOB_SWEEP     = 270.0
+KN_KNOB_VAL_Y     = 234.0                        # value read-out under each knob
+KN_STATUS     = (120.0, 478.0, 1640.0, 505.0)    # status bar
+
+# red glow travelling along the veins: pre-rendered additive loop (see KnnvcVeins_frames)
+try:
+    from core.constants import ASSETS_DIR as _KN_ASSETS_DIR
+except Exception:
+    _KN_ASSETS_DIR = ""
+KN_VEIN_DIR  = os.path.join(_KN_ASSETS_DIR, "packapunch", "KnnvcVeins_frames")
+KN_VEIN_FPS  = 20.0      # 48 frames = 2.4 s loop
+KN_VEIN_GAIN = 1.0       # brightness of the travelling light
+
+# text (art px sizes) and colours: glowing red
+KN_FS_BIG     = 20.0
+KN_FS_LABEL   = 17.0     # button labels / voice names
+KN_FS_MED     = 15.0
+KN_FS_SMALL   = 13.0
+KN_TEXT       = (1.00, 0.24, 0.17, 1.00)    # bright glowing red
+KN_TEXT_DIM   = (0.66, 0.14, 0.11, 0.92)    # unavailable / unselected
+KN_TEXT_HOT   = (1.00, 0.56, 0.48, 1.00)    # text on a lit key
+KN_TEXT_DARK  = (0.10, 0.00, 0.00, 0.95)    # on the lit red number plate
+KN_GLOW       = 0.95
+KN_GLOW_SCALE = 0.5      # overall text-glow strength multiplier
+KN_GLOW_COL   = (1.00, 0.10, 0.06)
+
+
+def _kn_pp_skin_on():
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_kn, get_texture as _gt_kn
+        return _gas_kn() == KN_PP_SKIN and _gt_kn("rack_knnvc_bg") is not None
+    except Exception:
+        return False
+
+
+def knnvc_pp_active():
+    """True when the packApunch kNN-VC layout is in use (skin loaded AND PyTorch found, since the skin
+    is withheld behind the setup warning until then)."""
+    return _kn_pp_skin_on() and _check_deps()
+
+
+class _KnGeom:
+    """Art px -> screen px for one rack."""
+    def __init__(self, rx, ry, rw, rh):
+        self.rx, self.ry, self.rw, self.rh = rx, ry, rw, rh
+        self.sx, self.sy = rw / KN_ART_W, rh / KN_ART_H
+        self.s = min(self.sx, self.sy)
+
+    def X(self, ax):
+        return self.rx + ax * self.sx
+
+    def Y(self, ay):
+        return self.ry + (1.0 - ay / KN_ART_H) * self.rh
+
+    def rect(self, r):
+        """(x0, y0, x1, y1) screen rect, y0 = bottom."""
+        return (self.X(r[0]), self.Y(r[3]), self.X(r[2]), self.Y(r[1]))
+
+    def top_key(self, i):
+        x0 = KN_TOPKEY_X0 + KN_TOPKEY_PITCH * i
+        return (x0, KN_TOPKEY_Y[0], x0 + KN_TOPKEY_W, KN_TOPKEY_Y[1])
+
+    def src_key(self, i):
+        x0 = KN_SRCKEY_X0 + KN_SRCKEY_PITCH * i
+        return (x0, KN_SRCKEY_Y[0], x0 + KN_SRCKEY_W, KN_SRCKEY_Y[1])
+
+    def voice_row(self, k):
+        y0 = KN_VOICE_Y0 + KN_VOICE_PITCH * k
+        return (KN_VOICE_X[0], y0, KN_VOICE_X[1], y0 + KN_VOICE_H)
+
+    def voice_btn(self, k):
+        y0 = KN_VOICE_Y0 + KN_VOICE_PITCH * k
+        return (KN_VOICE_BTN_X[0], y0 + KN_VOICE_BTN_DY[0], KN_VOICE_BTN_X[1], y0 + KN_VOICE_BTN_DY[1])
+
+
+def _kn_in(r, x, y):
+    return r[0] <= x <= r[2] and r[1] <= y <= r[3]
+
+
+def knnvc_pp_hit(mx, my, rack, ai_idx, rack_x, rack_y, rw, rh):
+    """Click zones for the packApunch layout. Returns a hit dict (same zones the old layout used),
+    or None. Only call while knnvc_pp_active()."""
+    g = _KnGeom(rack_x, rack_y, rw, rh)
+    R = g.rect
+    if _kn_in(R(KN_COLLAPSE), mx, my):
+        return {'zone': 'ai_collapse', 'ai_idx': ai_idx}
+    if _kn_in(R(KN_CLOSE), mx, my):
+        return {'zone': 'ai_delete', 'ai_idx': ai_idx}
+    if _kn_in(R(KN_ON), mx, my):
+        return {'zone': 'ai_on_off', 'ai_idx': ai_idx}
+    for ci in range(9):
+        if _kn_in(R(g.top_key(ci)), mx, my):
+            return {'zone': 'ai_channel_btn', 'ai_idx': ai_idx, 'ch_idx': ci}
+    for ki, (kx, ky) in enumerate(KN_KNOBS):
+        if math.hypot(mx - g.X(kx), my - g.Y(ky)) <= KN_KNOB_HIT_R * g.s:
+            return {'zone': 'ai_rvc_knob', 'ai_idx': ai_idx, 'knob_idx': ki}
+    if _kn_in(R(KN_GENERATE), mx, my):
+        return {'zone': 'ai_rvc_convert', 'ai_idx': ai_idx}
+    if _kn_in(R(KN_PREVIEW), mx, my):
+        return {'zone': 'ai_rvc_preview', 'ai_idx': ai_idx}
+    if _kn_in(R(KN_OUT_DEC), mx, my):
+        return {'zone': 'ai_rvc_outch_dec', 'ai_idx': ai_idx}
+    if _kn_in(R(KN_OUT_INC), mx, my):
+        return {'zone': 'ai_rvc_outch_inc', 'ai_idx': ai_idx}
+    for ci in range(9):
+        if _kn_in(R(g.src_key(ci)), mx, my):
+            return {'zone': 'ai_rvc_add_ch', 'ai_idx': ai_idx, 'ch_idx': ci}
+    if _kn_in(R(KN_NAME), mx, my):
+        return {'zone': 'ai_rvc_name_field', 'ai_idx': ai_idx}
+    if _kn_in(R(KN_ADD), mx, my):
+        return {'zone': 'ai_rvc_add_voice', 'ai_idx': ai_idx}
+    if _kn_in(R(KN_ARROW_UP), mx, my):
+        return {'zone': 'ai_rvc_scroll', 'ai_idx': ai_idx, 'dir': -1}
+    if _kn_in(R(KN_ARROW_DN), mx, my):
+        return {'zone': 'ai_rvc_scroll', 'ai_idx': ai_idx, 'dir': 1}
+    voices = _discover_ref_voices(ai_idx)
+    try:
+        scroll = int(rack.get('rvc_scroll', 0))
+    except Exception:
+        scroll = 0
+    for slot in range(KN_VOICE_ROWS):
+        vi = slot + scroll
+        if vi >= len(voices):
+            break
+        if _kn_in(R(g.voice_btn(slot)), mx, my):
+            return {'zone': 'ai_rvc_voice_preview', 'ai_idx': ai_idx, 'voice_idx': vi}
+        if _kn_in(R(g.voice_row(slot)), mx, my):
+            return {'zone': 'ai_rvc_voice', 'ai_idx': ai_idx, 'voice_idx': vi}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# drawing helpers
+# ---------------------------------------------------------------------------
+def _kn_text(text, x, cy, fs_art, g, col, lv=1.0, align="l", glow=KN_GLOW):
+    """Glowing text; x is the left edge / centre / right edge by align, cy the vertical centre (screen px)."""
+    try:
+        from ui.racks.pp_text import draw_text as _pdt, text_width as _ptw
+    except Exception:
+        _pdt = _ptw = None
+    if lv <= 0.01:
+        return 0.0
+    fs = max(1, int(round(fs_art * g.s)))
+    a = col[3] * lv
+    c = (col[0], col[1], col[2], a)
+    if _ptw:
+        tw = _ptw(text, fs)
+    else:
+        tw = _text_width(text, fs)
+    if align == "c":
+        x = x - tw / 2
+    elif align == "r":
+        x = x - tw
+    y = cy - fs * 0.36
+    if _pdt:
+        _pdt(text, x, y, fs, c, glow=glow * lv * KN_GLOW_SCALE, glow_col=KN_GLOW_COL)
+    else:
+        _draw_text(text, x, y, fs, c)
+    return tw
+
+
+def _kn_quad(shader, x0, y0, x1, y1, col, blend="ALPHA"):
+    gpu.state.blend_set(blend)
+    shader.bind()
+    shader.uniform_float("color", col)
+    batch_for_shader(shader, "TRIS", {"pos": [(x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1)]}).draw(shader)
+    gpu.state.blend_set("ALPHA")
+
+
+def _kn_glow_box(shader, r, lv, g):
+    """Bright red outline + soft halo around a rect (the selected voice row)."""
+    x0, y0, x1, y1 = r
+    t = max(1.0, 1.7 * g.s)
+    for grow, wid, a in ((3.2 * g.s, 3.0 * g.s, 0.10), (1.6 * g.s, 2.2 * g.s, 0.18), (0.0, t, 0.85)):
+        ax0, ay0, ax1, ay1 = x0 - grow, y0 - grow, x1 + grow, y1 + grow
+        col = (1.0, 0.16, 0.10, a * lv)
+        bl = "ADDITIVE" if grow > 0 else "ALPHA"
+        _kn_quad(shader, ax0, ay1 - wid, ax1, ay1, col, bl)
+        _kn_quad(shader, ax0, ay0, ax1, ay0 + wid, col, bl)
+        _kn_quad(shader, ax0, ay0, ax0 + wid, ay1, col, bl)
+        _kn_quad(shader, ax1 - wid, ay0, ax1, ay1, col, bl)
+    _kn_quad(shader, x0, y0, x1, y1, (1.0, 0.1, 0.06, 0.07 * lv), "ADDITIVE")
+
+
+def _kn_pointer(shader, cx, cy, length, width, ang_deg, lv):
+    a = math.radians(ang_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    x0, y0 = cx + ca * length * 0.12, cy + sa * length * 0.12
+    x1, y1 = cx + ca * length, cy + sa * length
+    for wmul, col, bl in ((3.0, (1.0, 0.10, 0.06, 0.22 * lv), "ADDITIVE"),
+                          (1.8, (1.0, 0.12, 0.08, 0.35 * lv), "ADDITIVE"),
+                          (1.0, (1.0, 0.30, 0.22, lv), "ALPHA")):
+        hw = width * wmul * 0.5
+        nx, ny = -sa * hw, ca * hw
+        q = [(x0 + nx, y0 + ny), (x0 - nx, y0 - ny), (x1 + nx, y1 + ny),
+             (x0 - nx, y0 - ny), (x1 - nx, y1 - ny), (x1 + nx, y1 + ny)]
+        gpu.state.blend_set(bl)
+        shader.bind()
+        shader.uniform_float("color", col)
+        batch_for_shader(shader, "TRIS", {"pos": q}).draw(shader)
+    gpu.state.blend_set("ALPHA")
+
+
+def _kn_blit(key, r, blend="ALPHA", k=1.0):
+    """Blit a skin image into a screen rect; k < 1 fades it (premultiplied by k)."""
+    try:
+        from ui.mixer.texture_cache import (get_texture as _gt, blit_texture as _bt,
+                                            blit_texture_tinted as _btt)
+        tex = _gt(key)
+        if tex:
+            if k >= 0.999:
+                _bt(tex, r[0], r[1], r[2] - r[0], r[3] - r[1], key=key, blend=blend)
+            elif k > 0.003:
+                _btt(tex, r[0], r[1], r[2] - r[0], r[3] - r[1], color=(k, k, k, k), blend=blend, key=key)
+            return True
+    except Exception as e:
+        print(f"[KNNVC] blit {key}: {e}")
+    return False
+
+
+# knob LED arc meters: 6 lit segments per side (bottom->top), art-pixel boxes of the sprites
+KN_ARC_BOXES = {0: {'L': [[1304, 189, 1352, 242], [1291, 180, 1339, 218], [1287, 168, 1334, 196], [1287, 144, 1334, 171], [1291, 122, 1339, 159], [1302, 96, 1352, 150]],
+                    'R': [[1402, 197, 1437, 244], [1409, 184, 1449, 219], [1417, 168, 1454, 197], [1417, 145, 1454, 171], [1411, 122, 1450, 156], [1402, 94, 1439, 143]]},
+                1: {'L': [[1467, 189, 1516, 242], [1455, 179, 1503, 218], [1450, 169, 1498, 196], [1450, 144, 1497, 171], [1454, 122, 1502, 159], [1466, 96, 1516, 149]],
+                    'R': [[1566, 197, 1600, 244], [1573, 184, 1612, 219], [1580, 168, 1617, 197], [1581, 145, 1617, 171], [1574, 122, 1613, 156], [1566, 94, 1602, 143]]}}
+KN_ARC_SEGS = 12
+
+
+def _kn_arc_meter(g, ki, v, lv):
+    """Light the knob's LED arc: left side bottom->top, then right side top->bottom."""
+    if lv <= 0.003:
+        return
+    n = 1.0 + v * (KN_ARC_SEGS - 1)
+    boxes = KN_ARC_BOXES.get(ki)
+    if not boxes:
+        return
+    for s in range(KN_ARC_SEGS):
+        k = max(0.0, min(1.0, n - s)) * lv
+        if k <= 0.003:
+            continue
+        side, i = ("L", s) if s < 6 else ("R", 5 - (s - 6))
+        _kn_blit(f"knnvc_arc_{ki}_{side}{i}", g.rect(boxes[side][i]), "ALPHA_PREMULT", k)
+
+
+
+def knnvc_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
+    """packApunch kNN-VC rack: everything that moves or changes, drawn over the baked art."""
+    import time as _time
+    g = _KnGeom(rx, ry, rw, rh)
+    R = g.rect
+    sh = gpu.shader.from_builtin("UNIFORM_COLOR")
+    enabled = bool(getattr(rack, "enabled", True))
+    try:
+        from ui.racks.rack_base import _pp_preset_level as _ppl
+        lv = _ppl(("knnvc", ai_idx), enabled, _time.monotonic())
+    except Exception:
+        lv = 1.0 if enabled else 0.0
+    now = _time.time()
+
+    # ── power: lights-off art fades in over the chassis (dark character, eyes out, veins down) ─────
+    full = (rx, ry, rx + rw, ry + rh)
+    if lv < 0.997:
+        _kn_blit("rack_knnvc_bg_off", full, blend="ALPHA_PREMULT", k=1.0 - lv)
+    # ── red glow travelling along the veins in the metal (fades out with the power) ───────────────
+    if lv > 0.01:
+        try:
+            from core.rack_screen_sequence import get_sequence_frame as _gsf
+            from ui.mixer.texture_cache import blit_texture_tinted as _btt_v
+            _vt = _gsf("knnvc_packapunch_veins", KN_VEIN_DIR, fps=KN_VEIN_FPS, speed=1.0, phase_key=ai_idx)
+            if _vt is not None:
+                k = lv * KN_VEIN_GAIN
+                _btt_v(_vt, rx, ry, rw, rh, color=(k, k, k, k), blend="ADDITIVE_PREMULT",
+                       key="knnvc_packapunch_veins")
+        except Exception as _e_vn:
+            print(f"[KNNVC] vein animation error: {_e_vn}")
+    # ── dimmed ON glass, crossfaded in as the rack goes off ───────────────────────────────────────
+    if lv < 0.997:
+        _kn_blit("rack_knnvc_off_btn", R(KN_OFF_PATCH), k=1.0 - lv)
+
+    # ── rack number on the lit square ─────────────────────────────────────────
+    br = R(KN_BADGE)
+    _kn_text(str(ai_idx + 1), (br[0] + br[2]) / 2, (br[1] + br[3]) / 2, 22.0, g, KN_TEXT_DARK, 1.0, "c", glow=0.0)
+
+    # ── channel keys above the screen ─────────────────────────────────────────
+    group_off = getattr(rack, 'group_idx', 0) * 9
+    for ci in range(9):
+        kr = R(g.top_key(ci))
+        assigned = bool(getattr(rack, f"ch{ci}", False))
+        if assigned:
+            _kn_blit("rack_knnvc_key_lit", kr, k=lv)
+        _kn_text(str(group_off + ci + 1), (kr[0] + kr[2]) / 2, (kr[1] + kr[3]) / 2, KN_FS_MED, g,
+                 KN_TEXT_HOT if assigned else KN_TEXT_DIM, lv, "c",
+                 glow=KN_GLOW if assigned else 0.35)
+
+    status = getattr(rack, "ai_status", _READY)
+    active_chs = [ci + 1 for ci in range(9) if getattr(rack, f"ch{ci}", False)]
+
+    # ── SOURCE read-out ───────────────────────────────────────────────────────
+    sr = R(KN_SOURCE)
+    src_disp = f"CH {active_chs[0]}" if active_chs else "USE RAIL"
+    _kn_text(src_disp, sr[0] + 7 * g.s, (sr[1] + sr[3]) / 2, KN_FS_MED, g,
+             KN_TEXT if active_chs else KN_TEXT_DIM, lv)
+
+    # ── REFERENCE VOICES ──────────────────────────────────────────────────────
+    voices = _discover_ref_voices(ai_idx)
+    sel_idx = int(getattr(rack, "p4", 0.0)) % max(1, len(voices)) if voices else 0
+    try:
+        scroll = int(rack.get('rvc_scroll', 0))
+    except Exception:
+        scroll = 0
+    scroll = max(0, min(scroll, max(0, len(voices) - 1)))
+    try:
+        rack['rvc_max_vis'] = KN_VOICE_ROWS
+    except Exception:
+        pass
+    if voices:
+        for slot in range(KN_VOICE_ROWS):
+            vi = slot + scroll
+            if vi >= len(voices):
+                break
+            name, _wav = voices[vi]
+            rr = R(g.voice_row(slot))
+            issel = (vi == sel_idx)
+            if issel:
+                _kn_glow_box(sh, rr, lv, g)
+            cyr = (rr[1] + rr[3]) / 2
+            maxw = (R(g.voice_btn(slot))[0] - rr[0]) - 26 * g.s
+            nm = name
+            fs_px = max(1, int(round(KN_FS_LABEL * g.s)))
+            while len(nm) > 1 and _text_width(nm, fs_px) > maxw:
+                nm = nm[:-1]
+            _kn_text(nm, rr[0] + 14 * g.s, cyr, KN_FS_LABEL, g, KN_TEXT if issel else KN_TEXT_DIM, lv)
+            br2 = R(g.voice_btn(slot))
+            _is_prev = False
+            try:
+                from core.ai_knnvc import is_voice_previewing as _ivp
+                _is_prev = _ivp(ai_idx, vi)
+            except Exception:
+                pass
+            _kn_text("■" if _is_prev else ">", (br2[0] + br2[2]) / 2, (br2[1] + br2[3]) / 2,
+                     KN_FS_LABEL, g, KN_TEXT, lv, "c")
+        if len(voices) > KN_VOICE_ROWS:
+            pg = f"{scroll + 1}-{min(scroll + KN_VOICE_ROWS, len(voices))}/{len(voices)}"
+            ar = R(KN_ARROW_UP)
+            _kn_text(pg, ar[0] - 6 * g.s, (ar[1] + ar[3]) / 2, KN_FS_SMALL, g, KN_TEXT_DIM, lv, "r", glow=0.5)
+    else:
+        rr = R(g.voice_row(0))
+        _kn_text("No reference voices yet", rr[0] + 14 * g.s, (rr[1] + rr[3]) / 2, KN_FS_LABEL, g, KN_TEXT_DIM, lv)
+        rr2 = R(g.voice_row(1))
+        _kn_text("Use ADD TO VOICES, or drop WAVs into voices/", rr2[0] + 14 * g.s, (rr2[1] + rr2[3]) / 2,
+                 KN_FS_MED, g, KN_TEXT_DIM, lv, glow=0.5)
+
+    # ── screen: state read-out under the eyes ─────────────────────────────────
+    scr = R(KN_SCREEN)
+    cxs = (scr[0] + scr[2]) / 2
+    def _line(txt, art_y, fs, col, glow=KN_GLOW, a=1.0):
+        c = (col[0], col[1], col[2], col[3] * a)
+        _kn_text(txt, cxs, g.Y(art_y), fs, g, c, lv, "c", glow=glow)
+    ref_sel = voices[sel_idx][0] if voices else None
+    if status == _PROCESSING:
+        pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(now * 5.0))
+        _line("CONVERTING...", 214, KN_FS_BIG, KN_TEXT, a=pulse)
+        _line("This may take 30-60 seconds", 236, KN_FS_SMALL, KN_TEXT_DIM, 0.5)
+    elif status == _DONE:
+        _line("CONVERSION DONE", 214, KN_FS_BIG, KN_TEXT)
+        info = "Output placed in VSE"
+        try:
+            import glob, tempfile, wave
+            matches = sorted(glob.glob(os.path.join(tempfile.gettempdir(), f"pb_knnvc_{ai_idx}_*.wav")))
+            if matches:
+                wav = matches[-1]
+                sz = os.path.getsize(wav)
+                sz_str = f"{sz // 1024}KB" if sz < 1024 * 1024 else f"{sz // (1024 * 1024)}MB"
+                with wave.open(wav, 'r') as wf:
+                    dur = wf.getnframes() / wf.getframerate()
+                    sr_hz = wf.getframerate()
+                info = f"{dur:.1f}s   |   {sr_hz}Hz   |   {sz_str}"
+        except Exception:
+            pass
+        _line(info, 236, KN_FS_SMALL, KN_TEXT_DIM, 0.5)
+    elif status == _ERROR:
+        _line("ERROR - CHECK CONSOLE", 214, KN_FS_BIG, (1.0, 0.30, 0.12, 1.0))
+        _line("Assign a source channel and select a reference voice", 236, KN_FS_SMALL, KN_TEXT_DIM, 0.5)
+    else:
+        if not active_chs:
+            _line("ASSIGN A SOURCE CHANNEL", 214, KN_FS_BIG, KN_TEXT_DIM, 0.5)
+            _line("use the channel keys above the screen", 236, KN_FS_SMALL, KN_TEXT_DIM, 0.4)
+        elif not voices:
+            _line("ADD A REFERENCE VOICE", 214, KN_FS_BIG, KN_TEXT_DIM, 0.5)
+            _line("use ADD TO VOICES (bottom left)", 236, KN_FS_SMALL, KN_TEXT_DIM, 0.4)
+        else:
+            _line("READY TO CONVERT", 214, KN_FS_BIG, KN_TEXT)
+            _line(f"Ref: {(ref_sel or 'none')[:24]}   |   Src: CH{active_chs[0]}", 236, KN_FS_SMALL, KN_TEXT_DIM, 0.6)
+
+    # ── GENERATE / PREVIEW ────────────────────────────────────────────────────
+    _has_out_gen = False
+    try:
+        from core.ai_knnvc import has_rack_output as _hro
+        _has_out_gen = _hro(ai_idx)
+    except Exception:
+        pass
+    if status == _PROCESSING:
+        c_lbl = "GENERATING..."
+    elif _has_out_gen:
+        c_lbl = "PLACE ON TRACK"
+    else:
+        c_lbl = "GENERATE"
+    gr = R(KN_GENERATE)
+    _kn_text(c_lbl, (gr[0] + gr[2]) / 2, (gr[1] + gr[3]) / 2, KN_FS_LABEL, g, KN_TEXT, lv, "c")
+    _has_out = _is_playing = False
+    try:
+        from core.ai_knnvc import has_rack_output, is_rack_previewing
+        _has_out = has_rack_output(ai_idx)
+        _is_playing = is_rack_previewing(ai_idx)
+    except Exception:
+        pass
+    pr = R(KN_PREVIEW)
+    _kn_text("■ STOP" if _is_playing else "> PREVIEW", (pr[0] + pr[2]) / 2, (pr[1] + pr[3]) / 2,
+             KN_FS_LABEL, g, KN_TEXT if (_has_out or _is_playing) else KN_TEXT_DIM, 1.0, "c")   # painted on metal: stays lit
+
+    # ── OUT CH ────────────────────────────────────────────────────────────────
+    out_ch_val = int(getattr(rack, "p3", 0.0)) or (active_chs[0] + 1 if active_chs else 2)
+    out_ch_val = max(1, min(9, out_ch_val))
+    ob = R(KN_OUT_BOX)
+    _kn_text(str(out_ch_val), (ob[0] + ob[2]) / 2, (ob[1] + ob[3]) / 2, 22.0, g, KN_TEXT, lv, "c")
+
+    # ── SRC keys (add-from-timeline channel) ──────────────────────────────────
+    add_ch = int(getattr(rack, "p5", 0.0))
+    for ci in range(9):
+        kr = R(g.src_key(ci))
+        issel = (ci == add_ch)
+        if issel:
+            _kn_blit("rack_knnvc_key_lit", kr, k=lv)
+        _kn_text(str(ci + 1), (kr[0] + kr[2]) / 2, (kr[1] + kr[3]) / 2, KN_FS_SMALL, g,
+                 KN_TEXT_HOT if issel else KN_TEXT_DIM, lv, "c", glow=KN_GLOW if issel else 0.35)
+
+    # ── name field ────────────────────────────────────────────────────────────
+    _name_active = False
+    _name_cursor = 0
+    try:
+        from ui.mixer.interaction import _active_text_field as _atf
+        if _atf and _atf.get('ai_idx') == ai_idx and _atf.get('field') == 'add_voice_name':
+            _name_active = True
+            _name_cursor = _atf.get('cursor', 0)
+    except ImportError:
+        pass
+    name_val = rack.get('add_voice_name', None)
+    if name_val is None:
+        name_val = f"CH{add_ch + 1}Sample"
+        rack['add_voice_name'] = name_val
+    nr = R(KN_NAME)
+    ncy = (nr[1] + nr[3]) / 2
+    nx = nr[0] + 8 * g.s
+    if name_val:
+        disp_name = name_val[:28] if len(name_val) <= 28 else name_val[:27] + "..."
+        _kn_text(disp_name, nx, ncy, KN_FS_MED, g, KN_TEXT, lv)
+    else:
+        _kn_text("enter name...", nx, ncy, KN_FS_MED, g, KN_TEXT_DIM, lv, glow=0.4)
+    if _name_active and int(now * 2) % 2 == 0:
+        fs_px = max(1, int(round(KN_FS_MED * g.s)))
+        pre = name_val[:min(_name_cursor, len(name_val))]
+        try:
+            from ui.racks.pp_text import text_width as _ptw2
+            cw = _ptw2(pre, fs_px)
+        except Exception:
+            cw = _text_width(pre, fs_px)
+        cxp = nx + cw
+        _kn_quad(sh, cxp, nr[1] + 2 * g.s, cxp + max(1.0, 1.4 * g.s), nr[3] - 2 * g.s, (1.0, 0.35, 0.28, 1.0))
+
+    # ── ADD TO VOICES ─────────────────────────────────────────────────────────
+    ar_ = R(KN_ADD)
+    add_busy = rack.get('add_voice_busy', False)
+    _kn_text("ADDING..." if add_busy else "ADD TO VOICES >", (ar_[0] + ar_[2]) / 2, (ar_[1] + ar_[3]) / 2,
+             KN_FS_LABEL, g, KN_TEXT_DIM if add_busy else KN_TEXT, 1.0, "c")   # painted on metal: stays lit
+
+    # ── knobs ─────────────────────────────────────────────────────────────────
+    vals = (int(2 + float(getattr(rack, "p0", 0.5)) * 6), str(int(10 + float(getattr(rack, "p1", 0.5)) * 50)) + "s")
+    for ki, (kx, ky) in enumerate(KN_KNOBS):
+        v = max(0.0, min(1.0, float(getattr(rack, f"p{ki}", 0.5))))
+        cx, cy = g.X(kx), g.Y(ky)
+        _kn_arc_meter(g, ki, v, lv)
+        _kn_pointer(sh, cx, cy, KN_KNOB_PTR_LEN * g.s, KN_KNOB_PTR_W * g.s,
+                    KN_KNOB_START_DEG - KN_KNOB_SWEEP * v, lv)
+        _kn_text(str(vals[ki]), cx, g.Y(KN_KNOB_VAL_Y), KN_FS_MED, g, KN_TEXT, lv, "c")
+
+    # ── status bar ────────────────────────────────────────────────────────────
+    ref_name = "none"
+    if voices:
+        si = int(getattr(rack, "p4", 0.0)) % max(1, len(voices))
+        ref_name = os.path.splitext(os.path.basename(voices[si][1]))[0] if si < len(voices) else "none"
+    topk_disp = int(2 + float(getattr(rack, "p0", 0.5)) * 6)
+    src_str = f"SRC:CH{active_chs[0]}" if active_chs else "SRC:unset"
+    out_ch_sb = int(getattr(rack, "p3", 0.0)) or (active_chs[0] + 1 if active_chs else 2)
+    sb = R(KN_STATUS)
+    _kn_text(f"ENGINE: kNN-VC  |  {src_str}  |  OUT:CH{out_ch_sb}  |  REF:{ref_name}  |  TOPK:{topk_disp}  |  OFFLINE",
+             sb[0] + 14 * g.s, (sb[1] + sb[3]) / 2, KN_FS_SMALL, g, KN_TEXT_DIM, lv, glow=0.6)

@@ -184,6 +184,8 @@ PIPER_SCRIPT_TEXT_RIGHT_INSET = 6.0   # pulls the wrap edge in from the right
 # already works in throughout Racks.py.
 # ---------------------------------------------------------------------------
 def cursor_index_from_xy(text, sp_x, sp_y, sp_w, sp_h, scale, mouse_x, mouse_y):
+    if piper_pp_active():          # packApunch layout: sp_* is the script area's screen rect
+        return _pp_cursor_index(text, sp_x, sp_y, sp_w, sp_h, mouse_x, mouse_y)
     fs_lbl  = max(1, int(8*scale))
     fs_txt  = max(1, int(PIPER_SCRIPT_FONT_SIZE*scale))
     line_h  = fs_txt * 1.7
@@ -949,3 +951,744 @@ def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
         }
         _draw_circle(rx+rw-14*scale, sbar_y+sbar_h/2,
                      3.5*scale, dot_cols.get(status, (0.4, 0.4, 0.4, 1.0)))
+
+# =============================================================================
+# PACKAPUNCH SKIN  -  "HAL 9000"  (rack_piper_bg.png, 1760 x 476 art px)
+# Everything below is laid out in ART pixels (top-left origin) and scaled to the rack at draw time, so
+# drawing and click zones always agree. Used only while the packApunch skin is active.
+# On-screen content (script, voice list, waveform) fades out when the rack is switched off; labels that are
+# painted on metal (buttons, keys) stay visible. The eye has its own, much slower, fade.
+# =============================================================================
+import math as _pm
+import re as _pre
+import time as _ptime
+
+PP_ART_W = 1760.0
+PP_ART_H = 476.0
+PP_SKIN  = "packapunch"
+
+PP_COLLAPSE = (10.5, 17.3, 40.0, 44.5)
+PP_BADGE    = (49.0, 17.3, 80.0, 44.5)
+PP_ON       = (1612.0, 17.4, 1670.0, 40.8)
+PP_CLOSE    = (1679.0, 17.4, 1703.0, 40.8)
+PP_TOPKEY_X0, PP_TOPKEY_PITCH, PP_TOPKEY_W, PP_TOPKEY_Y = 730.0, 30.3, 24.2, (17.4, 40.8)
+PP_BOTKEY_X0, PP_BOTKEY_PITCH, PP_BOTKEY_W, PP_BOTKEY_Y = 10.0, 31.0, 23.0, (415.5, 439.0)
+
+PP_SCRIPT_GLASS = (81.0, 66.0, 601.0, 277.0)
+PP_SCRIPT       = (98.0, 80.0, 585.0, 262.0)      # typed-text area (inside the left CRT)
+PP_VOICE_GLASS  = (1139.0, 66.0, 1697.0, 277.0)
+PP_PRESET_BOX   = (375.0, 17.4, 635.0, 40.8)       # preset selector in the top rail (name box)
+PP_PRESET_PREV  = (343.0, 17.4, 373.0, 40.8)       # < hit/draw area
+PP_PRESET_NEXT  = (637.0, 17.4, 667.0, 40.8)       # > hit/draw area
+PP_ADD          = (1160.0, 84.0, 1676.0, 106.0)   # + ADD VOICE bar (top of the right CRT)
+PP_CARD_X       = (1160.0, 1630.0)
+PP_CARD_Y0, PP_CARD_PITCH, PP_CARD_H, PP_CARD_ROWS = 112.0, 37.0, 34.0, 4
+PP_ARROW_UP     = (1636.0, 112.0, 1676.0, 172.0)
+PP_ARROW_DN     = (1636.0, 200.0, 1676.0, 260.0)
+PP_DL_W, PP_DL_H = 104.0, 24.0                    # DOWNLOAD button inside a catalog card
+
+PP_GENERATE = (103.0, 310.0, 251.0, 353.0)
+PP_PREVIEW  = (272.0, 310.0, 425.0, 353.0)
+PP_CLEAR    = (442.0, 310.0, 583.0, 353.0)
+PP_WAVE     = (1126.0, 309.0, 1691.0, 345.0)       # output read-out bar
+PP_WAVE_BAR = (1118.0, 304.0, 1698.0, 350.0)
+PP_KNOBS    = ((1468.8, 396.8), (1570.6, 397.2), (1661.8, 397.0))   # SPEED, NOISE, NOISE W
+PP_KNOB_HIT_R   = 30.0
+PP_KNOB_PTR_LEN = 15.5
+PP_KNOB_PTR_W   = 2.7
+PP_KNOB_START_DEG = 225.0
+PP_KNOB_SWEEP     = 270.0
+PP_STATUS   = (8.0, 447.0, 1752.0, 470.0)
+PP_LED      = (1733.0, 461.0)
+PP_EYE_C    = (868.0, 169.0)
+PP_EYE_PATCH = (756.0, 50.0, 979.0, 289.0)
+PP_EYE_GLOW_SIZE = 640.0
+PP_EYE_GLOW_GAIN = 0.85
+PP_EYE_IDLE_DIP = 0.40                                # how far the idle breath dims the lens (0..1)
+PP_SCREEN_TINT = 0.07                                 # phosphor wash strength on the matte-shaped CRTs
+PP_EYE_FADE_ON, PP_EYE_FADE_OFF = 0.8, 4.0        # seconds: HAL wakes quickly and dies slowly
+
+PP_FS_BIG, PP_FS_BTN, PP_FS_TEXT, PP_FS_CARD, PP_FS_SUB, PP_FS_SMALL = 24.0, 21.0, 17.0, 16.0, 12.5, 13.0
+PP_LINE_H = 1.5
+PP_TXT      = (0.86, 0.94, 1.00, 1.00)     # cold phosphor white
+PP_TXT_DIM  = (0.50, 0.58, 0.68, 0.90)
+PP_TXT_HOT  = (1.00, 1.00, 1.00, 1.00)
+PP_METAL    = (0.93, 0.95, 0.97, 1.00)     # lettering painted on metal
+PP_METAL_DIM = (0.52, 0.55, 0.60, 0.95)
+PP_RED      = (1.00, 0.30, 0.20, 1.00)
+PP_GLOW_COL = (0.45, 0.70, 1.00)
+PP_GLOW     = 0.55
+PP_ICE      = (0.50, 0.72, 1.00)           # light colour of lit keys / outlines
+
+_PP_EYE = {}
+
+
+def _pp_skin_on():
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas, get_texture as _gt
+        return _gas() == PP_SKIN and _gt("rack_piper_bg") is not None
+    except Exception:
+        return False
+
+
+def piper_pp_active():
+    return _pp_skin_on()
+
+
+class _PpGeom:
+    def __init__(self, rx, ry, rw, rh):
+        self.rx, self.ry, self.rw, self.rh = rx, ry, rw, rh
+        self.sx, self.sy = rw / PP_ART_W, rh / PP_ART_H
+        self.s = min(self.sx, self.sy)
+
+    def X(self, ax):
+        return self.rx + ax * self.sx
+
+    def Y(self, ay):
+        return self.ry + (1.0 - ay / PP_ART_H) * self.rh
+
+    def rect(self, r):
+        return (self.X(r[0]), self.Y(r[3]), self.X(r[2]), self.Y(r[1]))
+
+    def top_key(self, i):
+        x0 = PP_TOPKEY_X0 + PP_TOPKEY_PITCH * i
+        return (x0, PP_TOPKEY_Y[0], x0 + PP_TOPKEY_W, PP_TOPKEY_Y[1])
+
+    def bot_key(self, i):
+        x0 = PP_BOTKEY_X0 + PP_BOTKEY_PITCH * i
+        return (x0, PP_BOTKEY_Y[0], x0 + PP_BOTKEY_W, PP_BOTKEY_Y[1])
+
+    def card(self, k):
+        y0 = PP_CARD_Y0 + PP_CARD_PITCH * k
+        return (PP_CARD_X[0], y0, PP_CARD_X[1], y0 + PP_CARD_H)
+
+    def dl_btn(self, k):
+        c = self.card(k)
+        cy = (c[1] + c[3]) / 2
+        return (c[2] - 8.0 - PP_DL_W, cy - PP_DL_H / 2, c[2] - 8.0, cy + PP_DL_H / 2)
+
+
+def _pp_in(r, x, y):
+    return r[0] <= x <= r[2] and r[1] <= y <= r[3]
+
+
+# -- script text layout (shared by drawing, click-to-cursor and drag-select) ------------------------------------
+def _pp_wrap(text, fs_px, max_w):
+    """Greedy word wrap that keeps real character indices: a list of (start, string); line k owns characters
+    start_k .. start_(k+1)-1 (the space a line broke on belongs to the line before it)."""
+    if not text:
+        return []
+    lines = []
+    ln_start = None
+    ln_end = 0
+    for mo in _pre.finditer(r"\S+", text):
+        if ln_start is None:
+            ln_start, ln_end = mo.start(), mo.end()
+            continue
+        cand = text[ln_start:mo.end()].replace("\n", " ")
+        if _pp_tw(cand, fs_px) <= max_w:
+            ln_end = mo.end()
+        else:
+            lines.append((ln_start, text[ln_start:ln_end].replace("\n", " ")))
+            ln_start, ln_end = mo.start(), mo.end()
+    if ln_start is None:
+        return [(0, text.replace("\n", " "))]
+    lines.append((ln_start, text[ln_start:].replace("\n", " ")))
+    return lines
+
+
+def _pp_tw(txt, fs_px):
+    try:
+        from ui.racks.pp_text import text_width as _ptw
+        return _ptw(txt, fs_px)
+    except Exception:
+        return _text_width(txt, fs_px)
+
+
+def _pp_text_metrics(sp_w, sp_h):
+    """(scale, font px, line height px, max chars-width px, max lines) of the script area from its screen size."""
+    sx = sp_w / (PP_SCRIPT[2] - PP_SCRIPT[0])
+    sy = sp_h / (PP_SCRIPT[3] - PP_SCRIPT[1])
+    s = min(sx, sy)
+    fs = max(1, int(round(PP_FS_TEXT * s)))
+    lh = PP_FS_TEXT * PP_LINE_H * s
+    max_lines = max(1, int((sp_h - 6.0 * s) // lh))
+    return s, fs, lh, sp_w - 12.0 * s, max_lines
+
+
+def _pp_cursor_index(text, sp_x, sp_y, sp_w, sp_h, mouse_x, mouse_y):
+    """Character index under the mouse for the packApunch script area (sp_* = its screen rect, y = bottom)."""
+    s, fs, lh, wrap_w, max_lines = _pp_text_metrics(sp_w, sp_h)
+    if not text:
+        return 0
+    lines = _pp_wrap(text, fs, wrap_w)
+    if not lines:
+        return 0
+    first = max(0, len(lines) - max_lines)
+    top = sp_y + sp_h - 4.0 * s
+    row = int((top - mouse_y) // lh)
+    row = max(0, min(row, min(max_lines, len(lines) - first) - 1))
+    li = first + row
+    start, line = lines[li]
+    end = lines[li + 1][0] if li + 1 < len(lines) else len(text)
+    rel = mouse_x - (sp_x + 6.0 * s)
+    if rel <= 0:
+        return start
+    col = len(line)
+    for c in range(len(line) + 1):
+        w = _pp_tw(line[:c], fs)
+        if w >= rel:
+            if c > 0:
+                wp = _pp_tw(line[:c - 1], fs)
+                col = c - 1 if (rel - wp) < (w - rel) else c
+            else:
+                col = 0
+            break
+    return min(start + col, end if li + 1 < len(lines) else len(text))
+
+
+# -- hit testing ---------------------------------------------------------------------------------------------------
+def _pp_voice_state(rack, ai_idx):
+    try:
+        from core.ai_piper import get_voices
+        voices = get_voices()
+    except Exception:
+        voices = []
+    scroll = int(getattr(rack, 'p5', 0.0))
+    scroll = max(0, min(scroll, max(0, len(voices) - PP_CARD_ROWS)))
+    return voices, scroll
+
+
+def piper_pp_hit(mx, my, rack, ai_idx, rack_x, rack_y, rw, rh):
+    g = _PpGeom(rack_x, rack_y, rw, rh)
+    R = g.rect
+    if _pp_in(R(PP_COLLAPSE), mx, my):
+        return {'zone': 'ai_collapse', 'ai_idx': ai_idx}
+    if _pp_in(R(PP_CLOSE), mx, my):
+        return {'zone': 'ai_delete', 'ai_idx': ai_idx}
+    if _pp_in(R(PP_ON), mx, my):
+        return {'zone': 'ai_on_off', 'ai_idx': ai_idx}
+    if _pp_in(R(PP_PRESET_PREV), mx, my):
+        return {'zone': 'ai_preset_prev', 'ai_idx': ai_idx}
+    if _pp_in(R(PP_PRESET_NEXT), mx, my):
+        return {'zone': 'ai_preset_next', 'ai_idx': ai_idx}
+    for ci in range(9):
+        if _pp_in(R(g.top_key(ci)), mx, my) or _pp_in(R(g.bot_key(ci)), mx, my):
+            return {'zone': 'ai_channel_btn', 'ai_idx': ai_idx, 'ch_idx': ci}
+    for ki, (kx, ky) in enumerate(PP_KNOBS):
+        if _pm.hypot(mx - g.X(kx), my - g.Y(ky)) <= PP_KNOB_HIT_R * g.s:
+            return {'zone': 'ai_piper_knob', 'ai_idx': ai_idx, 'knob_idx': ki}
+    if _pp_in(R(PP_GENERATE), mx, my):
+        return {'zone': 'ai_process', 'ai_idx': ai_idx, 'ai_type': 'PIPER_TTS'}
+    if _pp_in(R(PP_PREVIEW), mx, my):
+        return {'zone': 'ai_piper_preview', 'ai_idx': ai_idx}
+    if _pp_in(R(PP_CLEAR), mx, my):
+        return {'zone': 'ai_piper_clear', 'ai_idx': ai_idx}
+    sr = R(PP_SCRIPT)
+    if _pp_in(sr, mx, my):
+        return {'zone': 'ai_piper_text', 'ai_idx': ai_idx,
+                'sp_x': sr[0], 'sp_y': sr[1], 'sp_w': sr[2] - sr[0], 'sp_h': sr[3] - sr[1],
+                'scale': g.s, 'mouse_x': mx, 'mouse_y': my}
+    browsing = _browse_mode.get(ai_idx, False)
+    if _pp_in(R(PP_ADD), mx, my):
+        return {'zone': 'ai_piper_add_voice_toggle', 'ai_idx': ai_idx}
+    scroll_zone = 'ai_piper_catalog_scroll' if browsing else 'ai_piper_scroll'
+    if _pp_in(R(PP_ARROW_UP), mx, my):
+        return {'zone': scroll_zone, 'ai_idx': ai_idx, 'dir': -1}
+    if _pp_in(R(PP_ARROW_DN), mx, my):
+        return {'zone': scroll_zone, 'ai_idx': ai_idx, 'dir': 1}
+    if browsing:
+        try:
+            from core.ai_piper import (get_voice_catalog, is_voice_installed, get_download_state)
+            cat = get_voice_catalog()
+        except Exception:
+            return None
+        n = len(cat)
+        b_scroll = max(0, min(int(_browse_scroll.get(ai_idx, 0)), max(0, n - PP_CARD_ROWS)))
+        for slot in range(PP_CARD_ROWS):
+            vi = b_scroll + slot
+            if vi >= n:
+                break
+            try:
+                inst = is_voice_installed(cat[vi]['key'])
+                dls = get_download_state(cat[vi]['key'])
+            except Exception:
+                inst, dls = False, None
+            if inst or (dls and dls.get('status') == 'DOWNLOADING'):
+                continue
+            if _pp_in(R(g.dl_btn(slot)), mx, my):
+                return {'zone': 'ai_piper_catalog_click', 'ai_idx': ai_idx, 'voice_key': cat[vi]['key']}
+        return None
+    voices, scroll = _pp_voice_state(rack, ai_idx)
+    for slot in range(PP_CARD_ROWS):
+        vi = scroll + slot
+        if vi >= len(voices):
+            break
+        if _pp_in(R(g.card(slot)), mx, my):
+            return {'zone': 'ai_piper_voice', 'ai_idx': ai_idx, 'voice_idx': vi}
+    return None
+
+
+# -- drawing helpers -----------------------------------------------------------------------------------------------
+def _pp_text(text, x, cy, fs_art, g, col, a=1.0, align="l", glow=PP_GLOW):
+    """Glowing text; x = left / centre / right by align, cy = vertical centre in screen px."""
+    try:
+        from ui.racks.pp_text import draw_text as _pdt, text_width as _ptw
+    except Exception:
+        _pdt = _ptw = None
+    if a <= 0.01:
+        return 0.0
+    fs = max(1, int(round(fs_art * g.s)))
+    c = (col[0], col[1], col[2], col[3] * a)
+    tw = _ptw(text, fs) if _ptw else _text_width(text, fs)
+    if align == "c":
+        x -= tw / 2
+    elif align == "r":
+        x -= tw
+    y = cy - fs * 0.36
+    if _pdt:
+        _pdt(text, x, y, fs, c, glow=glow * a, glow_col=PP_GLOW_COL)
+    else:
+        _draw_text(text, x, y, fs, c)
+    return tw
+
+
+def _pp_quad(sh, x0, y0, x1, y1, col, blend="ALPHA"):
+    gpu.state.blend_set(blend)
+    sh.bind()
+    sh.uniform_float("color", col)
+    batch_for_shader(sh, "TRIS", {"pos": [(x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1)]}).draw(sh)
+    gpu.state.blend_set("ALPHA")
+
+
+def _pp_tri(sh, pts, col, blend="ALPHA"):
+    gpu.state.blend_set(blend)
+    sh.bind()
+    sh.uniform_float("color", col)
+    batch_for_shader(sh, "TRIS", {"pos": pts}).draw(sh)
+    gpu.state.blend_set("ALPHA")
+
+
+def _pp_outline(sh, r, w, col, blend="ALPHA"):
+    x0, y0, x1, y1 = r
+    _pp_quad(sh, x0, y1 - w, x1, y1, col, blend)
+    _pp_quad(sh, x0, y0, x1, y0 + w, col, blend)
+    _pp_quad(sh, x0, y0, x0 + w, y1, col, blend)
+    _pp_quad(sh, x1 - w, y0, x1, y1, col, blend)
+
+
+def _pp_glow_box(sh, r, lv, g, strong=True):
+    t = max(1.0, 1.6 * g.s)
+    for grow, wid, a in ((3.0 * g.s, 3.0 * g.s, 0.08), (1.5 * g.s, 2.2 * g.s, 0.15), (0.0, t, 0.85 if strong else 0.35)):
+        rr = (r[0] - grow, r[1] - grow, r[2] + grow, r[3] + grow)
+        _pp_outline(sh, rr, wid, (PP_ICE[0], PP_ICE[1], PP_ICE[2], a * lv), "ADDITIVE" if grow > 0 else "ALPHA")
+    _pp_quad(sh, r[0], r[1], r[2], r[3], (PP_ICE[0], PP_ICE[1], PP_ICE[2], 0.07 * lv), "ADDITIVE")
+
+
+def _pp_blit(key, r, blend="ALPHA_PREMULT", k=1.0):
+    try:
+        from ui.mixer.texture_cache import (get_texture as _gt, blit_texture as _bt, blit_texture_tinted as _btt)
+        tex = _gt(key)
+        if tex:
+            if k >= 0.999:
+                _bt(tex, r[0], r[1], r[2] - r[0], r[3] - r[1], key=key, blend=blend)
+            elif k > 0.003:
+                _btt(tex, r[0], r[1], r[2] - r[0], r[3] - r[1], color=(k, k, k, k), blend=blend, key=key)
+            return True
+    except Exception as e:
+        print(f"[PIPER] blit {key}: {e}")
+    return False
+
+
+def _pp_eye_level(ai_idx, enabled, now):
+    """0..1 life of the eye: wakes in ~0.8 s, dies over ~4 s."""
+    st = _PP_EYE.get(ai_idx)
+    if st is None:
+        st = {"l": 1.0 if enabled else 0.0, "t": now}
+        _PP_EYE[ai_idx] = st
+    dt = max(0.0, min(0.25, now - st["t"]))
+    st["t"] = now
+    if enabled:
+        st["l"] = min(1.0, st["l"] + dt / PP_EYE_FADE_ON)
+    else:
+        st["l"] = max(0.0, st["l"] - dt / PP_EYE_FADE_OFF)
+    v = st["l"]
+    return v * v * (3.0 - 2.0 * v)
+
+
+def _pp_eye_pulse(status, now):
+    if status == "PROCESSING":
+        return 0.55 + 0.45 * _pm.sin(now * 6.9)
+    if status == "PREVIEWING":
+        return 0.25 + 0.75 * min(1.0, 0.65 * abs(_pm.sin(now * 7.3)) + 0.45 * abs(_pm.sin(now * 3.1 + 1.0)))
+    if status == "ERROR":
+        return 0.35 + 0.45 * (1.0 if _pm.sin(now * 23.0) > 0 else 0.0)
+    return _pp_eye_idle(now)
+
+
+def _pp_eye_idle(now):
+    """HAL at rest: slow breathing (~4 s) with a faint shimmer, 0.28 .. 0.80."""
+    br = 0.5 + 0.5 * _pm.sin(now * 1.55)
+    sh = 0.5 + 0.5 * _pm.sin(now * 5.3 + 1.3) * _pm.sin(now * 0.7)
+    return 0.28 + 0.46 * br + 0.06 * sh
+
+
+def _pp_x_glyph(sh, r, col, g):
+    cx, cy = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
+    d = 5.2 * g.s
+    hw = 1.25 * g.s
+    for sgn in (1, -1):
+        dx, dy = d, d * sgn
+        nx, ny = -dy / _pm.hypot(dx, dy) * hw, dx / _pm.hypot(dx, dy) * hw
+        pts = [(cx - dx + nx, cy - dy + ny), (cx - dx - nx, cy - dy - ny), (cx + dx + nx, cy + dy + ny),
+               (cx - dx - nx, cy - dy - ny), (cx + dx - nx, cy + dy - ny), (cx + dx + nx, cy + dy + ny)]
+        _pp_tri(sh, pts, col)
+
+
+def _pp_pointer(sh, cx, cy, length, width, ang_deg):
+    a = _pm.radians(ang_deg)
+    ca, sa = _pm.cos(a), _pm.sin(a)
+    x0, y0 = cx + ca * length * 0.10, cy + sa * length * 0.10
+    x1, y1 = cx + ca * length, cy + sa * length
+    for wmul, col, bl in ((2.4, (0.0, 0.0, 0.0, 0.30), "ALPHA"),
+                          (1.0, (0.97, 0.98, 1.0, 1.0), "ALPHA")):
+        hw = width * wmul * 0.5
+        nx, ny = -sa * hw, ca * hw
+        q = [(x0 + nx, y0 + ny), (x0 - nx, y0 - ny), (x1 + nx, y1 + ny),
+             (x0 - nx, y0 - ny), (x1 - nx, y1 - ny), (x1 + nx, y1 + ny)]
+        _pp_tri(sh, q, col, bl)
+
+
+def piper_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
+    """packApunch Piper rack: everything that moves or changes, drawn over the baked art."""
+    g = _PpGeom(rx, ry, rw, rh)
+    R = g.rect
+    sh = gpu.shader.from_builtin("UNIFORM_COLOR")
+    enabled = bool(getattr(rack, "enabled", True))
+    now_m = _ptime.monotonic()
+    now = _ptime.time()
+    try:
+        from ui.racks.rack_base import _pp_preset_level as _ppl
+        lv = _ppl(("piper", ai_idx), enabled, now_m)
+    except Exception:
+        lv = 1.0 if enabled else 0.0
+    eye_lv = _pp_eye_level(ai_idx, enabled, now_m)
+    status = getattr(rack, 'ai_status', 'READY')
+
+    # ── power: dead screens fade in over the chassis; the eye dims on its own, slower clock ───────────
+    if lv < 0.997:
+        _pp_blit("rack_piper_bg_off", (rx, ry, rx + rw, ry + rh), k=1.0 - lv)
+    k_eye = 1.0 - eye_lv
+    if status not in ("PROCESSING", "PREVIEWING", "ERROR"):
+        # idle: the lens itself breathes (dips toward the dark patch), not just its bloom
+        k_eye += eye_lv * (1.0 - _pp_eye_idle(now) / 0.80) * PP_EYE_IDLE_DIP
+    if k_eye > 0.003:
+        _pp_blit("rack_piper_eye_off", R(PP_EYE_PATCH), k=min(1.0, k_eye))
+    if eye_lv > 0.01:
+        gx, gy = g.X(PP_EYE_C[0]), g.Y(PP_EYE_C[1])
+        half = PP_EYE_GLOW_SIZE * 0.5
+        kk = _pp_eye_pulse(status, now) * eye_lv * PP_EYE_GLOW_GAIN
+        try:
+            from ui.mixer.texture_cache import get_texture as _gt, blit_texture_tinted as _btt
+            tex = _gt("rack_piper_eye_glow")
+            if tex is not None and kk > 0.003:
+                _btt(tex, gx - half * g.sx, gy - half * g.sy, 2 * half * g.sx, 2 * half * g.sy,
+                     color=(kk, kk, kk, kk), blend="ADDITIVE_PREMULT", key="rack_piper_eye_glow")
+        except Exception as _e:
+            print(f"[PIPER] eye glow error: {_e}")
+
+    # ── faint phosphor light on the two CRT faces (shaped by the screen matte) ──────────────────────
+    if lv > 0.01:
+        try:
+            from ui.mixer.texture_cache import get_texture as _gt, blit_texture_tinted as _btt
+            tex = _gt("rack_piper_screens")
+            if tex is not None:
+                k_ = PP_SCREEN_TINT * lv
+                _btt(tex, rx, ry, rw, rh, color=(0.45 * k_, 0.62 * k_, 0.85 * k_, k_),
+                     blend="ADDITIVE_PREMULT", key="rack_piper_screens")
+        except Exception as _e:
+            print(f"[PIPER] screen tint error: {_e}")
+
+    # ── rack number, ON key, close key ───────────────────────────────────────────────────────────────
+    br = R(PP_BADGE)
+    _pp_text(str(ai_idx + 1), (br[0] + br[2]) / 2, (br[1] + br[3]) / 2, 22.0, g, PP_METAL, 1.0, "c", glow=0.0)
+    onr = R(PP_ON)
+    if lv > 0.01:
+        _pp_quad(sh, onr[0], onr[1], onr[2], onr[3], (PP_ICE[0], PP_ICE[1], PP_ICE[2], 0.10 * lv), "ADDITIVE")
+    _pp_text("ON", (onr[0] + onr[2]) / 2, (onr[1] + onr[3]) / 2, PP_FS_BTN, g,
+             (PP_METAL_DIM[0] + (PP_TXT_HOT[0] - PP_METAL_DIM[0]) * lv,
+              PP_METAL_DIM[1] + (PP_TXT_HOT[1] - PP_METAL_DIM[1]) * lv,
+              PP_METAL_DIM[2] + (PP_TXT_HOT[2] - PP_METAL_DIM[2]) * lv, 1.0), 1.0, "c", glow=0.8 * lv)
+    _pp_x_glyph(sh, R(PP_CLOSE), (0.85, 0.20, 0.15, 0.95), g)
+
+    # ── preset selector (top rail): < name > — same list/zones as the stock Piper rack ─────────────
+    try:
+        import Racks as _rk
+        _presets = _rk.AI_PRESETS.get("PIPER_TTS", [])
+    except Exception:
+        _presets = []
+    if _presets:
+        p_name = _presets[int(getattr(rack, 'preset_idx', 0)) % len(_presets)]
+        pb = R(PP_PRESET_BOX)
+        if lv > 0.01:
+            _pp_quad(sh, pb[0], pb[1], pb[2], pb[3], (0.0, 0.0, 0.0, 0.45 * lv))
+            _pp_outline(sh, pb, max(1.0, 1.2 * g.s), (PP_ICE[0], PP_ICE[1], PP_ICE[2], 0.55 * lv))
+            _pp_quad(sh, pb[0], pb[1], pb[2], pb[3], (PP_ICE[0], PP_ICE[1], PP_ICE[2], 0.06 * lv), "ADDITIVE")
+        _pp_text(p_name.upper(), (pb[0] + pb[2]) / 2, (pb[1] + pb[3]) / 2, PP_FS_SMALL + 2.0, g, PP_TXT, lv, "c", glow=0.5)
+        for rr_, sgn in ((R(PP_PRESET_PREV), -1), (R(PP_PRESET_NEXT), 1)):
+            ax, ay = (rr_[0] + rr_[2]) / 2, (rr_[1] + rr_[3]) / 2
+            hw, hh = 5.0 * g.s, 6.5 * g.s
+            tip, base = ax + sgn * hw, ax - sgn * hw
+            _pp_tri(sh, [(tip, ay), (base, ay + hh), (base, ay - hh)],
+                    (PP_METAL[0], PP_METAL[1], PP_METAL[2], 0.35 + 0.55 * lv))
+
+    # ── channel keys (rail row above, and the PLACE ON CHANNEL row below) ───────────────────────────
+    group_off = getattr(rack, 'group_idx', 0) * 9
+    for ci in range(9):
+        assigned = bool(getattr(rack, f"ch{ci}", False))
+        for kr in (R(g.top_key(ci)), R(g.bot_key(ci))):
+            if assigned and lv > 0.01:
+                _pp_quad(sh, kr[0] - 2 * g.s, kr[1] - 2 * g.s, kr[2] + 2 * g.s, kr[3] + 2 * g.s,
+                         (PP_ICE[0], PP_ICE[1], PP_ICE[2], 0.10 * lv), "ADDITIVE")
+                _pp_quad(sh, kr[0], kr[1], kr[2], kr[3], (PP_ICE[0], PP_ICE[1], PP_ICE[2], 0.34 * lv), "ADDITIVE")
+            _pp_text(str(group_off + ci + 1), (kr[0] + kr[2]) / 2, (kr[1] + kr[3]) / 2, PP_FS_SMALL + 1.0, g,
+                     PP_TXT_HOT if (assigned and lv > 0.5) else PP_METAL_DIM, 1.0, "c",
+                     glow=0.7 * lv if assigned else 0.0)
+
+    # ── script (left CRT) ────────────────────────────────────────────────────────────────────────────
+    script = getattr(rack, 'ai_text', '') or ''
+    text_active, cursor_pos, sel = False, len(script), (-1, -1)
+    try:
+        from ui.mixer.interaction import _active_text_field as _atf
+        if _atf and _atf.get('ai_idx') == ai_idx:
+            text_active = True
+            cursor_pos = _atf.get('cursor', len(script))
+            ss, se = _atf.get('sel_start', -1), _atf.get('sel_end', -1)
+            if ss >= 0 and se >= 0 and ss != se:
+                sel = (min(ss, se), max(ss, se))
+    except Exception:
+        pass
+    sr = R(PP_SCRIPT)
+    s_, fs_px, lh, wrap_w, max_lines = _pp_text_metrics(sr[2] - sr[0], sr[3] - sr[1])
+    tx0 = sr[0] + 6.0 * s_
+    if lv > 0.01:
+        if not script and not text_active:
+            _pp_text("Click to type script...", tx0, sr[3] - 4.0 * s_ - lh * 0.5, PP_FS_TEXT, g, PP_TXT_DIM, lv)
+        lines = _pp_wrap(script, fs_px, wrap_w)
+        first = max(0, len(lines) - max_lines)
+        cur_line = None
+        for li in range(first, len(lines)):
+            row = li - first
+            if row >= max_lines:
+                break
+            start, line = lines[li]
+            end = lines[li + 1][0] if li + 1 < len(lines) else len(script) + 1
+            cy = sr[3] - 4.0 * s_ - lh * (row + 0.5)
+            if sel[0] >= 0:
+                ov0, ov1 = max(sel[0], start) - start, min(sel[1], start + len(line)) - start
+                if ov0 < ov1:
+                    pre_w = _pp_tw(line[:ov0], fs_px)
+                    sel_w = _pp_tw(line[ov0:ov1], fs_px)
+                    _pp_quad(sh, tx0 + pre_w, cy - lh * 0.5, tx0 + pre_w + max(sel_w, 2 * s_), cy + lh * 0.5,
+                             (0.35, 0.55, 0.95, 0.38 * lv), "ALPHA")
+            _pp_text(line, tx0, cy, PP_FS_TEXT, g, PP_TXT, lv)
+            if text_active and cur_line is None and start <= cursor_pos < end:
+                cur_line = (row, cy, line[:max(0, min(cursor_pos - start, len(line)))], line)
+        if text_active and script and cur_line is None and lines:
+            row = min(len(lines) - 1 - first, max_lines - 1)
+            cur_line = (row, sr[3] - 4.0 * s_ - lh * (row + 0.5), lines[-1][1], lines[-1][1])
+        if text_active and int(now * 2) % 2 == 0:
+            # terminal-style block cursor: a solid phosphor rectangle one character wide, covering the
+            # character it sits on (which is redrawn dark on top so it stays readable)
+            if cur_line is None:
+                cx_, cy_, pre_, full_ = tx0, sr[3] - 4.0 * s_ - lh * 0.5, "", ""
+            else:
+                pre_, full_ = cur_line[2], cur_line[3]
+                cx_, cy_ = tx0 + _pp_tw(pre_, fs_px), cur_line[1]
+            ch_ = full_[len(pre_)] if len(pre_) < len(full_) else ""
+            bw_ = _pp_tw(ch_, fs_px) if ch_ and ch_ != " " else 0.0
+            if bw_ <= 0.0:
+                bw_ = _pp_tw(" ", fs_px) if ch_ == " " else _pp_tw("M", fs_px) * 0.82
+            bw_ = max(bw_, 5.0 * g.s)
+            _pp_quad(sh, cx_, cy_ - fs_px * 0.50, cx_ + bw_, cy_ + fs_px * 0.46, (0.82, 0.92, 1.0, 0.85 * lv))
+            _pp_quad(sh, cx_ - 2 * g.s, cy_ - fs_px * 0.62, cx_ + bw_ + 2 * g.s, cy_ + fs_px * 0.58,
+                     (PP_GLOW_COL[0], PP_GLOW_COL[1], PP_GLOW_COL[2], 0.10 * lv), "ADDITIVE")
+            if ch_ and ch_ != " ":
+                _pp_text(ch_, cx_, cy_, PP_FS_TEXT, g, (0.02, 0.04, 0.07, 1.0), lv)
+        cc = f"{len(script)} / 4096"
+        _pp_text(cc, sr[2] - 4.0 * g.s, sr[1] + 8.0 * g.s, PP_FS_SMALL - 1.5, g, PP_TXT_DIM, lv * 0.8, "r", glow=0.3)
+
+    # ── status message, bottom-left of the script screen (button lettering is baked in the art) ─────
+    if lv > 0.01 and status in ("PROCESSING", "ERROR", "PREVIEWING"):
+        if status == "PROCESSING":
+            msg, mcol, ma = "GENERATING...", PP_TXT_HOT, 0.65 + 0.35 * _pm.sin(now * 6.0)
+        elif status == "ERROR":
+            msg, mcol, ma = "ERROR - CLICK GENERATE TO RETRY", PP_RED, 1.0
+        else:
+            msg, mcol, ma = "PLAYING...", PP_TXT, 0.9
+        _pp_text(msg, sr[0] + 6.0 * g.s, sr[1] + 8.0 * g.s, PP_FS_SMALL + 1.0, g, mcol, lv * ma, "l", glow=0.6)
+
+    # ── voices (right CRT) ───────────────────────────────────────────────────────────────────────────
+    browsing = _browse_mode.get(ai_idx, False)
+    ar_ = R(PP_ADD)
+    if lv > 0.01:
+        _pp_outline(sh, ar_, max(1.0, 1.2 * g.s), (PP_ICE[0], PP_ICE[1], PP_ICE[2], 0.55 * lv))
+        _pp_text("< BACK TO VOICES" if browsing else "+ ADD VOICE", (ar_[0] + ar_[2]) / 2, (ar_[1] + ar_[3]) / 2,
+                 PP_FS_SMALL + 2.0, g, PP_TXT, lv, "c")
+        up, dn = R(PP_ARROW_UP), R(PP_ARROW_DN)
+        cxa = (up[0] + up[2]) / 2
+    def _arrows(can_up, can_dn, label):
+        if lv <= 0.01:
+            return
+        col_u = (PP_TXT[0], PP_TXT[1], PP_TXT[2], (0.9 if can_up else 0.22) * lv)
+        col_d = (PP_TXT[0], PP_TXT[1], PP_TXT[2], (0.9 if can_dn else 0.22) * lv)
+        ut = up[3] - 10.0 * g.s
+        _pp_tri(sh, [(cxa, ut), (cxa - 9 * g.s, ut - 13 * g.s), (cxa + 9 * g.s, ut - 13 * g.s)], col_u)
+        db = dn[1] + 10.0 * g.s
+        _pp_tri(sh, [(cxa, db), (cxa - 9 * g.s, db + 13 * g.s), (cxa + 9 * g.s, db + 13 * g.s)], col_d)
+        if label:
+            _pp_text(label, cxa, (up[1] + dn[3]) / 2, PP_FS_SMALL - 1.5, g, PP_TXT_DIM, lv, "c", glow=0.3)
+
+    if browsing:
+        try:
+            from core.ai_piper import (get_voice_catalog, get_catalog_status, is_voice_installed, get_download_state)
+            catalog = get_voice_catalog()
+            cat_status, cat_err = get_catalog_status()
+        except Exception as _ce:
+            catalog, cat_status, cat_err = [], "ERROR", str(_ce)
+        c0 = R(g.card(0))
+        if cat_status == "LOADING":
+            _pp_text("Loading voice catalog...", c0[0] + 14 * g.s, g.Y(150), PP_FS_CARD, g, PP_TXT_DIM, lv)
+        elif cat_status == "BLOCKED":
+            _pp_text("Online access is disabled.", c0[0] + 14 * g.s, g.Y(140), PP_FS_CARD, g, PP_RED, lv)
+            _pp_text("Enable it in Preferences > Get Extensions > Allow Online Access.", c0[0] + 14 * g.s, g.Y(166),
+                     PP_FS_SUB, g, PP_TXT_DIM, lv)
+        elif cat_status == "ERROR":
+            _pp_text("Could not load catalog:", c0[0] + 14 * g.s, g.Y(140), PP_FS_CARD, g, PP_RED, lv)
+            _pp_text((cat_err or "unknown error")[:70], c0[0] + 14 * g.s, g.Y(166), PP_FS_SUB, g, PP_TXT_DIM, lv)
+        elif not catalog:
+            _pp_text("Catalog is empty.", c0[0] + 14 * g.s, g.Y(150), PP_FS_CARD, g, PP_TXT_DIM, lv)
+        else:
+            n_cat = len(catalog)
+            b_scroll = max(0, min(int(_browse_scroll.get(ai_idx, 0)), max(0, n_cat - PP_CARD_ROWS)))
+            _browse_scroll[ai_idx] = b_scroll
+            for slot in range(PP_CARD_ROWS):
+                vi = b_scroll + slot
+                if vi >= n_cat:
+                    break
+                entry = catalog[vi]
+                cr_ = R(g.card(slot))
+                try:
+                    installed = is_voice_installed(entry['key'])
+                    dls = get_download_state(entry['key'])
+                except Exception:
+                    installed, dls = False, None
+                downloading = bool(dls and dls.get('status') == 'DOWNLOADING')
+                is_err = bool(dls and dls.get('status') == 'ERROR')
+                if lv > 0.01:
+                    _pp_outline(sh, cr_, max(1.0, g.s), (PP_ICE[0], PP_ICE[1], PP_ICE[2], (0.7 if installed else 0.22) * lv))
+                cy = (cr_[1] + cr_[3]) / 2
+                name_line = f"{entry.get('lang_name', '')} - {entry.get('name', '')} ({entry.get('quality', '')})"
+                show_btn = not installed and not downloading
+                max_w = (R(g.dl_btn(slot))[0] - cr_[0] - 22 * g.s) if show_btn else (cr_[2] - cr_[0] - 22 * g.s)
+                fs_px2 = max(1, int(round(PP_FS_CARD * g.s)))
+                while len(name_line) > 4 and _pp_tw(name_line, fs_px2) > max_w:
+                    name_line = name_line[:-1]
+                _pp_text(name_line, cr_[0] + 12 * g.s, cr_[3] - 11 * g.s, PP_FS_CARD, g,
+                         PP_TXT_HOT if installed else PP_TXT, lv)
+                size_mb = (entry.get('onnx_size', 0) or 0) / (1024 * 1024)
+                st_txt = "INSTALLED" if installed else (f"DOWNLOADING {dls.get('pct', 0):.0f}%" if downloading else ("ERROR" if is_err else ""))
+                _pp_text(f"{size_mb:.0f} MB" + (f"   {st_txt}" if st_txt else ""), cr_[0] + 12 * g.s, cr_[1] + 9 * g.s,
+                         PP_FS_SUB, g, PP_RED if is_err else PP_TXT_DIM, lv)
+                if show_btn and lv > 0.01:
+                    db_ = R(g.dl_btn(slot))
+                    _pp_outline(sh, db_, max(1.0, 1.2 * g.s), ((PP_RED[0], PP_RED[1], PP_RED[2]) if is_err else PP_ICE) + (0.8 * lv,))
+                    _pp_text("RETRY" if is_err else "DOWNLOAD", (db_[0] + db_[2]) / 2, (db_[1] + db_[3]) / 2,
+                             PP_FS_SMALL, g, PP_RED if is_err else PP_TXT, lv, "c")
+            lbl = f"{b_scroll + 1}-{min(b_scroll + PP_CARD_ROWS, n_cat)}/{n_cat}" if n_cat > PP_CARD_ROWS else ""
+            _arrows(b_scroll > 0, b_scroll + PP_CARD_ROWS < n_cat, lbl)
+    else:
+        voices, scroll = _pp_voice_state(rack, ai_idx)
+        sel_idx = int(getattr(rack, 'p4', 0.0)) % max(1, len(voices)) if voices else 0
+        if voices:
+            for slot in range(PP_CARD_ROWS):
+                vi = scroll + slot
+                if vi >= len(voices):
+                    break
+                name, onnx_path, _x = voices[vi]
+                cr_ = R(g.card(slot))
+                issel = (vi == sel_idx)
+                if lv > 0.01:
+                    if issel:
+                        _pp_glow_box(sh, cr_, lv, g)
+                    else:
+                        _pp_outline(sh, cr_, max(1.0, g.s), (PP_ICE[0], PP_ICE[1], PP_ICE[2], 0.20 * lv))
+                _pp_text(name, cr_[0] + 12 * g.s, cr_[3] - 11 * g.s, PP_FS_CARD, g, PP_TXT_HOT if issel else PP_TXT, lv)
+                fn = os.path.basename(onnx_path).replace(".onnx", "")
+                _pp_text(fn, cr_[0] + 12 * g.s, cr_[1] + 9 * g.s, PP_FS_SUB, g, PP_TXT_DIM, lv)
+            lbl = f"{scroll + 1}-{min(scroll + PP_CARD_ROWS, len(voices))}/{len(voices)}" if len(voices) > PP_CARD_ROWS else ""
+            _arrows(scroll > 0, scroll + PP_CARD_ROWS < len(voices), lbl)
+        else:
+            c0 = R(g.card(0))
+            _pp_text("No voices found in ai_engines/piper/voices/", c0[0] + 14 * g.s, g.Y(140), PP_FS_CARD, g, PP_TXT_DIM, lv)
+            _pp_text("Click + ADD VOICE above.", c0[0] + 14 * g.s, g.Y(166), PP_FS_CARD, g, PP_TXT_DIM, lv)
+
+    # ── output read-out ──────────────────────────────────────────────────────────────────────────────
+    wr = R(PP_WAVE)
+    try:
+        from core.ai_piper import get_output_wave
+        wave = get_output_wave(ai_idx)
+    except Exception:
+        wave = []
+    if lv > 0.01:
+        cyw = (wr[1] + wr[3]) / 2
+        amp = (wr[3] - wr[1]) * 0.46
+        if wave and len(wave) > 1:
+            n = len(wave)
+            nb = min(n, 520)
+            step = (wr[2] - wr[0]) / nb
+            for b in range(nb):
+                i0, i1 = int(b * n / nb), max(int(b * n / nb) + 1, int((b + 1) * n / nb))
+                a_ = max(abs(v) for v in wave[i0:i1])
+                h_ = max(1.0 * g.s, a_ * amp)
+                x0_ = wr[0] + b * step
+                _pp_quad(sh, x0_, cyw - h_, x0_ + step * 0.72, cyw + h_, (0.55, 0.78, 1.0, 0.80 * lv))
+            _pp_quad(sh, wr[0], cyw - 0.5 * g.s, wr[2], cyw + 0.5 * g.s, (0.8, 0.92, 1.0, 0.35 * lv))
+        else:
+            _pp_quad(sh, wr[0], cyw - 0.6 * g.s, wr[2], cyw + 0.6 * g.s, (0.5, 0.7, 1.0, 0.18 * lv), "ADDITIVE")
+            if status != "DONE":
+                _pp_text("CLICK GENERATE TO SYNTHESISE", (wr[0] + wr[2]) / 2, cyw, PP_FS_SMALL, g, PP_TXT_DIM, lv, "c", glow=0.3)
+
+    # ── knobs ────────────────────────────────────────────────────────────────────────────────────────
+    for ki, (kx, ky) in enumerate(PP_KNOBS):
+        v = max(0.0, min(1.0, float(getattr(rack, f"p{ki}", (0.5, 0.667, 0.8)[ki]))))
+        cx, cy = g.X(kx), g.Y(ky)
+        _pp_pointer(sh, cx, cy, PP_KNOB_PTR_LEN * g.s, PP_KNOB_PTR_W * g.s, PP_KNOB_START_DEG - PP_KNOB_SWEEP * v)
+        vs = f"{2.0 - v * 1.5:.1f}x" if ki == 0 else f"{v:.2f}"
+        _pp_text(vs, cx, g.Y(ky - 33.0), PP_FS_SMALL + 2.0, g, PP_METAL, 1.0, "c", glow=0.3)
+
+    # ── status bar + LED ─────────────────────────────────────────────────────────────────────────────
+    voices_all = []
+    try:
+        from core.ai_piper import get_voices
+        voices_all = get_voices()
+    except Exception:
+        pass
+    voice_name = "no voice loaded"
+    if voices_all:
+        vi = int(getattr(rack, 'p4', 0.0)) % max(1, len(voices_all))
+        voice_name = os.path.basename(voices_all[vi][1]).replace(".onnx", "")
+    sb = R(PP_STATUS)
+    _pp_text(f"ENGINE: piper.exe  |  MODEL: {voice_name}  |  OFFLINE", sb[0] + 14 * g.s, (sb[1] + sb[3]) / 2,
+             PP_FS_SMALL, g, PP_TXT, lv * 0.85, glow=0.4)
+    led_cols = {'READY': (0.20, 0.95, 0.45), 'PROCESSING': (1.0, 0.65, 0.15), 'PREVIEWING': (0.65, 0.4, 1.0),
+                'DONE': (0.20, 0.95, 0.45), 'ERROR': (1.0, 0.15, 0.1)}
+    lc = led_cols.get(status, led_cols['READY'])
+    lx, ly = g.X(PP_LED[0]), g.Y(PP_LED[1])
+    for rad, a in ((11.0, 0.10), (7.0, 0.22), (4.4, 0.95)):
+        rr = rad * g.s
+        pts = []
+        for k in range(24):
+            a0, a1 = 2 * _pm.pi * k / 24, 2 * _pm.pi * (k + 1) / 24
+            pts += [(lx, ly), (lx + rr * _pm.cos(a0), ly + rr * _pm.sin(a0)), (lx + rr * _pm.cos(a1), ly + rr * _pm.sin(a1))]
+        _pp_tri(sh, pts, (lc[0], lc[1], lc[2], a * lv), "ADDITIVE" if rad > 5 else "ALPHA")

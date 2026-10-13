@@ -157,7 +157,7 @@ def draw_callback_px(self, context) -> None:
         blf.size(0, int(20 * UI_SCALE))
         blf.position(0, STRIP_LEFT_MARGIN*UI_SCALE + SCROLL_X,
                      height - 40*UI_SCALE - SCROLL_Y, 0)
-        blf.draw(0, f"PEDALBOARD HUD | Scale: {round(UI_SCALE, 2)}")
+        blf.draw(0, f"THE HIJACKER | Scale: {round(UI_SCALE, 2)}")
 
         # PACK-A-PUNCH trigger button — fixed top-right, screen-space
         # (not SCROLL_X/Y-shifted, see packapunch_button_rect's docstring).
@@ -219,6 +219,7 @@ def draw_callback_px(self, context) -> None:
         except Exception:
             pass
 
+        _ember_jobs = []   # packApunch embers: queued here, drawn AFTER the strip controls so they fly on top
         # ── 3-part strip skin backgrounds (drawn per group, once per group's strips) ──
         # Drawn BEFORE strip elements so knobs/faders draw on top of the background.
         try:
@@ -246,6 +247,15 @@ def draw_callback_px(self, context) -> None:
                 _dx       = _SLM * UI_SCALE + _g*9*_SSTRIDE*UI_SCALE + SCROLL_X
                 _dw       = _n2 * _SSTRIDE * UI_SCALE + (_SW - _SSTRIDE) * UI_SCALE
 
+                # packApunch: animated lava cracks on the desk art (sends section / upper part), drawn over the desk
+                # art but under the strip slices; it fades out toward the seam where the strip-bottom art starts
+                try:
+                    from ui.mixer.lava_fx import draw_desk_lava as _desk_lava
+                    _seam_y = base_y - (_SHH + _SGH + 12 + 12) * UI_SCALE - _send_h2 + 7 * UI_SCALE   # top edge of the strip-bottom art
+                    _desk_lava(_dx, base_y - _strip_h_fixed, _dw, _strip_h_fixed, seam_y=_seam_y, scale=UI_SCALE)
+                except Exception:
+                    pass
+
                 # Top slice: HEADER + GAIN  (135px at scale 1)
                 _top_h2 = (_SHH + _SGH) * UI_SCALE
                 _tex = _gt("strip_top_bg")
@@ -264,7 +274,26 @@ def draw_callback_px(self, context) -> None:
                 _bot_h2  = (_SEQ + _SPAN + _FTP + _FH + _NBH + _FBP) * UI_SCALE
                 _bot_top = base_y - (_SHH + _SGH + 12 + 12) * UI_SCALE - _send_h2
                 _btex = _gt("strip_bottom_bg")
-                if _btex: _bt(_btex, _dx, _bot_top - _bot_h2, _dw, _bot_h2, key="strip_bottom_bg")
+                # the strip-bottom art is 572px tall: the original 565 plus 7px extending UP over the desk art for a
+                # cleaner blend at the seam (bottom edge unchanged)
+                _bot_ht = _bot_h2 + 7 * UI_SCALE
+                if _btex: _bt(_btex, _dx, _bot_top - _bot_h2, _dw, _bot_ht, key="strip_bottom_bg")
+                if _btex:
+                    try:   # packApunch: animated lava cracks on top of the (dimmed) strip art
+                        from ui.mixer.lava_fx import draw_strip_lava as _lava, draw_embers as _embers
+                        _lava(_dx, _bot_top - _bot_h2, _dw, _bot_ht, group=_g, scale=UI_SCALE)
+                        # embers fly over the whole desk height (sends section + strips); drawn later, on top of everything
+                        _ember_jobs.append((_dx, base_y, _dw, (_dx, _bot_top - _bot_h2, _dw, _bot_ht),
+                                            (_dx, base_y - _strip_h_fixed, _dw, _strip_h_fixed), _g))
+                    except Exception:
+                        pass
+                try:   # packApunch: the knob caps are in the art; draw only the live pointers on them
+                    from ui.mixer import knob_fx as _kfx
+                    if _kfx.art_knobs_active():
+                        _kfx.draw_group_knobs((_dx, base_y - _top_h2, _dw, _top_h2),
+                                              (_dx, _bot_top - _bot_h2, _dw, _bot_ht), tracks, _g * 9, _n2)
+                except Exception as _ek:
+                    print(f"[KNOBS] {_ek}")
         except Exception as _e3:
             pass
 
@@ -302,6 +331,15 @@ def draw_callback_px(self, context) -> None:
             peak  = _meters_mod._peak_hold[i]     if i < MAX_CHANNELS else 0.0
             draw_channel_strip(i, track, sx, base_y, UI_SCALE, tracks,
                                eng, peak, group_idx)
+
+        # packApunch embers: the top layer of the desk, over the knobs, buttons and faders
+        if _ember_jobs:
+            try:
+                from ui.mixer.lava_fx import draw_embers as _embers_top
+                for _ej in _ember_jobs:
+                    _embers_top(_ej[0], _ej[1], _ej[2], _ej[3], _ej[4], group=_ej[5])
+            except Exception:
+                pass
 
         # Racks
         try:

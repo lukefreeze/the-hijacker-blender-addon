@@ -111,6 +111,4 @@ def reset_engine():
     _engine_attempted  = False
 
 
-# Kept for import compatibility — no longer installs pedalboard wheel
-PEDALBOARD_AVAILABLE = True
 HIJACKER_AVAILABLE   = True
