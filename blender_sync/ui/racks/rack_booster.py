@@ -56,12 +56,12 @@ RACK_RAIL_H = 32
 BST_PP_SKIN       = "packapunch"
 BST_PP_ART_W      = 1988.0
 BST_PP_ART_H      = 528.0
-BST_PP_KNOB_POS   = (319.5, 288.5)   # centre of the baked knob disc
-BST_PP_KNOB_SIZE  = (281.0, 285.0)   # sprite draw size (art px); disc edge lands at r≈140, just inside the gold teeth
-BST_PP_HIT_R      = 140.0            # hit radius (art px)
+BST_PP_KNOB_POS   = (313.5, 277.5)    # centre of the knob cap
+BST_PP_KNOB_SIZE  = (219.0, 219.0)   # the rotating cap, drawn 1:1 over the cap baked into the art
+BST_PP_HIT_R      = 150.0            # hit radius (art px)
 BST_PP_SWEEP      = 270.0            # degrees of travel, min = lower-left (-135), max = lower-right (+135)
 BST_PP_KNOB_KEY   = "rack_booster_knob"
-BST_PP_KNOB_LINE  = 36.0             # angle of the red line in the sprite, degrees clockwise from up
+BST_PP_KNOB_LINE  = 0.0              # angle of the red pointer in the sprite, degrees clockwise from up
 BST_PP_VALUE_POS  = (314.0, 504.5)   # centre of the "+6.0 dB" readout (art px)
 BST_PP_VALUE_PX   = 21.0             # readout font size (art px)
 BST_PP_VALUE_COL  = (0.80, 0.79, 0.76, 0.95)
@@ -87,7 +87,7 @@ def booster_pp_knob_geom(rack_x, rack_y, rw, rh):
             BST_PP_KNOB_SIZE[0] * 0.5 * sr, BST_PP_HIT_R * sr)
 
 
-def _bst_pp_draw_knob(rx, ry, rw, rh, boost_norm, boost_str):
+def _bst_pp_draw_knob(rx, ry, rw, rh, boost_norm, boost_str, power=1.0):
     """packApunch knob: lit sprite turned to the value, plus the live readout. Returns True if drawn."""
     try:
         from ui.mixer.texture_cache import get_texture as _gtc_k, blit_texture_rotated as _blt_rot
@@ -107,11 +107,457 @@ def _bst_pp_draw_knob(rx, ry, rw, rh, boost_norm, boost_str):
         vx = rx + BST_PP_VALUE_POS[0] * sx
         vy = ry + (1.0 - BST_PP_VALUE_POS[1] / BST_PP_ART_H) * rh
         tw = _text_width(boost_str, fs)
-        _draw_text(boost_str, vx - tw / 2, vy - fs / 2, fs, BST_PP_VALUE_COL)
+        _draw_text(boost_str, vx - tw / 2, vy - fs / 2, fs,
+                   (BST_PP_VALUE_COL[0], BST_PP_VALUE_COL[1], BST_PP_VALUE_COL[2], BST_PP_VALUE_COL[3] * power))
         return True
     except Exception as _e_bk:
         print(f"[BOOSTER] knob draw error: {_e_bk}")
         return False
+
+
+# =============================================================================
+# PACKAPUNCH SKIN (CHIMICHANGA / "The Booster") - live parts placed in ART pixels
+# Everything below is in rack_booster_bg.png space (1988 x 528), y measured from the TOP.
+# The art itself carries no live text: the meter cells, the preset name, the output channel,
+# the free-channel list, the status word, the rack number and the keypad digits are all drawn here.
+# =============================================================================
+BST_PP_METER_X0    = 637.0                  # left edge of cell 0
+BST_PP_METER_PITCH = (1057.0 - 637.0) / 18.0
+BST_PP_METER_CELLS = 31
+BST_PP_METER_CW    = 14.0                   # cell width
+BST_PP_IN_Y        = (138.0, 180.0)         # IN meter cell row (y0, y1)
+BST_PP_OUT_Y       = (218.0, 260.0)         # OUT meter cell row
+BST_PP_DB_IN       = (1338.0, 131.0)        # centre of the little dB read-out (IN)
+BST_PP_DB_OUT      = (1338.0, 212.0)
+BST_PP_DB_PX       = 15.0
+BST_PP_PRESET_BTNS = [                      # (rect x0,y0,x1,y1, boost_norm); top row +24 +30 +40, bottom row +6 +12 +18
+    ((612.0, 295.0, 840.0, 357.0), 24 / 40.0),
+    ((856.0, 295.0, 1144.0, 357.0), 30 / 40.0),
+    ((1159.0, 295.0, 1397.0, 357.0), 1.0),
+    ((612.0, 372.0, 840.0, 436.0), 6 / 40.0),
+    ((856.0, 372.0, 1144.0, 436.0), 12 / 40.0),
+    ((1159.0, 372.0, 1397.0, 436.0), 18 / 40.0),
+]
+BST_PP_APPLY       = (614.0, 452.0, 1274.0, 507.0)
+BST_PP_LIMIT       = (1290.0, 459.0, 1394.0, 503.0)
+BST_PP_LIMIT_BAR   = (1376.0, 458.0, 1396.0, 505.0)   # patch rects (match the PNGs)
+BST_PP_LIMIT_X     = (1316.0, 461.0, 1362.0, 502.0)
+BST_PP_STEPPER     = (1426.0, 406.0, 1905.0, 444.0)   # output channel box (the - and + are baked at its ends)
+BST_PP_FREE_POS    = (1434.0, 455.0)        # left edge / centre line of the free-channel list
+BST_PP_FREE_PX     = 12.0
+BST_PP_STATUS_DOT  = (1440.0, 508.0, 7.0)
+BST_PP_STATUS_POS  = (1456.0, 508.0)
+BST_PP_STATUS_PX   = 15.0
+BST_PP_CREAM       = (0.90, 0.87, 0.80, 1.0)
+BST_PP_AMBER       = (0.96, 0.66, 0.26, 1.0)
+
+
+# The bullet casings round the knob: (clock angle in degrees from straight up, x, y of its 36 x 36 cell in the art),
+# in the order of the cells in rack_booster_bullets_lit.png (8 cells per row). The atlas holds ONLY the casings' own pixels
+# (cut out of the art as a mask, in a lit colour), so lighting one lights exactly that casing and nothing around it.
+BST_PP_BULLET_CELL = 36
+BST_PP_BULLET_COLS = 8
+BST_PP_BULLET_ATLAS = 288.0
+BST_PP_BULLET_CELLS = [
+    (-174.4, 280, 408),
+    (-168.1, 264, 404),
+    (-161.9, 248, 401),
+    (-155.3, 233, 393),
+    (-149.1, 219, 386),
+    (-142.7, 204, 377),
+    (-136.6, 191, 368),
+    (-130.1, 180, 355),
+    (-123.9, 171, 342),
+    (-117.6, 164, 327),
+    (-111.2, 157, 312),
+    (-104.6, 153, 295),
+    (-98.6, 151, 280),
+    (-91.9, 150, 263),
+    (-85.6, 151, 247),
+    (-79.2, 153, 231),
+    (-73.0, 157, 216),
+    (-66.5, 163, 201),
+    (-60.4, 170, 187),
+    (-54.1, 178, 174),
+    (-47.6, 188, 162),
+    (-41.5, 199, 150),
+    (-35.6, 211, 141),
+    (-29.4, 224, 132),
+    (-23.3, 238, 126),
+    (-17.2, 252, 120),
+    (-11.3, 266, 117),
+    (-5.4, 281, 114),
+    (0.6, 296, 114),
+    (6.6, 311, 114),
+    (12.6, 326, 117),
+    (18.4, 341, 120),
+    (24.3, 355, 126),
+    (30.5, 369, 132),
+    (36.5, 382, 141),
+    (42.5, 394, 150),
+    (48.6, 404, 162),
+    (54.6, 414, 174),
+    (60.8, 423, 187),
+    (67.0, 430, 201),
+    (73.3, 436, 216),
+    (79.4, 440, 231),
+    (85.6, 442, 247),
+    (92.0, 443, 264),
+    (98.3, 441, 280),
+    (104.5, 439, 296),
+    (110.7, 435, 312),
+    (117.0, 429, 327),
+    (123.0, 422, 341),
+    (129.0, 413, 354),
+    (135.5, 402, 368),
+    (141.5, 390, 378),
+    (147.8, 376, 388),
+    (153.9, 362, 396),
+    (159.9, 346, 399),
+    (166.2, 330, 403),
+    (172.4, 315, 407),
+    (179.1, 297, 408),
+]
+# Preset-button glow layer: the six button faces + lamps cut out as masks, in the lit colour (added on top, so only
+# the button shape lights up). Origin and size of that picture in art px:
+BST_PP_GLOW_RECT = (600.0, 285.0, 1410.0, 445.0)
+BST_PP_FADE = 14.0                                      # how fast lights fade in / out (per second)
+
+_bst_levels = {}
+
+
+def _bst_level(key, target, now=None):
+    """Smoothly eased 0..1 light level for one lamp (so things switch on / off instead of snapping)."""
+    now = time.monotonic() if now is None else now
+    lv, t0 = _bst_levels.get(key, (target, now))
+    dt = max(0.0, min(0.25, now - t0))
+    lv += (target - lv) * min(1.0, dt * BST_PP_FADE)
+    if abs(lv - target) < 0.004:
+        lv = target
+    _bst_levels[key] = (lv, now)
+    return lv
+
+
+class _BstG:
+    """Art-pixel -> screen mapping for one rack draw."""
+    def __init__(self, rx, ry, rw, rh):
+        self.rx, self.ry, self.rw, self.rh = rx, ry, rw, rh
+        self.sx, self.sy = rw / BST_PP_ART_W, rh / BST_PP_ART_H
+
+    def X(self, ax):
+        return self.rx + ax * self.sx
+
+    def Y(self, ay):
+        return self.ry + (1.0 - ay / BST_PP_ART_H) * self.rh
+
+    def rect(self, r):
+        return (self.X(r[0]), self.Y(r[3]), self.X(r[2]), self.Y(r[1]))   # x0, y0(bottom), x1, y1(top)
+
+
+def booster_pp_active():
+    return _bst_pp_active()
+
+
+def _bst_in(r, mx, my):
+    return r[0] <= mx <= r[2] and r[1] <= my <= r[3]
+
+
+def booster_pp_hit(mx, my, rack_x, rack_y, rw, rh):
+    """Click zones of the packApunch booster layout (same zone names as the old layout), or None."""
+    g = _BstG(rack_x, rack_y, rw, rh)
+    if _bst_in(g.rect(BST_PP_APPLY), mx, my):
+        return {'zone': 'booster_apply'}
+    if _bst_in(g.rect(BST_PP_LIMIT), mx, my):
+        return {'zone': 'booster_limiter'}
+    for r, norm in BST_PP_PRESET_BTNS:
+        if _bst_in(g.rect(r), mx, my):
+            return {'zone': 'booster_preset', 'boost_norm': norm}
+    st = g.rect(BST_PP_STEPPER)
+    if _bst_in(st, mx, my):
+        third = (st[2] - st[0]) / 6.0
+        if mx <= st[0] + third:
+            return {'zone': 'booster_ch_minus'}
+        if mx >= st[2] - third:
+            return {'zone': 'booster_ch_plus'}
+    return None
+
+
+def _bst_text(text, x, cy, fs_art, g, col, align="l", glow=0.0, glow_col=None, max_w=None):
+    """Text at x (left / centre / right by align), vertically centred on cy (screen px)."""
+    if not text:
+        return 0.0
+    try:
+        from ui.racks.pp_text import draw_text as _pdt, text_width as _ptw
+    except Exception:
+        _pdt = _ptw = None
+    fs = max(1, int(round(fs_art * g.sy)))
+    tw = _ptw(text, fs) if _ptw else _text_width(text, fs)
+    if max_w is not None and tw > max_w > 0:
+        fs = max(1, int(fs * max_w / tw))
+        tw = _ptw(text, fs) if _ptw else _text_width(text, fs)
+    if align == "c":
+        x -= tw / 2
+    elif align == "r":
+        x -= tw
+    y = cy - fs * 0.36
+    if _pdt:
+        _pdt(text, x, y, fs, col, glow=glow, glow_col=(glow_col or col))
+    else:
+        _draw_text(text, x, y, fs, col)
+    return tw
+
+
+def _bst_quad(sh, pts, col, blend="ALPHA"):
+    gpu.state.blend_set(blend)
+    sh.bind()
+    sh.uniform_float("color", col)
+    batch_for_shader(sh, "TRIS", {"pos": [pts[0], pts[1], pts[2], pts[0], pts[2], pts[3]]}).draw(sh)
+    gpu.state.blend_set("ALPHA")
+
+
+def _bst_disc(sh, cx, cy, rx_, ry_, col, blend="ALPHA", seg=24):
+    pts = []
+    for i in range(seg):
+        a0 = 2 * math.pi * i / seg
+        a1 = 2 * math.pi * (i + 1) / seg
+        pts += [(cx, cy), (cx + rx_ * math.cos(a0), cy + ry_ * math.sin(a0)),
+                (cx + rx_ * math.cos(a1), cy + ry_ * math.sin(a1))]
+    gpu.state.blend_set(blend)
+    sh.bind()
+    sh.uniform_float("color", col)
+    batch_for_shader(sh, "TRIS", {"pos": pts}).draw(sh)
+    gpu.state.blend_set("ALPHA")
+
+
+def _bst_patch(g, key, art_rect, alpha=1.0):
+    try:
+        from ui.mixer.texture_cache import get_texture as _gt, blit_texture as _bt
+        tex = _gt(key)
+        if tex is None:
+            return False
+        r = g.rect(art_rect)
+        _bt(tex, r[0], r[1], r[2] - r[0], r[3] - r[1], alpha=alpha, key=key)
+        return True
+    except Exception:
+        return False
+
+
+def _bst_db_pos(v):
+    """Meter position 0..1 for a linear level: a dB scale (-60 .. 0) moves like a real meter; linear would sit in the
+    first few cells for speech."""
+    if v <= 0.0001:
+        return 0.0
+    return max(0.0, min(1.0, (20.0 * math.log10(min(v, 1.0)) + 60.0) / 60.0))
+
+
+BST_PP_METER_FALL = 0.40        # seconds for the cells to drain to zero when the rack is switched off
+BST_PP_METER_UP   = 0.45        # seconds for the sweep up to full when the rack is switched on
+BST_PP_METER_DOWN = 0.70        # seconds to settle back from full to the real level
+
+_bst_meter_state = {}
+
+
+def _bst_ease(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _bst_meter_disp(rack_idx, enabled, name, live, now):
+    """Displayed meter position for one meter. Off: drains to zero. Switch-on: sweeps up to full, then falls back to
+    the real level, then follows it live. Returns (position 0..1, phase) with phase 'off' / 'up' / 'down' / 'live'."""
+    st = _bst_meter_state.get(rack_idx)
+    if st is None:                                   # first sight: no animation
+        st = {"en": bool(enabled), "t0": now - 999.0, "start": {}, "last": {}}
+        _bst_meter_state[rack_idx] = st
+    if bool(enabled) != st["en"]:
+        st["en"], st["t0"] = bool(enabled), now
+        st["start"] = dict(st["last"])               # where each meter was at the moment of the switch
+    t = now - st["t0"]
+    s0 = st["start"].get(name, 0.0)
+    if not st["en"]:
+        pos = s0 * max(0.0, 1.0 - t / BST_PP_METER_FALL)
+        phase = "off"
+    elif t < BST_PP_METER_UP:
+        pos = s0 + (1.0 - s0) * _bst_ease(t / BST_PP_METER_UP)
+        phase = "up"
+    elif t < BST_PP_METER_UP + BST_PP_METER_DOWN:
+        pos = 1.0 + (live - 1.0) * _bst_ease((t - BST_PP_METER_UP) / BST_PP_METER_DOWN)
+        phase = "down"
+    else:
+        pos = live
+        phase = "live"
+    st["last"][name] = pos
+    return pos, phase
+
+
+def _bst_pp_meter(g, sh, y_rng, pos, peak_pos, is_out, db_pos, db_str, db_level):
+    """Lit cells over the dimmed baked cell row (pos 0..1), plus the dB read-out (db_str '' = none)."""
+    n = BST_PP_METER_CELLS
+    lit = int(pos * n + 0.5)
+    pk = int(peak_pos * n) if (peak_pos is not None and peak_pos > 0.0) else -1
+    for i in range(min(lit, n)):
+        f = i / float(n - 1)
+        if f > 0.90:
+            c = (1.00, 0.30, 0.22, 0.97)
+        elif f > 0.70:
+            c = (1.00, 0.62, 0.28, 0.97)
+        else:
+            c = (0.82, 0.46, 0.41, 0.97) if not is_out else (0.95, 0.58, 0.40, 0.97)
+        x0 = BST_PP_METER_X0 + BST_PP_METER_PITCH * i
+        r = g.rect((x0, y_rng[0], x0 + BST_PP_METER_CW, y_rng[1]))
+        _bst_quad(sh, [(r[0], r[1]), (r[2], r[1]), (r[2], r[3]), (r[0], r[3])], c)
+        _bst_quad(sh, [(r[0], r[1]), (r[2], r[1]), (r[2], r[3]), (r[0], r[3])], (0.35, 0.10, 0.06, 0.20), "ADDITIVE")
+    if 0 <= pk < n and pk >= lit:
+        x0 = BST_PP_METER_X0 + BST_PP_METER_PITCH * pk
+        r = g.rect((x0, y_rng[0], x0 + BST_PP_METER_CW, y_rng[1]))
+        _bst_quad(sh, [(r[0], r[1]), (r[2], r[1]), (r[2], r[3]), (r[0], r[3])], (1.0, 0.85, 0.7, 0.55), "ADDITIVE")
+    if db_str:
+        col = _GREEN if db_level < 0.7 else (_AMBER if db_level < 0.9 else _RED)
+        _bst_text(db_str, g.X(db_pos[0]), g.Y(db_pos[1]), BST_PP_DB_PX, g, (col[0], col[1], col[2], 0.95), "c")
+
+
+def _bst_pp_bullets(g, sh, boost_norm, power=1.0):
+    """Light the baked bullet casings (just their own shapes) from the knob's minimum up to its value."""
+    try:
+        from ui.mixer.texture_cache import get_texture as _gt, blit_texture_tinted as _btt
+        tex = _gt("rack_booster_bullets_lit")
+    except Exception:
+        return
+    if tex is None:
+        return
+    v = max(0.0, min(1.0, boost_norm))
+    target = (v - 0.5) * BST_PP_SWEEP
+    half = BST_PP_SWEEP / 2.0 + 2.0
+    cell, cols, at = BST_PP_BULLET_CELL, BST_PP_BULLET_COLS, BST_PP_BULLET_ATLAS
+    for i, (clk, ox, oy) in enumerate(BST_PP_BULLET_CELLS):
+        if abs(clk) > half:
+            continue
+        k = max(0.0, min(1.0, (target - clk) / 3.0 + 0.5))
+        if v <= 0.0:
+            k = 0.0
+        k *= power
+        if k <= 0.004:
+            continue
+        row, col = divmod(i, cols)
+        uv = (col * cell / at, 1.0 - (row + 1) * cell / at, (col + 1) * cell / at, 1.0 - row * cell / at)
+        _btt(tex, g.X(ox), g.Y(oy + cell), cell * g.sx, cell * g.sy, color=(k, k, k, k),
+             blend="ALPHA_PREMULT", uv=uv, key="rack_booster_bullets_lit")
+
+
+def _bst_pp_btn_glow(g, rect, k):
+    """Switch a preset button on: its own lit face + lamp (cut from the art) added over it at level k."""
+    if k <= 0.004:
+        return
+    try:
+        from ui.mixer.texture_cache import get_texture as _gt, blit_texture_tinted as _btt
+        tex = _gt("rack_booster_btn_glow")
+        if tex is None:
+            return
+        gx0, gy0, gx1, gy1 = BST_PP_GLOW_RECT
+        gw, gh = gx1 - gx0, gy1 - gy0
+        pad = 3.0
+        x0, y0, x1, y1 = rect[0] - pad, rect[1] - pad, rect[2] + pad, rect[3] + pad
+        uv = ((x0 - gx0) / gw, 1.0 - (y1 - gy0) / gh, (x1 - gx0) / gw, 1.0 - (y0 - gy0) / gh)
+        r = g.rect((x0, y0, x1, y1))
+        _btt(tex, r[0], r[1], r[2] - r[0], r[3] - r[1], color=(k, k, k, k), blend="ADDITIVE_PREMULT",
+             uv=uv, key="rack_booster_btn_glow")
+    except Exception:
+        pass
+
+
+def _bst_pp_draw_body(rx, ry, rw, rh, rack, rack_idx, scale):
+    """Live parts of the packApunch booster. Returns True when drawn (the bg + knob + keypad + rail are drawn elsewhere)."""
+    g = _BstG(rx, ry, rw, rh)
+    sh = _get_shader()
+    boost_norm = getattr(rack, 'p0', 0.30)
+    limiter_on = getattr(rack, 'p1', 1.0) > 0.5
+    target_ch = int(getattr(rack, 'p2', 0))
+    boost_db = boost_norm * 40.0
+    boost_str = f"+{boost_db:.1f} dB"
+    gain_lin = 10.0 ** (boost_db / 20.0)
+    status = getattr(rack, 'ai_status', 'READY')
+    if status not in ('READY', 'PROCESSING', 'DONE', 'ERROR', 'NO_CHANNEL'):
+        status = 'READY'
+    enabled = getattr(rack, 'enabled', True)
+
+    # skin background (full rack height - rail, title, rack-number plate and keypad frame are baked in)
+    try:
+        from ui.mixer.texture_cache import get_texture as _gtc_bs, blit_texture as _blt_bs
+        _tex = _gtc_bs("rack_booster_bg")
+        if not _tex:
+            return False
+        _blt_bs(_tex, rx, ry, rw, rh, key="rack_booster_bg")
+    except Exception:
+        return False
+
+    # knob + its value
+    _now = time.monotonic()
+    # the lights fade out with the rack, the same fade as the preset name (rack_base._pp_preset_level)
+    try:
+        from ui.racks.rack_base import _pp_preset_level as _ppl
+        power = _ppl(rack_idx, enabled, _now)
+    except Exception:
+        power = 1.0 if enabled else 0.0
+    _bst_pp_bullets(g, sh, boost_norm, power)
+    _bst_pp_draw_knob(rx, ry, rw, rh, boost_norm, boost_str, power)
+
+    # meters
+    in_rms, in_peak = _get_live_levels(rack)
+    out_rms = _tanh_limit(in_rms * gain_lin) if limiter_on else min(in_rms * gain_lin, 1.0)
+    out_peak = _tanh_limit(in_peak * gain_lin) if limiter_on else min(in_peak * gain_lin, 1.0)
+    pin, ph_in = _bst_meter_disp(rack_idx, enabled, "in", _bst_db_pos(in_rms), _now)
+    pout, ph_out = _bst_meter_disp(rack_idx, enabled, "out", _bst_db_pos(out_rms), _now)
+    pk_in = _bst_db_pos(in_peak) if (ph_in == "live" and in_peak > 0.001) else None
+    pk_out = _bst_db_pos(out_peak) if (ph_out == "live" and out_peak > 0.001) else None
+    _bst_pp_meter(g, sh, BST_PP_IN_Y, pin, pk_in, False, BST_PP_DB_IN,
+                  _level_to_dbfs(in_rms) if ph_in == "live" else "", in_rms)
+    _bst_pp_meter(g, sh, BST_PP_OUT_Y, pout, pk_out, True, BST_PP_DB_OUT,
+                  _level_to_dbfs(out_rms) if ph_out == "live" else "", out_rms)
+
+    # preset buttons: the one matching the current boost switches on (its own face and lamp light up, nothing else)
+    for bi, (r, norm) in enumerate(BST_PP_PRESET_BTNS):
+        _bst_pp_btn_glow(g, r, _bst_level((rack_idx, bi), 1.0 if abs(boost_norm - norm) < 0.015 else 0.0, _now) * power)
+
+    # apply button: the baked art says APPLY BOOST; other states get a plate over the label
+    ap = g.rect(BST_PP_APPLY)
+    if status != 'READY':
+        if status == 'PROCESSING':
+            pulse = 0.5 + 0.5 * math.sin(time.time() * 5.0)
+            plate, txt, col = (0.30, 0.05, 0.03, 1.0), "BOOSTING...", (1.0, 0.70 + 0.2 * pulse, 0.25, 1.0)
+            _bst_quad(sh, [(ap[0], ap[1]), (ap[2], ap[1]), (ap[2], ap[3]), (ap[0], ap[3])], (1.0, 0.5, 0.2, 0.10 + 0.12 * pulse), "ADDITIVE")
+        elif status == 'DONE':
+            plate, txt, col = (0.05, 0.22, 0.09, 1.0), "DONE  (apply again)", _GREEN
+        elif status == 'ERROR':
+            plate, txt, col = (0.22, 0.03, 0.03, 1.0), "ERROR - RETRY", (1.0, 0.45, 0.35, 1.0)
+        else:
+            plate, txt, col = (0.20, 0.08, 0.04, 1.0), "NO CHANNEL", (0.85, 0.60, 0.30, 1.0)
+        p = g.rect((BST_PP_APPLY[0] + 8.0, BST_PP_APPLY[1] + 7.0, BST_PP_APPLY[2] - 8.0, BST_PP_APPLY[3] - 7.0))
+        _bst_quad(sh, [(p[0], p[1]), (p[2], p[1]), (p[2], p[3]), (p[0], p[3])], plate)
+        _bst_text(txt, (ap[0] + ap[2]) / 2, (ap[1] + ap[3]) / 2, 26.0, g, col, "c")
+
+    # limiter: green bar = limiter on, red cross = off (full send)
+    if limiter_on:
+        _bst_patch(g, "rack_booster_limit_bar", BST_PP_LIMIT_BAR)
+    else:
+        _bst_patch(g, "rack_booster_limit_x", BST_PP_LIMIT_X)
+
+    # output channel + free channels + status
+    st = g.rect(BST_PP_STEPPER)
+    ch_display = f"ch {target_ch}" if target_ch > 0 else "auto"
+    _bst_text(ch_display, (st[0] + st[2]) / 2, (st[1] + st[3]) / 2, 24.0, g, BST_PP_AMBER, "c", glow=0.25, glow_col=(1.0, 0.55, 0.15, 1.0))
+    free = _get_free_channels()
+    if free:
+        _bst_text("free: " + " ".join(str(c) for c in free), g.X(BST_PP_FREE_POS[0]), g.Y(BST_PP_FREE_POS[1]),
+                  BST_PP_FREE_PX, g, (0.92, 0.66, 0.36, 0.95), "l")
+    dot_cols = {'READY': (0.96, 0.72, 0.22, 1.0), 'PROCESSING': (1.0, 0.80, 0.25, 1.0), 'DONE': (0.20, 0.92, 0.40, 1.0),
+                'ERROR': (1.0, 0.25, 0.20, 1.0), 'NO_CHANNEL': (0.45, 0.40, 0.38, 1.0)}
+    dc = dot_cols.get(status, dot_cols['READY'])
+    dx_, dy_, dr_ = BST_PP_STATUS_DOT
+    _bst_disc(sh, g.X(dx_), g.Y(dy_), dr_ * g.sx, dr_ * g.sy, dc)
+    _bst_disc(sh, g.X(dx_), g.Y(dy_), dr_ * 1.9 * g.sx, dr_ * 1.9 * g.sy, (dc[0], dc[1], dc[2], 0.16), "ADDITIVE")
+    _bst_text({'PROCESSING': 'BUSY', 'NO_CHANNEL': 'NO CH'}.get(status, status), g.X(BST_PP_STATUS_POS[0]), g.Y(BST_PP_STATUS_POS[1]), BST_PP_STATUS_PX, g,
+              (dc[0], dc[1], dc[2], 0.95), "l")
+    return True
 
 
 # =============================================================================
@@ -307,6 +753,12 @@ def _get_free_channels():
 
 
 def _draw_booster_body(rx, ry, rw, rh, rack, rack_idx, scale):
+    if _bst_pp_active():
+        try:
+            if _bst_pp_draw_body(rx, ry, rw, rh, rack, rack_idx, scale):
+                return
+        except Exception as _e_bpp:
+            print(f"[BOOSTER] packApunch draw error: {_e_bpp}")
     boost_norm = getattr(rack, 'p0', 0.30)
     limiter_on = getattr(rack, 'p1', 1.0) > 0.5
     target_ch  = int(getattr(rack, 'p2', 0))

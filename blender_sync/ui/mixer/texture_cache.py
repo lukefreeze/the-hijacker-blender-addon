@@ -144,6 +144,11 @@ SKIN_MAP = {
     "rack_noisegate_bg":   "rack_noisegate_bg.png",
     "rack_delay_bg":       "rack_delay_bg.png",
     "rack_booster_bg":         "rack_booster_bg.png",
+    "rack_booster_off_btn":    "rack_booster_off_btn.png",     # packApunch: the ON glass with the light turned down
+    "rack_booster_limit_bar":  "rack_booster_limit_bar.png",   # packApunch: lit green bar of the limiter display (limiter on)
+    "rack_booster_limit_x":    "rack_booster_limit_x.png",     # packApunch: red cross of the limiter display (limiter off)
+    "rack_booster_bullets_lit": "rack_booster_bullets_lit.png", # packApunch: the lit bullet casings round the knob (atlas, premultiplied)
+    "rack_booster_btn_glow":   "rack_booster_btn_glow.png",    # packApunch: the six preset buttons' lit faces + lamps (added on top)
     "rack_booster_btn_on":     "booster__button.png",
     "rack_booster_led_green":  "booster_Green__LED.png",   # 17x43px — IN meter
     "rack_booster_led_orange": "booster_Orange__LED.png",  # 17x43px — OUT meter
@@ -212,6 +217,8 @@ SKIN_MAP = {
     "rack_knnvc_off_btn":  "rack_knnvc_off_btn.png",
     "rack_knnvc_key_lit":  "rack_knnvc_key_lit.png",
     "rack_demucs_bg":      "rack_demucs_bg.png",
+    "rack_demucs_bg_lit":  "rack_demucs_bg_lit.png",   # packApunch: lit stem-pad lens, model-slab glow, ON / SPLIT / channel-key glow (premultiplied)
+    "rack_demucs_rain":    "rack_demucs_rain.png",   # packApunch: glyph atlas for the procedural code rain (sharp cells on top, blurred copy below; premultiplied white)
     # Demucs stem-pad ON glow overlay — off-state is baked into rack_demucs_bg.png
     # above; this blits on top of whichever stem pads are currently enabled
     # (same convention as rack_booster_btn_on / mixdown_*_btn_on above).
@@ -226,7 +233,11 @@ SKIN_MAP = {
     "rack_piper_screens":  "rack_piper_screens.png",       # packApunch: CRT screen matte (white x alpha) for the phosphor tint
     "rack_piper_eye_glow": "rack_piper_eye_glow.png",      # packApunch: additive eye bloom / pulse
     "rack_voicefixer_bg":  "rack_voicefixer_bg.png",
+    "rack_voicefixer_bg_lit": "rack_voicefixer_bg_lit.png",   # packApunch: backlit mode windows + lit keys (optional crossfade art)
+    "rack_voicefixer_screen_frame": "rack_voicefixer_screen_frame.png",   # packApunch: bezel over the big screens, cut by the screen matte (premultiplied)
     "rack_whisper_bg":     "rack_whisper_bg.png",
+    "rack_whisper_bg_lit": "rack_whisper_bg_lit.png",   # packApunch: lit keys, selected buttons, lit toggle slots, TRANSCRIBE rim pulse + wiped-label patch (premultiplied)
+    "rack_whisper_bg_off": "rack_whisper_bg_off.png",   # packApunch: the whole rack with its lights off (blitted over the lit art while powered down)
     "add_rack_btn":        "add_rack_btn.png",
     "add_ai_rack_btn":     "add_ai_rack_btn.png",
     "rack_chassis":  "rack_chassis.png",

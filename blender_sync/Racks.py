@@ -4129,7 +4129,20 @@ def _hit_test_rack_zones(rx, ry, i, rack, rack_x, rack_y, rw, rh, ui_scale, grou
                         'group_idx': group_idx}
 
     # BOOSTER rack hit zones
+    _bst_pp_on = False
     if not rack.collapsed and rack.effect_type == "BOOSTER":
+        # packApunch skin: click zones in art pixels (rack_booster.booster_pp_hit)
+        try:
+            from ui.racks.rack_booster import booster_pp_active as _bpa, booster_pp_hit as _bph
+            if _bpa():
+                _bst_pp_on = True
+                _bhit = _bph(rx, ry, rack_x, rack_y, rw, rh)
+                if _bhit:
+                    _bhit['rack_idx'] = i
+                    return _bhit
+        except Exception as _e_bph:
+            print(f"[BOOSTER] pp hit error: {_e_bph}")
+    if not rack.collapsed and rack.effect_type == "BOOSTER" and not _bst_pp_on:
         try:
             from ui.racks.rack_booster import (
                 BST_APPLY_X, BST_APPLY_Y, BST_APPLY_W, BST_APPLY_H,
@@ -5282,6 +5295,42 @@ def _draw_ai_rack_expanded(rx, ry, rw, rh, rack, ai_idx, scale):
             print(f"[AI RACKS] Piper packApunch draw error rack {ai_idx}: {_e_pipp}")
             import traceback; traceback.print_exc()
 
+    # Voice Fixer on the packApunch skin: the art carries its own keys, windows, screens and lamp, so the whole
+    # rack is drawn by rack_voicefixer_pp.vf_pp_draw instead of the rail layout below.
+    if rack.ai_type == "RESEMBLE" and _ai_bg_tex is not None:
+        try:
+            from ui.racks.rack_voicefixer_pp import vf_pp_active as _vf_pp_on, vf_pp_draw as _vf_pp_draw
+            if _vf_pp_on():
+                _vf_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale)
+                return
+        except Exception as _e_vfpp:
+            print(f"[AI RACKS] Voice Fixer packApunch draw error rack {ai_idx}: {_e_vfpp}")
+            import traceback; traceback.print_exc()
+
+    # Demucs on the packApunch skin (Matrix / Zion): the art carries its own keys, pads, model slabs, screens and CRT,
+    # so the whole rack is drawn by rack_demucs_pp.dm_pp_draw instead of the rail layout below.
+    if rack.ai_type == "DEMUCS" and _ai_bg_tex is not None:
+        try:
+            from ui.racks.rack_demucs_pp import dm_pp_active as _dm_pp_on, dm_pp_draw as _dm_pp_draw
+            if _dm_pp_on():
+                _dm_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale)
+                return
+        except Exception as _e_dmpp:
+            print(f"[AI RACKS] Demucs packApunch draw error rack {ai_idx}: {_e_dmpp}")
+            import traceback; traceback.print_exc()
+
+    # Whisper on the packApunch skin: the art carries its own keys, buttons, screens and lenses, so the whole rack is
+    # drawn by rack_whisper_pp.wh_pp_draw instead of the rail layout below.
+    if rack.ai_type == "WHISPER" and _ai_bg_tex is not None:
+        try:
+            from ui.racks.rack_whisper_pp import wh_pp_active as _wh_pp_on, wh_pp_draw as _wh_pp_draw
+            if _wh_pp_on():
+                _wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale)
+                return
+        except Exception as _e_whpp:
+            print(f"[AI RACKS] Whisper packApunch draw error rack {ai_idx}: {_e_whpp}")
+            import traceback; traceback.print_exc()
+
     col_x = rx + 4*scale
     col_y = ry + rh - 28*scale
     col_w = 24*scale
@@ -5923,6 +5972,33 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                     return _pi_pp_hit(mouse_x, mouse_y, rack, ai_idx, rack_x, rack_y, rw, rack_h)
             except Exception as _e_pih:
                 print(f"[AI RACKS] Piper packApunch hit-test error: {_e_pih}")
+
+        # Voice Fixer on the packApunch skin: art-coordinate click zones (rack_voicefixer_pp.vf_pp_hit)
+        if rack.ai_type == "RESEMBLE" and not rack.collapsed:
+            try:
+                from ui.racks.rack_voicefixer_pp import vf_pp_active as _vf_pp_on2, vf_pp_hit as _vf_pp_hit
+                if _vf_pp_on2():
+                    return _vf_pp_hit(mouse_x, mouse_y, rack, ai_idx, rack_x, rack_y, rw, rack_h)
+            except Exception as _e_vfh:
+                print(f"[AI RACKS] Voice Fixer packApunch hit-test error: {_e_vfh}")
+
+        # Demucs on the packApunch skin: art-coordinate click zones (rack_demucs_pp.dm_pp_hit)
+        if rack.ai_type == "DEMUCS" and not rack.collapsed:
+            try:
+                from ui.racks.rack_demucs_pp import dm_pp_active as _dm_pp_on2, dm_pp_hit as _dm_pp_hit
+                if _dm_pp_on2():
+                    return _dm_pp_hit(mouse_x, mouse_y, rack, ai_idx, rack_x, rack_y, rw, rack_h)
+            except Exception as _e_dmh:
+                print(f"[AI RACKS] Demucs packApunch hit-test error: {_e_dmh}")
+
+        # Whisper on the packApunch skin: art-coordinate click zones (rack_whisper_pp.wh_pp_hit)
+        if rack.ai_type == "WHISPER" and not rack.collapsed:
+            try:
+                from ui.racks.rack_whisper_pp import wh_pp_active as _wh_pp_on2, wh_pp_hit as _wh_pp_hit
+                if _wh_pp_on2():
+                    return _wh_pp_hit(mouse_x, mouse_y, rack, ai_idx, rack_x, rack_y, rw, rack_h)
+            except Exception as _e_whh:
+                print(f"[AI RACKS] Whisper packApunch hit-test error: {_e_whh}")
 
         # Collapse button
         col_x = rack_x + 4*scale

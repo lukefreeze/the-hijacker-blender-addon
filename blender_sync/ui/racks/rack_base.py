@@ -853,6 +853,8 @@ PACKAPUNCH_BAKED_BTNS = {
     "NOISE_GATE":  ("rack_noisegate_off_btn", (1738, 4, 1819, 52),   1864, 503),
     # Delay: the lit ON glass top right; the patch is the same glass with the light turned off
     "DELAY":       ("rack_delay_off_btn",     (1556, 4, 1680, 120),  1758, 468),
+    # Booster: the green ON glass top right; the patch is the same glass with the light turned down
+    "BOOSTER":     ("rack_booster_off_btn",   (1873, 8, 1944, 50),   1988, 528),
 }
 
 # Click zones for baked buttons that are NOT where the generic rail buttons are.
@@ -885,6 +887,15 @@ PACKAPUNCH_BTN_HITBOXES = {
         "keys":  {"cx": (1522.0, 1583.0, 1643.0), "cy": (200.0, 263.0, 325.0), "w": 50.0, "h": 44.0},
         # preset display: the dark box; the two arrows are baked into the metal either side of it
         "preset": {"box": (783.0, 12.0, 986.0, 41.0), "arrow_w": 34.0, "arrows_outside": True},
+    },
+    "BOOSTER": {
+        "on":    (1876, 10, 1941, 47),    # the green ON glass
+        "close": (1946, 10, 1984, 47),    # the X
+        "art":   (1988, 528),
+        # 3x3 channel keypad on the cardboard sign (centres of the key faces, row-major)
+        "keys":  {"cx": (1847.0, 1897.0, 1947.0), "cy": (112.0, 162.0, 211.0), "w": 40.0, "h": 40.0},
+        # preset display: the dark box at the top; the two arrows are baked into the metal either side of it
+        "preset": {"box": (870.0, 11.0, 1130.0, 51.0), "arrow_w": 34.0, "arrows_outside": True},
     },
     "REVERB": {
         "on":    (1537, 60, 1651, 126),   # the lit ON glass
@@ -929,6 +940,7 @@ def packapunch_preset_rects(rack, rack_x, rack_y, rw, rh):
 #   effect type -> ((centre x, centre y) in art px, art w, art h, digit height in art px, colour)
 PACKAPUNCH_BADGE = {
     "DELAY": ((116.0, 27.0), 1758, 468, 26.0, (0.86, 0.86, 0.82, 1.0)),
+    "BOOSTER": ((81.0, 30.0), 1988, 528, 24.0, (0.94, 0.94, 0.96, 1.0)),
 }
 
 
@@ -997,6 +1009,21 @@ PACKAPUNCH_RACK_THEME["DELAY"] = {
     "key_frac":     0.58,
     "key_lit_prefix": "rack_delay_key",                # lit key textures: rack_delay_key<N>_lit
     "key_lit_patch":  (66.0, 60.0, 50.0, 44.0),        # lit image size / key face size, art px (w, h, key w, key h)
+}
+
+
+PACKAPUNCH_RACK_THEME["BOOSTER"] = {
+    "font": None,
+    "glow": 0.22,
+    "preset_col":   (0.90, 0.87, 0.80, 1.00),          # the cream of the baked "+6 dB"
+    "arrow_col":    (0.90, 0.87, 0.80, 0.95),          # (arrows are baked on this rack - not drawn)
+    "text_frac":    0.58,
+    "preset_font":  False,
+    "uppercase":    False,
+    "key_on_text":  (0.07, 0.05, 0.04, 1.00),          # marker ink on the cardboard keys: assigned channel
+    "key_off_text": (0.22, 0.15, 0.09, 0.42),          # a faded pencil mark: unassigned
+    "key_glow":     (1.0, 0.80, 0.35, 0.16),           # a warm wash on an assigned key
+    "key_frac":     0.62,
 }
 
 

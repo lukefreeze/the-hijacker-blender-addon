@@ -112,8 +112,7 @@ def main():
         val = fsamples[i] * gain_linear
         if use_limit:
             val = soft_limit(val)
-        else:
-            val = max(-1.0, min(1.0, val))   # hard clip as safety floor
+        # limiter off (RAW): no limiting and no clipping - the output is float32, so peaks above 0 dBFS are kept as they are
         boosted[i] = val
 
         if i % report_step == 0:

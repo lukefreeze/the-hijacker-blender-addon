@@ -30,6 +30,9 @@ bundle them, auto-download them, or only link to them. Check commercial-use term
 
 ## 4. Other open items
 - [ ] Booster rack: circular knob sprite, art fixes, full wiring
-- [ ] Voice Fixer (Mother) and Demucs (Matrix) restyles
-- [ ] Noise-gate power-off behaviour, EQ live labels, mixdown rack, delay audio
+- [x] Voice Fixer restyle (new packApunch layout: rack_voicefixer_pp.py), optional lit art rack_voicefixer_bg_lit.png still to add
+- [ ] Demucs (Matrix) restyle
+- [ ] Rename the Voice Fixer rack (drop the "Mother" working name)
+- [x] Noise-gate power-off, EQ power-off, delay audio (done and checked)
+- [ ] Mixdown rack skin: button "on" overlays (mode, format, sample rate, bit depth, range) and collapsed background
 - [ ] Commit the large body of uncommitted work on feature/hijacker-engine
