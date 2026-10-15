@@ -238,6 +238,8 @@ SKIN_MAP = {
     "rack_whisper_bg":     "rack_whisper_bg.png",
     "rack_whisper_bg_lit": "rack_whisper_bg_lit.png",   # packApunch: lit keys, selected buttons, lit toggle slots, TRANSCRIBE rim pulse + wiped-label patch (premultiplied)
     "rack_whisper_bg_off": "rack_whisper_bg_off.png",   # packApunch: the whole rack with its lights off (blitted over the lit art while powered down)
+    "rack_mixdown_bg_lit": "rack_mixdown_bg_lit.png",   # packApunch: Mixdown art with every key lit (patches crossfade over selected keys)
+    "rack_mixdown_bg_off": "rack_mixdown_bg_off.png",   # packApunch: Mixdown with its lights off (dark screens + dark ON / arrow / save keys)
     "add_rack_btn":        "add_rack_btn.png",
     "add_ai_rack_btn":     "add_ai_rack_btn.png",
     "rack_chassis":  "rack_chassis.png",

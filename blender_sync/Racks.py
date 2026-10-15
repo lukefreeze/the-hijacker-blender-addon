@@ -3951,6 +3951,14 @@ def hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
                 col_btn_y2 = rack_y + rh - 28*ui_scale
                 col_btn_w2 = 24*ui_scale
                 col_btn_h2 = 20*ui_scale
+                try:
+                    from ui.racks.rack_base import packapunch_rect as _pp_rc
+                    _pp_cr = _pp_rc(rack, "collapse", rack_x, rack_y, rw, rh)
+                except Exception:
+                    _pp_cr = None
+                if _pp_cr:   # packApunch art with its own collapse key
+                    col_btn_x2, col_btn_y2 = _pp_cr[0], _pp_cr[1]
+                    col_btn_w2, col_btn_h2 = _pp_cr[2] - _pp_cr[0], _pp_cr[3] - _pp_cr[1]
                 if (col_btn_x2 <= rx <= col_btn_x2 + col_btn_w2 and
                         col_btn_y2 <= ry <= col_btn_y2 + col_btn_h2):
                     return {'zone': 'collapse', 'rack_idx': i}
@@ -3985,6 +3993,14 @@ def _hit_test_rack_zones(rx, ry, i, rack, rack_x, rack_y, rw, rh, ui_scale, grou
     col_btn_y2 = rack_y + rh - 28*ui_scale
     col_btn_w2 = 24*ui_scale
     col_btn_h2 = 20*ui_scale
+    try:
+        from ui.racks.rack_base import packapunch_rect as _pp_rc
+        _pp_cr = _pp_rc(rack, "collapse", rack_x, rack_y, rw, rh)
+    except Exception:
+        _pp_cr = None
+    if _pp_cr:   # packApunch art with its own collapse key
+        col_btn_x2, col_btn_y2 = _pp_cr[0], _pp_cr[1]
+        col_btn_w2, col_btn_h2 = _pp_cr[2] - _pp_cr[0], _pp_cr[3] - _pp_cr[1]
     if (col_btn_x2 <= rx <= col_btn_x2 + col_btn_w2 and
             col_btn_y2 <= ry <= col_btn_y2 + col_btn_h2):
         return {'zone': 'collapse', 'rack_idx': i}
@@ -4026,6 +4042,14 @@ def _hit_test_rack_zones(rx, ry, i, rack, rack_x, rack_y, rw, rh, ui_scale, grou
     badge_y2 = rack_y + rh - 28*ui_scale
     badge_w2 = 38*ui_scale
     badge_h2 = 20*ui_scale
+    try:
+        from ui.racks.rack_base import packapunch_rect as _pp_rc2
+        _pp_br = _pp_rc2(rack, "badge", rack_x, rack_y, rw, rh)
+    except Exception:
+        _pp_br = None
+    if _pp_br:       # packApunch art with its own rack-number window
+        badge_x2, badge_y2 = _pp_br[0], _pp_br[1]
+        badge_w2, badge_h2 = _pp_br[2] - _pp_br[0], _pp_br[3] - _pp_br[1]
     if (badge_x2 <= rx <= badge_x2 + badge_w2 and
             badge_y2 <= ry <= badge_y2 + badge_h2):
         return {'zone': 'rack_badge', 'rack_idx': i,
@@ -4222,7 +4246,19 @@ def _hit_test_rack_zones(rx, ry, i, rack, rack_x, rack_y, rw, rh, ui_scale, grou
                 return {'zone': 'booster_ch_plus', 'rack_idx': i}
 
     # MIXDOWN rack hit zones
+    _mx_pp_on = False
     if not rack.collapsed and rack.effect_type == "MIXDOWN":
+        # packApunch skin: click zones in art pixels (rack_mixdown_pp.mx_pp_hit)
+        try:
+            from ui.racks.rack_mixdown_pp import mx_pp_active as _mxa, mx_pp_hit as _mxh
+            if _mxa():
+                _mx_pp_on = True
+                _mhit = _mxh(rx, ry, rack, i, rack_x, rack_y, rw, rh)
+                if _mhit:
+                    return _mhit
+        except Exception as _e_mxh:
+            print(f"[MIXDOWN] pp hit error: {_e_mxh}")
+    if not rack.collapsed and rack.effect_type == "MIXDOWN" and not _mx_pp_on:
         s         = ui_scale
         pad_mx    = 10 * s
         CH_W      = 100 * s

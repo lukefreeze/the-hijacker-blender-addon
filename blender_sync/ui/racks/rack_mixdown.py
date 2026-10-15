@@ -768,6 +768,15 @@ def _draw_mixdown_body(rx, ry, rw, rh, rack, rack_idx, scale):
     except Exception:
         _draw_rect(rx, ry, rw, body_h, (0.04, 0.04, 0.04, 1.0))
 
+    # ── packApunch skin: the new Event Horizon layout (rack_mixdown_pp) replaces the whole body
+    try:
+        from ui.racks.rack_mixdown_pp import mx_pp_active as _mx_pp_on, mx_pp_draw as _mx_pp_draw
+        if _mx_pp_on():
+            _mx_pp_draw(rx, ry, rw, rh, rack, rack_idx, scale)
+            return
+    except Exception as _e_mxpp:
+        print(f"[MIXDOWN] pp draw error: {_e_mxpp}")
+
     shader = _get_shader()
 
     # ── Column boundaries ────────────────────────────────────────────────

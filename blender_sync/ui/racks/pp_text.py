@@ -41,6 +41,12 @@ PROFILES = {
     },
 }
 
+# Fonts without a layout profile that sit lower/higher than the normal font: height of the middle of the capitals
+# above the baseline, in em (mixdown.ttf = Event Horizon small-caps, cap height 0.52 em). draw_text then centres
+# such text on the same y the normal font uses.
+FONT_VC = {"mixdown": 0.26}
+_vc_by_fid = {}
+
 _ids = {}                              # resolved file path -> blf font id (0 = failed / default)
 
 
@@ -77,6 +83,8 @@ def font_id(spec, etype=""):
         except Exception:
             fid = 0
         _ids[p] = fid
+        if fid:
+            _vc_by_fid[fid] = FONT_VC.get(os.path.splitext(os.path.basename(p))[0].lower())
     return fid
 
 
@@ -150,6 +158,9 @@ def draw_text(text, x, y, size, color, glow=0.0, glow_col=None, fid=0, prof=None
     size = max(1, int(size))
     if not prof:
         blf.size(fid, size)
+        vc = _vc_by_fid.get(fid) if fid else None
+        if vc:                                   # centre on the same line the normal font would use
+            y = y + size / 2.0 - 1.0 - vc * size
         _blit(fid, text, x, y, color, glow, glow_col, max(1.0, size / 14.0) ** 0.5)
         return
     text = _prepare(text, prof)

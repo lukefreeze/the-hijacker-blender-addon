@@ -855,6 +855,8 @@ PACKAPUNCH_BAKED_BTNS = {
     "DELAY":       ("rack_delay_off_btn",     (1556, 4, 1680, 120),  1758, 468),
     # Booster: the green ON glass top right; the patch is the same glass with the light turned down
     "BOOSTER":     ("rack_booster_off_btn",   (1873, 8, 1944, 50),   1988, 528),
+    # Mixdown: ON light and screens are faded by rack_mixdown_pp (off image patches), so no overlay here.
+    "MIXDOWN":     (None, (0, 0, 0, 0), 1, 1),
 }
 
 # Click zones for baked buttons that are NOT where the generic rail buttons are.
@@ -897,6 +899,18 @@ PACKAPUNCH_BTN_HITBOXES = {
         # preset display: the dark box at the top; the two arrows are baked into the metal either side of it
         "preset": {"box": (870.0, 11.0, 1130.0, 51.0), "arrow_w": 34.0, "arrows_outside": True},
     },
+    "MIXDOWN": {
+        "on":    (1781, 21, 1835, 78),    # the red ON key
+        "close": (1865, 25, 1917, 77),    # the red close key
+        "art":   (2000, 528),
+        # custom rects for the collapse key and the rack-number window (see packapunch_rect)
+        "collapse": (100, 24, 150, 74),
+        "badge":    (168, 14, 254, 86),
+        # 3x3 channel keypad (centres of the key faces, row-major)
+        "keys":  {"cx": (1799.0, 1866.5, 1934.0), "cy": (203.5, 269.0, 336.0), "w": 43.0, "h": 44.0},
+        # preset display: the dark screen; the two arrow keys are baked into the steel either side of it
+        "preset": {"box": (896.0, 16.0, 1120.0, 80.0), "arrow_w": 52.0, "arrows_outside": True},
+    },
     "REVERB": {
         "on":    (1537, 60, 1651, 126),   # the lit ON glass
         "close": (1691, 59, 1759, 130),   # the red square button
@@ -936,11 +950,30 @@ def packapunch_preset_rects(rack, rack_x, rack_y, rw, rh):
             "right": (X(x1 - aw_arrow), Y(y1), X(x1), Y(y0))}
 
 
+def packapunch_rect(rack, name, rack_x, rack_y, rw, rh):
+    """Screen-space rect (x0, y0, x1, y1) of a named baked control ("collapse" / "badge") for a packApunch rack
+    whose art puts it somewhere other than the generic rail position, or None for the generic position."""
+    cfg = PACKAPUNCH_BTN_HITBOXES.get(getattr(rack, "effect_type", None))
+    if not cfg or name not in cfg or getattr(rack, "collapsed", False):
+        return None
+    try:
+        from ui.mixer.texture_cache import get_active_skin as _gas_r
+        if _gas_r() != "packapunch":
+            return None
+    except Exception:
+        return None
+    aw, ah = cfg["art"]
+    x0, y0, x1, y1 = cfg[name]
+    return (rack_x + x0 / aw * rw, rack_y + (1.0 - y1 / ah) * rh,
+            rack_x + x1 / aw * rw, rack_y + (1.0 - y0 / ah) * rh)
+
+
 # Racks whose packApunch art has its own number plate for the rack number:
 #   effect type -> ((centre x, centre y) in art px, art w, art h, digit height in art px, colour)
 PACKAPUNCH_BADGE = {
     "DELAY": ((116.0, 27.0), 1758, 468, 26.0, (0.86, 0.86, 0.82, 1.0)),
     "BOOSTER": ((81.0, 30.0), 1988, 528, 24.0, (0.94, 0.94, 0.96, 1.0)),
+    "MIXDOWN": ((211.0, 50.0), 2000, 528, 32.0, (1.00, 0.45, 0.42, 1.0)),   # red phosphor digit in the black window
 }
 
 
@@ -1027,6 +1060,23 @@ PACKAPUNCH_RACK_THEME["BOOSTER"] = {
 }
 
 
+PACKAPUNCH_RACK_THEME["MIXDOWN"] = {
+    "font": None,                                      # normal font here; mixdown.ttf is used only for the title and the right-hand screens (rack_mixdown_pp)
+    "glow": 0.5,
+    "preset_col":   (1.00, 0.43, 0.40, 1.00),          # red phosphor, like the rest of the screens
+    "arrow_col":    (1.00, 0.43, 0.40, 0.95),          # (arrows are baked on this rack - not drawn)
+    "text_frac":    0.36,
+    "text_frac_themed": 0.50,
+    "preset_font":  False,
+    "uppercase":    True,
+    "key_on_text":  (1.00, 0.92, 0.90, 1.00),          # white-hot digit on a red-lit key
+    "key_off_text": (0.14, 0.15, 0.18, 0.80),          # dark engraving on a steel key
+    "key_glow":     (0.0, 0.0, 0.0, 0.0),              # rack_mixdown_pp lights the keys from the lit art
+    "key_frac":     0.46,
+    "key_plain":    True,                              # channel numbers in the normal font (only the title / screens use mixdown.ttf)
+}
+
+
 def _pp_theme(rack):
     """Look of the packApunch text for this rack, with the amber defaults filled in."""
     t = PACKAPUNCH_RACK_THEME.get(getattr(rack, "effect_type", None), {})
@@ -1054,6 +1104,7 @@ def _pp_theme(rack):
         "key_glow":     t.get("key_glow", PP_KEY_ON_GLOW),
         "key_frac":     t.get("key_frac", 0.42),
         "uppercase":    t.get("uppercase", PP_PRESET_UPPERCASE),
+        "key_plain":    t.get("key_plain", False),
         "key_lit_prefix": t.get("key_lit_prefix"),
         "key_lit_patch":  t.get("key_lit_patch"),
     }
@@ -1191,6 +1242,7 @@ def _draw_pp_keypad(rack, key_rects, scale):
     kg = th["key_glow"]
     shader = _get_shader()
     lit_prefix = th.get("key_lit_prefix")
+    th_k = dict(th, fid=0, prof=None) if th.get("key_plain") else th      # key numbers: normal font when asked
     for local_idx, (x0, y0, x1, y1) in enumerate(key_rects):
         assigned = getattr(rack, f'ch{local_idx}', False)
         if assigned and lit_prefix and getattr(rack, "enabled", True):
@@ -1216,9 +1268,9 @@ def _draw_pp_keypad(rack, key_rects, scale):
             gpu.state.blend_set("ALPHA")
         label = str(group_idx * 9 + local_idx + 1)
         fs = max(1, int((y1 - y0) * th["key_frac"]))
-        tw = _pp_text_width(label, fs, th)
+        tw = _pp_text_width(label, fs, th_k)
         _pp_draw_text(label, (x0 + x1) / 2 - tw / 2, (y0 + y1) / 2 - fs / 2 + 1, fs,
-                      th["key_on_text"] if assigned else th["key_off_text"], th)
+                      th["key_on_text"] if assigned else th["key_off_text"], th_k)
 
 
 def packapunch_btn_hitboxes(rack, rack_x, rack_y, rw, rh):
@@ -1533,9 +1585,15 @@ def _draw_rack_expanded(rx, ry, rack, rack_idx, scale, rack_width=None):
         # packApunch: the rack number sits in the art's own number plate (the baked digit is painted out of the art)
         (_bcx, _bcy), _baw, _bah, _bpx, _bcol = _bd_pp
         badge_fs = max(1, int(_bpx * rh / _bah))
-        tw_b = _text_width(badge_label, badge_fs)
-        _draw_text(badge_label, rx + _bcx / _baw * rw - tw_b / 2,
-                   ry + (1.0 - _bcy / _bah) * rh - badge_fs / 2 + 1, badge_fs, _bcol)
+        _th_b = _pp_theme(rack)
+        if _th_b["fid"]:                         # rack with its own font: the number in it, with the rack's glow
+            tw_b = _pp_text_width(badge_label, badge_fs, _th_b)
+            _pp_draw_text(badge_label, rx + _bcx / _baw * rw - tw_b / 2,
+                          ry + (1.0 - _bcy / _bah) * rh - badge_fs / 2 + 1, badge_fs, _bcol, _th_b)
+        else:
+            tw_b = _text_width(badge_label, badge_fs)
+            _draw_text(badge_label, rx + _bcx / _baw * rw - tw_b / 2,
+                       ry + (1.0 - _bcy / _bah) * rh - badge_fs / 2 + 1, badge_fs, _bcol)
     else:
         tw_b = _text_width(badge_label, badge_fs)
         _draw_text(badge_label, badge_x + badge_w/2 - tw_b/2,
