@@ -40,8 +40,9 @@ VF_ART_W = 1758.0
 VF_ART_H = 497.0
 
 # ── layout (art px) ──────────────────────────────────────────────────────────
-VF_COLLAPSE = (97.0, 8.0, 127.0, 32.0)          # chip drawn over the left end of the hazard band
-VF_BADGE = (131.0, 8.0, 161.0, 32.0)            # rack number chip next to it
+VF_COLLAPSE = (94.0, 3.0, 129.0, 38.0)          # collapse button baked into the art (click area)
+VF_BADGE = (136.0, 6.0, 168.0, 36.0)            # orange rack-number box baked into the art (number drawn on it)
+VF_CHIPS_OFF = (86.0, 0.0, 178.0, 44.0)         # collapse button + number box: the unlit version lives in the lit image at this spot
 VF_ON = (1586.0, 9.0, 1633.0, 57.0)
 VF_CLOSE = (1647.0, 9.0, 1695.0, 57.0)
 
@@ -101,6 +102,11 @@ VF_LIT_KEY = ((471.0, 170.0, 540.0, 239.0), (471.0, 241.0, 540.0, 311.0), (471.0
 # glass-frame overlay: the bezel around the two big screens, cut by the screen matte. Drawn over the text so
 # anything that reaches past the glass is hidden behind the bezel.
 VF_FRAME_ZONES = ((600.0, 70.0, 1215.0, 268.0), (1262.0, 70.0, 1710.0, 385.0))
+
+# CRT life: glass areas of the three green screens (art px). Drawn before the bezel overlay, which hides any spill.
+VF_CRT = ((625.0, 90.0, 1190.0, 250.0),         # centre screen
+          (1285.0, 90.0, 1690.0, 365.0),        # right (info) screen
+          (103.0, 67.0, 527.0, 103.0))          # small source strip
 
 _lit_state = {}
 
@@ -232,6 +238,126 @@ def _disc(sh, cx, cy, r, col, blend="ALPHA", seg=28):
     gpu.state.blend_set("ALPHA")
 
 
+def _smooth(e0, e1, x):
+    t = max(0.0, min(1.0, (x - e0) / (e1 - e0)))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _lamp_layers(lr, rgb, k):
+    """Soft lamp light as stacked discs, outermost first: [(radius, (r, g, b, a), blend), ...].
+
+    Two parts: a tinted halo (ALPHA) that washes the bezel and the plate around the lens, and a hot bloom
+    (ADDITIVE) that brightens the lens itself and fades out across the bezel, so the light spills over the
+    edge instead of sitting on the lens as a flat disc. Each disc's alpha is worked out so the stack adds up
+    to a smooth falloff."""
+    out = []
+    if k <= 0.003:
+        return out
+    n = 24
+    prev = 0.0
+    for j in range(n):                              # halo: opacity target falls off to 1.75 lr
+        f = 1.0 - j / float(n)                      # 1 (outermost) .. ~0
+        rr = lr * (0.45 + 1.30 * f)
+        o = 0.80 * k * (1.0 - _smooth(0.45, 1.75, rr / lr)) ** 1.15
+        a = 1.0 - (1.0 - o) / (1.0 - prev) if prev < 0.999 else 0.0
+        a = max(0.0, a)
+        out.append((rr, (rgb[0], rgb[1], rgb[2], a), "ALPHA"))
+        prev = max(prev, o)
+    prev = 0.0
+    for j in range(n):                              # bloom: additive, hot centre, gone by 1.3 lr
+        f = 1.0 - j / float(n)
+        rr = lr * (0.10 + 1.20 * f)
+        i = 0.42 * k * (1.0 - _smooth(0.10, 1.30, rr / lr))
+        d = max(0.0, i - prev)
+        out.append((rr, (min(1.0, rgb[0] + 0.15), min(1.0, rgb[1] + 0.25), min(1.0, rgb[2] + 0.2), d), "ADDITIVE"))
+        prev = max(prev, i)
+    return out
+
+
+def _lamp_glow(sh, cx, cy, lr, rgb, k, clip):
+    """Draw _lamp_layers at (cx, cy); clip = (x0, y0, x1, y1) screen rect the light must not leave (the rack)."""
+    x0, y0, x1, y1 = clip
+    seg = 48
+    for rr, col, blend in _lamp_layers(lr, rgb, k):
+        if col[3] <= 0.0005:
+            continue
+        pts = []
+        ring = [(min(x1, max(x0, cx + rr * math.cos(2 * math.pi * i / seg))),
+                 min(y1, max(y0, cy + rr * math.sin(2 * math.pi * i / seg)))) for i in range(seg + 1)]
+        for i in range(seg):
+            pts += [(cx, cy), ring[i], ring[i + 1]]
+        gpu.state.blend_set(blend)
+        sh.bind()
+        sh.uniform_float("color", col)
+        batch_for_shader(sh, "TRIS", {"pos": pts}).draw(sh)
+    gpu.state.blend_set("ALPHA")
+
+
+def _hash1(n, k):
+    v = math.sin(n * 127.1 + k * 311.7) * 43758.5453
+    return abs(v - math.floor(v))
+
+
+def _crt_overlay(sh, g, now, lv, ai_idx):
+    """Ambient phosphor life on the green screens: fine scanlines, a slow bright roll bar, a faint flicker and
+    an occasional glitch burst. Everything is additive green / thin dark lines, so text stays readable."""
+    if lv <= 0.01:
+        return
+    G = (0.25, 1.0, 0.42)
+    for si, z in enumerate(VF_CRT):
+        t = now + ai_idx * 3.1 + si * 1.9
+        ax0, ay0, ax1, ay1 = z
+        h_art = ay1 - ay0
+        X0, X1 = g.X(ax0), g.X(ax1)
+
+        def band(a_top, a_bot, col, blend="ADDITIVE"):
+            a_top, a_bot = max(ay0, a_top), min(ay1, a_bot)
+            if a_bot <= a_top:
+                return
+            _quad(sh, X0, g.Y(a_bot), X1, g.Y(a_top), col, blend)
+
+        # flicker wash (never fully steady)
+        fl = 0.5 + 0.5 * math.sin(t * 37.0) * math.sin(t * 11.3 + 1.0)
+        band(ay0, ay1, (G[0], G[1], G[2], lv * (0.014 + 0.016 * fl)))
+
+        # fine scanlines: one batch of thin dark lines
+        pitch = 3.2 if si < 2 else 3.0
+        pts = []
+        y = ay0 + 1.0
+        lh = 1.15
+        while y < ay1 - lh:
+            ya, yb = g.Y(y + lh), g.Y(y)
+            pts += [(X0, ya), (X1, ya), (X1, yb), (X0, ya), (X1, yb), (X0, yb)]
+            y += pitch
+        if pts:
+            gpu.state.blend_set("ALPHA")
+            sh.bind()
+            sh.uniform_float("color", (0.0, 0.0, 0.0, 0.16 * lv))
+            batch_for_shader(sh, "TRIS", {"pos": pts}).draw(sh)
+
+        # slow roll bar: soft band (stacked widths) travelling down, off-screen between passes
+        period = 7.0 + 1.3 * si
+        bh = max(16.0, min(46.0, h_art * 0.30))
+        p = (t / period) % 1.0
+        cy = ay0 - bh + p * (h_art + 2.0 * bh)
+        for w_, a_ in ((1.0, 0.016), (0.72, 0.020), (0.46, 0.024), (0.22, 0.028)):
+            band(cy - bh * w_ * 0.5, cy + bh * w_ * 0.5, (G[0], G[1], G[2], a_ * lv))
+
+        # glitch burst every ~9 s: a few bright hairline bars and a flash, 0.16 s
+        gp = 9.0
+        n = int(t // gp)
+        start = 2.0 + 5.0 * _hash1(n, si + 1)
+        dt = (t % gp) - start
+        if 0.0 <= dt < 0.16:
+            fade = 1.0 - dt / 0.16
+            band(ay0, ay1, (G[0], G[1], G[2], lv * 0.05 * fade))
+            for j in range(3):
+                by = ay0 + h_art * _hash1(n, 10 + j + si * 3)
+                bh2 = 2.0 + 6.0 * _hash1(n, 20 + j)
+                band(by, by + bh2, (0.6, 1.0, 0.7, lv * 0.20 * fade))
+    gpu.state.blend_set("ALPHA")
+
+
 def _tri(sh, pts, col):
     gpu.state.blend_set("ALPHA")
     sh.bind()
@@ -303,32 +429,32 @@ def vf_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
         lv = 1.0 if enabled else 0.0
 
     # ── power: darken the whole unit as the rack goes off ────────────────────
-    if lv < 0.997:
-        _quad(sh, rx, ry, rx + rw, ry + rh, (0.0, 0.0, 0.0, 0.55 * (1.0 - lv)))
+    # (no whole-unit dimming: the metal stays as it is; only screens, lamps and lit keys switch off via lv)
 
     status = getattr(rack, "ai_status", _READY)
     mode_idx = max(0, min(2, int(getattr(rack, "p0", 0.0))))
     active_chs = [ci + 1 for ci in range(9) if getattr(rack, f"ch{ci}", False)]
     group_off = getattr(rack, "group_idx", 0) * 9
 
-    # ── collapse chip + rack number over the hazard band ─────────────────────
-    cr = R(VF_COLLAPSE)
-    _quad(sh, cr[0], cr[1], cr[2], cr[3], (0.09, 0.08, 0.06, 0.94))
-    cx_, cy_ = (cr[0] + cr[2]) / 2, (cr[1] + cr[3]) / 2
-    aw, ah = (cr[2] - cr[0]) * 0.28, (cr[3] - cr[1]) * 0.22
-    _tri(sh, [(cx_ - aw, cy_ - ah), (cx_ + aw, cy_ - ah), (cx_, cy_ + ah * 1.3)], VF_CREAM)
+    # ── collapse button + rack-number box: baked into the art lit; the unlit version (stored in the lit image at
+    #    VF_CHIPS_OFF) fades in as the rack goes off, then the number is drawn on the box ─────────────────────
+    try:
+        from ui.mixer.texture_cache import get_texture as _gt_chip
+        _chip_tex = _gt_chip("rack_voicefixer_bg_lit")
+    except Exception:
+        _chip_tex = None
+    _lit_patch(g, _chip_tex, VF_CHIPS_OFF, 1.0 - lv)
     br = R(VF_BADGE)
-    _quad(sh, br[0], br[1], br[2], br[3], (0.09, 0.08, 0.06, 0.94))
-    _text(str(ai_idx + 1), (br[0] + br[2]) / 2, (br[1] + br[3]) / 2, 19.0, g, VF_CREAM, 1.0, "c", glow=0.0)
+    _text(str(ai_idx + 1), (br[0] + br[2]) / 2, (br[1] + br[3]) / 2, 21.0, g,
+          (0.22, 0.09, 0.01, 0.40 + 0.55 * lv), 1.0, "c", glow=0.0)
 
     # ── ON / close keys ──────────────────────────────────────────────────────
     onr = R(VF_ON)
-    if enabled:
-        _ocx, _ocy = (onr[0] + onr[2]) / 2, (onr[1] + onr[3]) / 2
-        _disc(sh, _ocx, _ocy, (onr[2] - onr[0]) * 0.46, (0.30, 1.0, 0.40, 0.16), "ADDITIVE")
-        _disc(sh, _ocx, _ocy, (onr[2] - onr[0]) * 0.26, (0.55, 1.0, 0.60, 0.14), "ADDITIVE")
-    _text("ON", (onr[0] + onr[2]) / 2, (onr[1] + onr[3]) / 2, 15.0, g, (0.04, 0.12, 0.04, 0.9) if enabled else (0.05, 0.10, 0.05, 0.6),
-          1.0, "c", glow=0.0)
+    # the key face stays plain; "ON" itself lights up (pale phosphor with a soft glow) while the rack is on
+    _on_lv = lv
+    _on_col = (0.04 + 0.78 * _on_lv, 0.10 + 0.90 * _on_lv, 0.04 + 0.78 * _on_lv, 0.6 + 0.4 * _on_lv)
+    _text("ON", (onr[0] + onr[2]) / 2, (onr[1] + onr[3]) / 2, 15.0, g, _on_col, 1.0, "c",
+          glow=0.85 * _on_lv, glow_col=VF_GREEN_GLOW)
     clr = R(VF_CLOSE)
     _text("X", (clr[0] + clr[2]) / 2, (clr[1] + clr[3]) / 2, 19.0, g, (0.98, 0.86, 0.80, 0.95), 1.0, "c", glow=0.0)
 
@@ -374,8 +500,8 @@ def vf_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
         tx = pr[0] + 14 * g.s
         ink = VF_INK if sel else VF_INK_DIM
         _mw = (pr[2] - pr[0]) - 28 * g.s
-        _text(_MODE_LABELS[mi], tx, pcy_big, VF_FS_LABEL, g, ink, lv, glow=0.0, max_w=_mw)
-        _text(_MODE_DESCS[mi], tx, pcy_sm, VF_FS_DESC, g, ink, lv, glow=0.0, max_w=_mw)
+        _text(_MODE_LABELS[mi], tx, pcy_big, VF_FS_LABEL, g, ink, 1.0, glow=0.0, max_w=_mw)
+        _text(_MODE_DESCS[mi], tx, pcy_sm, VF_FS_DESC, g, ink, 1.0, glow=0.0, max_w=_mw)
 
     # ── centre screen: state read-out ────────────────────────────────────────
     scr = R(VF_SCREEN)
@@ -433,16 +559,16 @@ def vf_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     if _is_playing:
         _quad(sh, pb[0], pb[1], pb[2], pb[3], (0.25, 1.0, 0.40, 0.18), "ADDITIVE")
     e_lbl = "RESTORING..." if status == _PROCESSING else "ENHANCE"
-    _text(e_lbl, (eb[0] + eb[2]) / 2, (eb[1] + eb[3]) / 2, VF_FS_MED, g, VF_INK_METAL, lv, "c", glow=0.0)
+    _text(e_lbl, (eb[0] + eb[2]) / 2, (eb[1] + eb[3]) / 2, VF_FS_MED, g, VF_INK_METAL, 1.0, "c", glow=0.0)
     p_col = VF_INK_METAL if (_has_out or _is_playing) else (VF_INK_METAL[0], VF_INK_METAL[1], VF_INK_METAL[2], 0.45)
-    _text("[] STOP" if _is_playing else "> PREVIEW", (pb[0] + pb[2]) / 2, (pb[1] + pb[3]) / 2, VF_FS_MED, g, p_col, lv, "c", glow=0.0)
+    _text("[] STOP" if _is_playing else "> PREVIEW", (pb[0] + pb[2]) / 2, (pb[1] + pb[3]) / 2, VF_FS_MED, g, p_col, 1.0, "c", glow=0.0)
 
     # ── OUT CH selector ──────────────────────────────────────────────────────
     out_ch_val = int(getattr(rack, "p3", 0.0)) or (active_chs[0] + 1 if active_chs else 2)
     out_ch_val = max(1, min(9, out_ch_val))
     ob = R(VF_OUT_BOX)
     _text(str(out_ch_val), (ob[0] + ob[2]) / 2, (ob[1] + ob[3]) / 2, 22.0, g, VF_GREEN, lv, "c")
-    _text("OUT CH", g.X(VF_OUT_LABEL_X), (ob[1] + ob[3]) / 2, VF_FS_SMALL, g, VF_INK, lv, glow=0.0)
+    _text("OUT CH", g.X(VF_OUT_LABEL_X), (ob[1] + ob[3]) / 2, VF_FS_SMALL, g, VF_INK, 1.0, glow=0.0)
 
     # ── right screen: about notes ────────────────────────────────────────────
     ir = R(VF_INFO)
@@ -460,6 +586,7 @@ def vf_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
         ny += _step
 
     # ── bezel over the two big screens (hides any text that reaches past the glass) ─────
+    _crt_overlay(sh, g, now, lv, ai_idx)
     _screen_frames(g)
 
     # ── status slot ──────────────────────────────────────────────────────────
@@ -471,15 +598,14 @@ def vf_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
 
     # ── status lamp ──────────────────────────────────────────────────────────
     lcx, lcy, lr = g.X(VF_LAMP[0]), g.Y(VF_LAMP[1]), VF_LAMP[2] * g.s
+    _clip = (rx, ry, rx + rw, ry + rh)
     if status == _PROCESSING:
         pul = 0.5 + 0.5 * math.sin(now * 6.0)
-        _disc(sh, lcx, lcy, lr * 0.78, (1.0, 0.45, 0.05, (0.35 + 0.35 * pul) * lv), "ADDITIVE")
+        _lamp_glow(sh, lcx, lcy, lr, (1.0, 0.45, 0.05), (0.55 + 0.45 * pul) * lv, _clip)
     elif status == _DONE:
-        _disc(sh, lcx, lcy, lr * 0.80, (0.10, 0.85, 0.25, 0.62 * lv), "ALPHA")
-        _disc(sh, lcx, lcy, lr * 0.80, (0.30, 1.0, 0.45, 0.25 * lv), "ADDITIVE")
+        _lamp_glow(sh, lcx, lcy, lr, (0.15, 0.95, 0.30), 0.85 * lv, _clip)
     elif status == _ERROR:
-        _disc(sh, lcx, lcy, lr * 0.80, (0.85, 0.08, 0.04, 0.65 * lv), "ALPHA")
-        _disc(sh, lcx, lcy, lr * 0.80, (1.0, 0.25, 0.15, 0.25 * lv), "ADDITIVE")
+        _lamp_glow(sh, lcx, lcy, lr, (1.0, 0.12, 0.06), 0.85 * lv, _clip)
     else:
-        _disc(sh, lcx, lcy, lr * 0.78, (1.0, 0.60, 0.10, 0.22 * lv), "ADDITIVE")
+        _lamp_glow(sh, lcx, lcy, lr, (1.0, 0.52, 0.08), 0.80 * lv, _clip)
     gpu.state.blend_set("ALPHA")

@@ -51,9 +51,9 @@ WH_OFF_KEY = "rack_whisper_bg_off"
 
 # ── layout (art px) ──────────────────────────────────────────────────────────
 WH_COLLAPSE = (112.0, 9.0, 148.0, 46.0)
-WH_ON = (153.0, 10.0, 189.0, 47.0)
-WH_CLOSE = (1767.0, 9.0, 1803.0, 46.0)
-WH_NUMBER_AT = (408.0, 31.0)                    # rack number, printed on the clean plate right of the logo
+WH_NUMBER = (153.0, 10.0, 189.0, 47.0)          # the red box next to the collapse key: shows the rack number (not a button)
+WH_POWER = (1392.0, 13.0, 1428.0, 49.0)         # top plate, right of the channel keys: on / off key ...
+WH_CLOSE = (1433.0, 13.0, 1469.0, 49.0)         # ... and the close-rack key next to it
 
 WH_TOP_X0, WH_TOP_P, WH_TOP_W, WH_TOP_Y = 815.0, 31.4, 22.0, (21.0, 44.0)      # nine channel keys across the top
 WH_KEY_X0, WH_KEY_P, WH_KEY_W = 113.0, 36.0, 28.0                              # input / output channel keys
@@ -106,8 +106,8 @@ WH_P_TRANS_CLEAN = ((1604.0, 387.0, 1787.0, 411.0), (0.0, 400.0, 183.0, 424.0))
 # regions where the OFF art differs from the lit art (rects in art px) - blitted at (1 - power)
 WH_OFF_REGIONS = (
     tuple((r[0] - 5, r[1] - 5, r[2] + 5, r[3] + 5) for r in WH_SCR.values())
-    + ((WH_ON[0] - 3, WH_ON[1] - 3, WH_ON[2] + 3, WH_ON[3] + 3),)
-    + tuple((r[0] - 6, r[1] - 6, r[2] + 6, r[3] + 6) for r in (WH_LOGO, WH_COLLAPSE, WH_CLOSE, WH_TRANS))
+    + ((WH_NUMBER[0] - 3, WH_NUMBER[1] - 3, WH_NUMBER[2] + 3, WH_NUMBER[3] + 3),)
+    + tuple((r[0] - 5, r[1] - 5, r[2] + 5, r[3] + 5) for r in (WH_LOGO, WH_COLLAPSE, WH_CLOSE, WH_POWER, WH_TRANS))
     + tuple((r[0] - 2, r[1] - 2, r[2] + 2, r[3] + 2) for r in (list(WH_ARR.values()) + list(WH_STYLE) + list(WH_POS)
                                                                 + list(WH_MODE)))
     + tuple((cx - 34, cy - 30, cx + 34, cy + 30) for (cx, cy) in WH_EYES)
@@ -115,6 +115,7 @@ WH_OFF_REGIONS = (
 
 # ── text sizes (art px) and colours ──────────────────────────────────────────
 WH_FS_BIG = 21.0
+WH_FS_VAL = 17.0                                # model / segment / language value text
 WH_FS_SCR = 16.0
 WH_FS_SMALL = 14.0
 WH_FS_KEY = 17.0
@@ -129,6 +130,7 @@ WH_GLOW = (1.00, 0.16, 0.16)
 WH_GLOW_AMT = 0.9
 WH_GLOW_SCALE = 0.5
 WH_NOTE = (1.00, 0.52, 0.48, 1.00)              # hints printed in light on the metal
+WH_PATH = (1.00, 0.76, 0.74, 1.00)              # SRT path: bright so it reads on the red glass
 WH_AMBER = (1.00, 0.72, 0.22, 1.00)
 WH_STEEL = (0.62, 0.62, 0.66, 0.95)             # stamped digits on the dark keys
 WH_INK = (0.05, 0.05, 0.06, 0.92)               # printed labels (match the black lettering in the art)
@@ -208,7 +210,7 @@ def wh_pp_hit(mx, my, rack, ai_idx, rack_x, rack_y, rw, rh):
         return {'zone': 'ai_collapse', 'ai_idx': ai_idx}
     if _in(R(WH_CLOSE), mx, my):
         return {'zone': 'ai_delete', 'ai_idx': ai_idx}
-    if _in(R(WH_ON), mx, my):
+    if _in(R(WH_POWER), mx, my):
         return {'zone': 'ai_on_off', 'ai_idx': ai_idx}
     for ci in range(9):
         if _in(R(_top_key(ci)), mx, my):
@@ -348,6 +350,172 @@ def _fit_tail(text, max_chars):
     return "..." + text[-(max_chars - 3):]
 
 
+# ── terminator-style targeting HUD, behind the font list ─────────────────────
+WH_HUD_BOX = (664.0, 80.0, 1146.0, 168.0)       # clip box inside the glass (art px)
+WH_HUD_X = (712.0, 1100.0)                      # where the reticle may roam (centre)
+WH_HUD_Y = (100.0, 148.0)
+WH_HUD_R = 28.0                                 # ring radius (art px)
+WH_HUD_BR = 38.0                                # bracket half-side
+WH_HUD_ALPHA = 0.60
+
+
+_hud_clock = {}
+
+
+def _hh(a, b):
+    x = (a * 374761393 + b * 668265263) & 0xFFFFFFFF
+    x = ((x ^ (x >> 13)) * 1274126177) & 0xFFFFFFFF
+    return ((x ^ (x >> 16)) & 0xFFFF) / 65535.0
+
+
+def _ease(t):
+    t = max(0.0, min(1.0, t))
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _hud_waypoint(seed, n):
+    return (WH_HUD_X[0] + (WH_HUD_X[1] - WH_HUD_X[0]) * _hh(seed, n * 2 + 1),
+            WH_HUD_Y[0] + (WH_HUD_Y[1] - WH_HUD_Y[0]) * _hh(seed, n * 2 + 2))
+
+
+WH_HUD_CYCLE = 13.0                             # one lock-on every cycle: it roams for 8.4-10 s first
+WH_HUD_HOLD = 2.0                               # seconds held on target
+
+
+def _hud_roam(seed, t):
+    """Free roaming: a few slow sine sweeps, so it keeps moving and never stops."""
+    ph = [_hh(seed, 40 + i) * 6.2832 for i in range(5)]
+    mx, my = (WH_HUD_X[0] + WH_HUD_X[1]) / 2.0, (WH_HUD_Y[0] + WH_HUD_Y[1]) / 2.0
+    x = mx + 112.0 * math.sin(0.50 * t + ph[0]) + 62.0 * math.sin(1.17 * t + ph[1]) + 20.0 * math.sin(2.3 * t + ph[2])
+    y = my + 17.0 * math.sin(0.83 * t + ph[3]) + 7.0 * math.sin(1.9 * t + ph[4])
+    return (max(WH_HUD_X[0], min(WH_HUD_X[1], x)), max(WH_HUD_Y[0], min(WH_HUD_Y[1], y)))
+
+
+def _hud_state(seed, t):
+    """(cx, cy, lock 0..1, blink 0..1) at clock t. It roams freely, then every WH_HUD_CYCLE seconds sweeps onto a
+    target, locks (brackets close in, ring blinks) for WH_HUD_HOLD seconds and lets go again."""
+    d = WH_HUD_CYCLE
+    n = int(t // d)
+    u = t - n * d
+    h = 8.4 + 1.6 * _hh(seed, 700 + n)                 # when the hold starts in this cycle
+    ta = h - 1.0                                       # start of the sweep onto the target
+    rx, ry = _hud_roam(seed, t)
+    tx, ty = _hud_waypoint(seed, n)
+    if u < ta:
+        return rx, ry, 0.0, 0.0
+    if u < h:
+        k = _ease(u - ta)
+        lock = _ease((u - ta - 0.5) / 0.5)
+        return rx + (tx - rx) * k, ry + (ty - ry) * k, lock, 0.0
+    if u < h + WH_HUD_HOLD:
+        blink = 0.5 + 0.5 * math.sin((u - h) * 26.0)
+        return tx + 0.6 * math.sin(t * 9.0), ty + 0.6 * math.sin(t * 7.0), 1.0, blink
+    k = 1.0 - _ease((u - h - WH_HUD_HOLD) / 0.6)
+    return rx + (tx - rx) * k, ry + (ty - ry) * k, k, 0.0
+
+
+def _clip_seg(x0, y0, x1, y1, box):
+    """Liang-Barsky clip of a segment to box; None if outside."""
+    dx, dy = x1 - x0, y1 - y0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x0 - box[0]), (dx, box[2] - x0), (-dy, y0 - box[1]), (dy, box[3] - y0)):
+        if p == 0.0:
+            if q < 0.0:
+                return None
+        else:
+            r = q / p
+            if p < 0.0:
+                if r > t1:
+                    return None
+                t0 = max(t0, r)
+            else:
+                if r < t0:
+                    return None
+                t1 = min(t1, r)
+    return (x0 + t0 * dx, y0 + t0 * dy, x0 + t1 * dx, y0 + t1 * dy)
+
+
+def _seg_quads(g, segs, th_art, box):
+    """Segments (art px) -> triangle list in screen px, clipped to box, thickness th_art."""
+    out = []
+    half = max(0.5, th_art * g.s * 0.5)
+    for (x0, y0, x1, y1) in segs:
+        c = _clip_seg(x0, y0, x1, y1, box)
+        if c is None:
+            continue
+        ax, ay, bx, by = g.X(c[0]), g.Y(c[1]), g.X(c[2]), g.Y(c[3])
+        dx, dy = bx - ax, by - ay
+        ln = math.hypot(dx, dy)
+        if ln < 1e-4:
+            continue
+        nx, ny = -dy / ln * half, dx / ln * half
+        a1, a2, b1, b2 = (ax + nx, ay + ny), (ax - nx, ay - ny), (bx + nx, by + ny), (bx - nx, by - ny)
+        out += [a1, a2, b1, a2, b2, b1]
+    return out
+
+
+def _tris(sh, pts, col):
+    if not pts:
+        return
+    gpu.state.blend_set("ADDITIVE")
+    sh.bind()
+    sh.uniform_float("color", col)
+    batch_for_shader(sh, "TRIS", {"pos": pts}).draw(sh)
+    gpu.state.blend_set("ALPHA")
+
+
+def _draw_hud(g, sh, ai_idx, now, lv, busy):
+    """Targeting reticle (ring + corner brackets + ticks) roaming the font screen, with cross-hair lines and a slow
+    scan sweep. Faint and additive so the font names stay readable on top."""
+    if lv <= 0.01:
+        return
+    seed = 7 + ai_idx * 31
+    st = _hud_clock.get(ai_idx)
+    if st is None:
+        st = _hud_clock[ai_idx] = [float(_hh(seed, 5) * 1000.0), now, 1.0]
+    dt = max(0.0, min(0.1, now - st[1]))
+    st[1] = now
+    st[2] += ((1.8 if busy else 1.0) - st[2]) * min(1.0, dt * 2.0)
+    st[0] += dt * st[2]
+    t = st[0]
+    cx, cy, lock, blink = _hud_state(seed, t)
+    box = WH_HUD_BOX
+    R_ = WH_HUD_R * (1.0 - 0.10 * lock)
+    B_ = WH_HUD_BR * (1.0 - 0.30 * lock)
+    arm = 12.0
+    ring, inner, ticks, brk = [], [], [], []
+    N = 44
+    for i in range(N):
+        a0, a1 = 2 * math.pi * i / N, 2 * math.pi * (i + 1) / N
+        ring.append((cx + R_ * math.cos(a0), cy + R_ * math.sin(a0), cx + R_ * math.cos(a1), cy + R_ * math.sin(a1)))
+    r2 = R_ * 0.30
+    for i in range(20):
+        a0, a1 = 2 * math.pi * i / 20, 2 * math.pi * (i + 1) / 20
+        inner.append((cx + r2 * math.cos(a0), cy + r2 * math.sin(a0), cx + r2 * math.cos(a1), cy + r2 * math.sin(a1)))
+    for (ux, uy) in ((1, 0), (-1, 0), (0, 1), (0, -1)):      # ticks: from inside the ring to just past it
+        ticks.append((cx + ux * R_ * 0.52, cy + uy * R_ * 0.52, cx + ux * R_ * 1.22, cy + uy * R_ * 1.22))
+    for sx_ in (-1, 1):                                       # corner brackets of the square
+        for sy_ in (-1, 1):
+            px, py = cx + sx_ * B_, cy + sy_ * B_
+            brk.append((px, py, px - sx_ * arm, py))
+            brk.append((px, py, px, py - sy_ * arm))
+    axis = [(box[0], cy, cx - B_ - 6.0, cy), (cx + B_ + 6.0, cy, box[2], cy),
+            (cx, box[1], cx, cy - B_ - 6.0), (cx, cy + B_ + 6.0, cx, box[3])]
+    a = WH_HUD_ALPHA * lv
+    hot = 0.55 * lock * (0.6 + 0.4 * blink)
+    # long cross-hair lines (very faint)
+    _tris(sh, _seg_quads(g, axis, 0.9, box), (1.0, 0.18, 0.22, 0.30 * a))
+    # slow scan sweep
+    sw = box[1] + (box[3] - box[1]) * ((now * 0.22) % 1.0)
+    _tris(sh, _seg_quads(g, [(box[0], sw, box[2], sw)], 1.2, box), (1.0, 0.25, 0.28, 0.16 * a))
+    # glow, then crisp lines
+    shapes = ring + inner + ticks + brk
+    _tris(sh, _seg_quads(g, shapes, 4.2, box), (1.0, 0.10, 0.14, (0.10 + 0.14 * lock) * a))
+    _tris(sh, _seg_quads(g, ring + ticks, 1.5, box), (1.0, 0.42 + hot * 0.4, 0.44 + hot * 0.4, 0.80 * a))
+    _tris(sh, _seg_quads(g, inner + brk, 1.5, box), (1.0, 0.36 + hot * 0.4, 0.38 + hot * 0.4, 0.85 * a))
+    _tris(sh, _seg_quads(g, [(cx - 1.6, cy, cx + 1.6, cy)], 3.0, box), (1.0, 0.75, 0.75, 0.9 * a))
+
+
 def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     """packApunch Whisper rack: everything that changes, drawn over the baked art."""
     g = _G(rx, ry, rw, rh)
@@ -393,10 +561,11 @@ def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     in_ch = active_chs[0] if active_chs else -1
     pulse = 0.5 + 0.5 * math.sin(now * 5.0)
 
-    # ── rack number, printed on the plate right of the logo ──────────────────
-    nx, ny = g.X(WH_NUMBER_AT[0]), g.Y(WH_NUMBER_AT[1])
-    _text_shadowed(str(ai_idx + 1), nx, ny, WH_FS_NUM, g, (0.10, 0.10, 0.11, 0.9), 1.0, "c",
-                   shadow=(1.0, 1.0, 1.0, 0.18), off=1.2)
+    # ── rack number in the red box beside the collapse key: hot pink on lit glass, dim maroon when the rack is off ──
+    nr = R(WH_NUMBER)
+    ncx, ncy = (nr[0] + nr[2]) / 2, g.Y((WH_NUMBER[1] + WH_NUMBER[3]) / 2 + 0.5)
+    _text(str(ai_idx + 1), ncx, ncy, WH_FS_NUM, g, (0.46, 0.08, 0.10, 0.95), 1.0 - lv, "c", glow=0.0)
+    _text(str(ai_idx + 1), ncx, ncy, WH_FS_NUM, g, WH_CORE, lv, "c", glow=1.0)
 
     # ── lit keys: top channel keys, input keys, output keys ──────────────────
     for ci in range(9):
@@ -462,19 +631,20 @@ def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     # ── MODEL SIZE screen ────────────────────────────────────────────────────
     sm = R(WH_SCR['model'])
     scy = (sm[1] + sm[3]) / 2
-    _text(_MODEL_LABELS[model_idx], sm[0] + 14 * g.s, scy, WH_FS_BIG, g, WH_CORE, lv, glow=1.0)
+    _text(_MODEL_LABELS[model_idx], sm[0] + 14 * g.s, scy, WH_FS_VAL, g, WH_CORE, lv, glow=1.0)
     _text(_MODEL_DESCS[model_idx], sm[2] - 14 * g.s, scy, WH_FS_SCR, g, WH_RED, lv, "r", glow=0.6,
           max_w=(sm[2] - sm[0]) * 0.62)
 
     # ── MAX SEGMENT screen ───────────────────────────────────────────────────
     sc = R(WH_SCR['chunk'])
     scy = (sc[1] + sc[3]) / 2
-    _text(f"{chunk_len}s", sc[0] + 14 * g.s, scy, WH_FS_BIG, g, WH_CORE, lv, glow=1.0)
+    _text(f"{chunk_len}s", sc[0] + 14 * g.s, scy, WH_FS_VAL, g, WH_CORE, lv, glow=1.0)
     _text("5s = more strips   30s = fewer strips", sc[2] - 14 * g.s, scy, WH_FS_SCR, g, WH_RED, lv, "r", glow=0.6,
           max_w=(sc[2] - sc[0]) * 0.62)
 
     # ── FONT screen: scrolling list ──────────────────────────────────────────
     fr = R(WH_SCR['font'])
+    _draw_hud(g, sh, ai_idx, now, lv, busy)
     fonts = get_system_fonts()
     if fonts:
         vis = WH_FONT_ROWS
@@ -534,7 +704,7 @@ def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
 
     # ── AUDIO LANGUAGE screen ────────────────────────────────────────────────
     lr = R(WH_SCR['lang'])
-    _text(_LANG_LABELS[lang_idx].upper(), (lr[0] + lr[2]) / 2, (lr[1] + lr[3]) / 2, WH_FS_BIG, g, WH_CORE, lv, "c",
+    _text(_LANG_LABELS[lang_idx].upper(), (lr[0] + lr[2]) / 2, (lr[1] + lr[3]) / 2, WH_FS_VAL, g, WH_CORE, lv, "c",
           glow=1.0, max_w=(lr[2] - lr[0]) * 0.8)
     _text(f"{lang_idx + 1:02d}/{len(_LANG_LABELS):02d}", lr[2] - 14 * g.s, (lr[1] + lr[3]) / 2, WH_FS_SMALL, g,
           WH_RED_DIM, lv, "r", glow=0.3)
@@ -554,7 +724,7 @@ def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     scy = (sr_[1] + sr_[3]) / 2
     if srt_on:
         path_disp = _fit_tail(srt_path, 62) if srt_path else "(no path set)"
-        _text(path_disp, sr_[0] + 12 * g.s, scy, WH_FS_SCR, g, WH_RED if srt_path else WH_RED_DIM, lv, glow=0.6,
+        _text(path_disp, sr_[0] + 12 * g.s, scy, WH_FS_SCR + 1.0, g, WH_PATH, lv, glow=0.7,
               max_w=(WH_SRT_BROWSE[0] - 1196.0 - 24.0) * g.sx)
         if lv > 0.01:                                       # small browse key at the right end of the screen
             bb = R(WH_SRT_BROWSE)
@@ -562,9 +732,9 @@ def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
             for (a, b_, c, d) in ((bb[0], bb[1], bb[2], bb[1] + 1.2 * g.s), (bb[0], bb[3] - 1.2 * g.s, bb[2], bb[3]),
                                   (bb[0], bb[1], bb[0] + 1.2 * g.s, bb[3]), (bb[2] - 1.2 * g.s, bb[1], bb[2], bb[3])):
                 _quad(sh, a, b_, c, d, (1.0, 0.45, 0.45, 0.9 * lv))
-            _text("...", (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2 - 3 * g.s, WH_FS_BIG, g, WH_CORE, lv, "c", glow=0.8)
+            _text("...", (bb[0] + bb[2]) / 2, (bb[1] + bb[3]) / 2 + 8 * g.s, WH_FS_BIG, g, WH_CORE, lv, "c", glow=0.8)
     else:
-        _text("SRT EXPORT OFF", sr_[0] + 12 * g.s, scy, WH_FS_SCR, g, WH_RED_DIM, lv, glow=0.3)
+        _text("SRT EXPORT OFF", sr_[0] + 12 * g.s, scy, WH_FS_SCR, g, WH_RED, lv, glow=0.4)
 
     # ── status screen (bottom left) ──────────────────────────────────────────
     st = R(WH_SCR['status'])
