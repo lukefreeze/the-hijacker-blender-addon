@@ -1,6 +1,15 @@
 // ---------------------------------------------------------------------------
 // hijacker_processor.cpp
 // The Hijacker — DSP effect chain (EQ, compressor, reverb, gate, delay)
+//
+// Real-time rules followed in this file (everything here can run on the
+// audio thread):
+//   * no heap allocation (delay lines are created by hj_ensure_delay_buffers()
+//     when an effect slot is assigned; apply_delay() only allocates as a last
+//     resort for the offline path)
+//   * no locks, no I/O
+//   * no per-sample transcendental calls on the hot path where a cheaper
+//     exact alternative exists
 // ---------------------------------------------------------------------------
 #include "hijacker_processor.h"
 #include "mixer_ui.h"
@@ -12,10 +21,27 @@
 #include <memory>
 #include <cstring>
 #include <cstdio>
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 extern "C" { extern EngineState g_state; }
 
 static const float PI = 3.14159265358979f;
+
+// ---------------------------------------------------------------------------
+// EQ output stage.
+//   1 = legacy: s / (1 + |s|) soft saturation after every EQ pass. This colours
+//       the sound (and lowers the level) whenever the EQ slot is enabled.
+//   0 = off: the EQ is a clean linear filter bank.
+//   2 = transparent safety: perfectly linear below 0.9, smooth soft-clip above
+//       (only catches true overs).
+// Defaults to 2 (clean below 0.9, soft safety above). Build with
+// -DHJ_EQ_OUTPUT_MODE=1 to get the legacy colouring back.
+// ---------------------------------------------------------------------------
+#ifndef HJ_EQ_OUTPUT_MODE
+#define HJ_EQ_OUTPUT_MODE 2
+#endif
 
 // ===========================================================================
 // Param denormalisation
@@ -58,11 +84,21 @@ static inline float lin2db(float lin) { return 20.0f * std::log10(lin + 1e-9f); 
 
 // ===========================================================================
 // Soft-knee gain computer
+//
+// Returns the gain change in dB (<= 0). The caller pre-computes
+// `lin_floor` = linear level below which the gain computer is exactly 0 dB
+// (threshold minus half the knee), so the common "not compressing" case costs
+// one comparison instead of a log10 + pow per sample.
 // ===========================================================================
-static float soft_knee_gr(float level_lin, float thr_db,
-                           float ratio, float knee_db)
+static inline float knee_floor_lin(float thr_db, float knee_db)
 {
-    if (level_lin <= 0.0f) return 1.0f;
+    return db2lin(thr_db - knee_db * 0.5f) - 1e-9f;
+}
+
+static inline float soft_knee_gr_db(float level_lin, float lin_floor,
+                                    float thr_db, float ratio, float knee_db)
+{
+    if (level_lin <= lin_floor) return 0.0f;
     float in_db  = lin2db(level_lin);
     float half_k = knee_db * 0.5f;
 
@@ -75,8 +111,8 @@ static float soft_knee_gr(float level_lin, float thr_db,
     } else {
         out_db = thr_db + (in_db - thr_db) / ratio;
     }
-
-    return db2lin(out_db - in_db);
+    float gr_db = out_db - in_db;
+    return gr_db < 0.0f ? gr_db : 0.0f;
 }
 
 // Forward declaration — defined after apply_comp_multi
@@ -90,7 +126,6 @@ static void apply_comp_single(int ch, aud::sample_t* buf,
                                const EffectSlot& fx,
                                float sr)
 {
-    // Param snapshot — prevents torn reads if a preset changes mid-buffer
     float thr_db  = denorm_threshold_full(fx.params[0]);  // -40..0dB for full signal
     float ratio   = denorm_ratio    (fx.params[1]);
     float atk_ms  = denorm_attack   (fx.params[2]);
@@ -100,9 +135,10 @@ static void apply_comp_single(int ch, aud::sample_t* buf,
 
     float atk_c = time_coeff(atk_ms, sr);
     float rel_c = time_coeff(rel_ms, sr);
+    float floor_lin = knee_floor_lin(thr_db, knee_db);
 
     CompressorBandState& st = g_state.comp_state[ch].single;
-    float max_gr_db = 0.0f;
+    float min_gr = 1.0f;
 
     for (int f = 0; f < frames; ++f) {
         float peak = 0.0f;
@@ -112,14 +148,16 @@ static void apply_comp_single(int ch, aud::sample_t* buf,
         float coeff = (peak > st.envelope) ? atk_c : rel_c;
         st.envelope = coeff * st.envelope + (1.0f - coeff) * peak;
 
-        float gr    = soft_knee_gr(st.envelope, thr_db, ratio, knee_db);
-        float gr_db = (gr < 1.0f) ? lin2db(gr) : 0.0f;
-        if (gr_db < max_gr_db) max_gr_db = gr_db;
+        float gr_db = soft_knee_gr_db(st.envelope, floor_lin, thr_db, ratio, knee_db);
+        float gr    = (gr_db < 0.0f) ? db2lin(gr_db) : 1.0f;
+        if (gr < min_gr) min_gr = gr;
 
+        float g = gr * mkp_lin;
         for (int c = 0; c < n_ch; ++c)
-            buf[f * n_ch + c] *= gr * mkp_lin;
+            buf[f * n_ch + c] *= g;
     }
 
+    float max_gr_db = (min_gr < 1.0f) ? lin2db(min_gr) : 0.0f;
     const float sm = 0.6f;  // faster decay than 0.85 — GR meter responds more snappily
     g_state.gr_levels[ch][0] = sm * g_state.gr_levels[ch][0]
                               + (1.0f - sm) * (-max_gr_db);
@@ -159,6 +197,19 @@ static BiquadCoeffs butter_hp(float freq, float sr) {
     return c;
 }
 
+// Second-order all-pass with the same poles as the Butterworth section above.
+// LP4 + HP4 of a Linkwitz-Riley crossover sums to exactly this response, so it
+// is used to phase-align the bands that skip a later crossover.
+static BiquadCoeffs butter_ap(float freq, float sr) {
+    float w = 2.0f * PI * freq / sr;
+    float cw = std::cos(w), sw = std::sin(w);
+    float alpha = sw / (2.0f * 0.7071068f), a0 = 1.0f + alpha;
+    BiquadCoeffs c;
+    c.b0=(1.0f-alpha)/a0; c.b1=-2.0f*cw/a0; c.b2=1.0f;     // (1+alpha)/a0 == 1
+    c.a1=-2.0f*cw/a0; c.a2=(1.0f-alpha)/a0;
+    return c;
+}
+
 static inline float biquad_step(float x, const BiquadCoeffs& co,
                                  float& z1, float& z2)
 {
@@ -185,6 +236,12 @@ static void lr_filter(float* buf, int n, const BiquadCoeffs& co,
         s = biquad_step(s, co, state_b[0], state_b[1]);
         buf[f] = s;
     }
+}
+
+static void ap_filter(float* buf, int n, const BiquadCoeffs& co, float* state)
+{
+    for (int f = 0; f < n; ++f)
+        buf[f] = biquad_step(buf[f], co, state[0], state[1]);
 }
 
 // ===========================================================================
@@ -247,34 +304,87 @@ static inline float eq_q_from_norm(float n) {
     return std::pow(10.0f, -1.0f + n * 2.0f);
 }
 
+static inline float eq_output_stage(float s)
+{
+#if HJ_EQ_OUTPUT_MODE == 1
+    return s / (1.0f + std::abs(s));
+#elif HJ_EQ_OUTPUT_MODE == 2
+    const float knee = 0.9f;
+    float a = std::abs(s);
+    if (a <= knee) return s;
+    float over = a - knee;
+    float y = knee + over / (1.0f + over / (1.0f - knee));   // asymptote 1.0, C1 at knee
+    return s < 0.0f ? -y : y;
+#else
+    return s;
+#endif
+}
+
 static void apply_eq_param(int ch, aud::sample_t* buf, int frames, int n_ch,
                             const EffectSlot& fx, float sr)
 {
-    BiquadCoeffs coeffs[7]; bool active[7] = {};
+    EqChannelState& eq = g_state.eq_state[ch];
+    const BiquadCoeffs ident = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    BiquadCoeffs tgt[7], start[7];
+    bool run[7], ramp[7];
+
     for (int bi = 0; bi < 7; ++bi) {
         float gdb = (fx.params[bi] - 0.5f) * 48.0f;
-        if (std::abs(gdb) < 0.5f) { active[bi]=false; continue; }
-        active[bi] = true;
-        float fn = fx.params[bi+7], qn = fx.params[bi+14];
-        float freq = (fn>0.0f) ? eq_freq_from_norm(fn) : EQ_DEF_FREQ[bi];
-        float q    = (qn>0.0f) ? eq_q_from_norm(qn)    : EQ_DEF_Q[bi];
-        freq = std::max(20.0f, std::min(freq, sr*0.49f));
-        q    = std::max(0.1f,  std::min(q,    10.0f));
-        if      (bi==0) coeffs[bi] = eq_low_shelf (gdb, freq, q, sr);
-        else if (bi==6) coeffs[bi] = eq_high_shelf(gdb, freq, q, sr);
-        else            coeffs[bi] = eq_peak      (gdb, freq, q, sr);
-    }
-    EqChannelState& eq = g_state.eq_state[ch];
-    int nc = std::min(n_ch, 2);
-    for (int f = 0; f < frames; ++f) {
-        for (int c = 0; c < nc; ++c) {
-            float s = buf[f*n_ch+c];
-            for (int bi = 0; bi < 7; ++bi) {
-                if (!active[bi]) continue;
-                s = biquad_step(s, coeffs[bi], eq.bands[bi].z1[c], eq.bands[bi].z2[c]);
-            }
-            buf[f*n_ch+c] = s / (1.0f + std::abs(s));
+        bool  active = std::abs(gdb) >= 0.5f;
+        if (active) {
+            float fn = fx.params[bi+7], qn = fx.params[bi+14];
+            float freq = (fn>0.0f) ? eq_freq_from_norm(fn) : EQ_DEF_FREQ[bi];
+            float q    = (qn>0.0f) ? eq_q_from_norm(qn)    : EQ_DEF_Q[bi];
+            freq = std::max(20.0f, std::min(freq, sr*0.49f));
+            q    = std::max(0.1f,  std::min(q,    10.0f));
+            if      (bi==0) tgt[bi] = eq_low_shelf (gdb, freq, q, sr);
+            else if (bi==6) tgt[bi] = eq_high_shelf(gdb, freq, q, sr);
+            else            tgt[bi] = eq_peak      (gdb, freq, q, sr);
+        } else {
+            tgt[bi] = ident;
         }
+        const float* pc = eq.bands[bi].pc;
+        start[bi] = { pc[0], pc[1], pc[2], pc[3], pc[4] };
+        bool start_is_ident = (pc[0]==1.0f && pc[1]==0.0f && pc[2]==0.0f &&
+                               pc[3]==0.0f && pc[4]==0.0f);
+        run[bi]  = active || !start_is_ident;      // still fading out => keep running
+        ramp[bi] = run[bi] && (start[bi].b0 != tgt[bi].b0 || start[bi].b1 != tgt[bi].b1 ||
+                               start[bi].b2 != tgt[bi].b2 || start[bi].a1 != tgt[bi].a1 ||
+                               start[bi].a2 != tgt[bi].a2);
+    }
+
+    const float inv_frames = 1.0f / (float)std::max(1, frames);
+    int nc = std::min(n_ch, 2);
+    for (int c = 0; c < nc; ++c) {
+        for (int f = 0; f < frames; ++f) {
+            float s = buf[f*n_ch+c];
+            float t = (float)(f + 1) * inv_frames;
+            for (int bi = 0; bi < 7; ++bi) {
+                EqBandState& b = eq.bands[bi];
+                if (!run[bi]) {
+                    // Identity filter: keep the delay line current (w == x) so
+                    // a band that is switched on later starts from a consistent state.
+                    b.z2[c] = b.z1[c]; b.z1[c] = s;
+                    continue;
+                }
+                BiquadCoeffs co = tgt[bi];
+                if (ramp[bi]) {
+                    co.b0 = start[bi].b0 + (tgt[bi].b0 - start[bi].b0) * t;
+                    co.b1 = start[bi].b1 + (tgt[bi].b1 - start[bi].b1) * t;
+                    co.b2 = start[bi].b2 + (tgt[bi].b2 - start[bi].b2) * t;
+                    co.a1 = start[bi].a1 + (tgt[bi].a1 - start[bi].a1) * t;
+                    co.a2 = start[bi].a2 + (tgt[bi].a2 - start[bi].a2) * t;
+                }
+                s = biquad_step(s, co, b.z1[c], b.z2[c]);
+            }
+            buf[f*n_ch+c] = eq_output_stage(s);
+        }
+    }
+    for (int bi = 0; bi < 7; ++bi) {
+        float* pc = eq.bands[bi].pc;
+        pc[0]=tgt[bi].b0; pc[1]=tgt[bi].b1; pc[2]=tgt[bi].b2;
+        pc[3]=tgt[bi].a1; pc[4]=tgt[bi].a2;
     }
 }
 
@@ -284,19 +394,21 @@ static void apply_eq_param(int ch, aud::sample_t* buf, int frames, int n_ch,
 static inline float comb_step(CombState& st, float in,
                                 int len, float feedback, float damp)
 {
+    if (st.pos >= len) st.pos = 0;
     float out    = st.buf[st.pos];
     st.filter    = out * (1.0f - damp) + st.filter * damp;
     st.buf[st.pos] = in + st.filter * feedback;
-    st.pos = (st.pos + 1) % len;
+    if (++st.pos >= len) st.pos = 0;
     return out;
 }
 
 static inline float allpass_step(AllpassState& st, float in, int len)
 {
+    if (st.pos >= len) st.pos = 0;
     float buf_out = st.buf[st.pos];
     float out     = -in + buf_out;
     st.buf[st.pos]= in + buf_out * 0.5f;
-    st.pos = (st.pos + 1) % len;
+    if (++st.pos >= len) st.pos = 0;
     return out;
 }
 
@@ -310,44 +422,55 @@ static void apply_reverb_param(int ch, aud::sample_t* buf, int frames, int n_ch,
     float pd_norm   = fx.params[3];
     float width     = fx.params[4];
     int   pd_samp   = (int)(pd_norm * 0.1f * sr);
-    pd_samp = std::min(pd_samp, MAX_PREDELAY_SAMP - 1);
+    pd_samp = std::max(0, std::min(pd_samp, MAX_PREDELAY_SAMP - 1));
 
     ReverbChannelState& rv = g_state.reverb_state[ch];
     rv.sample_rate = sr;
     float sr_scale = sr / 44100.0f;
 
+    // Delay-line lengths depend only on the sample rate: compute them once per
+    // buffer instead of once per sample.
+    int comb_len_l[PB_REVERB_COMB], comb_len_r[PB_REVERB_COMB];
+    int ap_len_l[PB_REVERB_AP],     ap_len_r[PB_REVERB_AP];
+    for (int i = 0; i < PB_REVERB_COMB; ++i) {
+        comb_len_l[i] = std::max(1, std::min((int)(COMB_LENGTHS_L[i] * sr_scale), MAX_COMB_LEN-1));
+        comb_len_r[i] = std::max(1, std::min((int)(COMB_LENGTHS_R[i] * sr_scale), MAX_COMB_LEN-1));
+    }
+    for (int i = 0; i < PB_REVERB_AP; ++i) {
+        ap_len_l[i] = std::max(1, std::min((int)(AP_LENGTHS_L[i] * sr_scale), MAX_AP_LEN-1));
+        ap_len_r[i] = std::max(1, std::min((int)(AP_LENGTHS_R[i] * sr_scale), MAX_AP_LEN-1));
+    }
+
     for (int f = 0; f < frames; ++f) {
         float in_l = buf[f*n_ch + 0];
         float in_r = (n_ch > 1) ? buf[f*n_ch + 1] : in_l;
 
+        // Pre-delay: a fixed-size ring that is written every sample and read
+        // `pd_samp` samples behind the write head. Changing the pre-delay time
+        // therefore never reads stale or mismatched positions.
+        int wp = rv.pd_write[0];
+        rv.predelay[0][wp] = in_l;
+        rv.predelay[1][wp] = in_r;
         float pd_in_l = in_l, pd_in_r = in_r;
         if (pd_samp > 0) {
-            pd_in_l = rv.predelay[0][rv.pd_write[0]];
-            pd_in_r = rv.predelay[1][rv.pd_write[1]];
-            rv.predelay[0][rv.pd_write[0]] = in_l;
-            rv.predelay[1][rv.pd_write[1]] = in_r;
-            rv.pd_write[0] = (rv.pd_write[0] + 1) % std::max(1, pd_samp);
-            rv.pd_write[1] = (rv.pd_write[1] + 1) % std::max(1, pd_samp);
+            int rp = wp - pd_samp;
+            if (rp < 0) rp += MAX_PREDELAY_SAMP;
+            pd_in_l = rv.predelay[0][rp];
+            pd_in_r = rv.predelay[1][rp];
         }
+        if (++wp >= MAX_PREDELAY_SAMP) wp = 0;
+        rv.pd_write[0] = rv.pd_write[1] = wp;
         float verb_in = (pd_in_l + pd_in_r) * 0.5f;
 
         float out_l = 0.0f, out_r = 0.0f;
         for (int i = 0; i < PB_REVERB_COMB; ++i) {
-            int len_l = (int)(COMB_LENGTHS_L[i] * sr_scale);
-            int len_r = (int)(COMB_LENGTHS_R[i] * sr_scale);
-            len_l = std::max(1, std::min(len_l, MAX_COMB_LEN-1));
-            len_r = std::max(1, std::min(len_r, MAX_COMB_LEN-1));
-            out_l += comb_step(rv.comb[0][i], verb_in, len_l, room_sz, damp);
-            out_r += comb_step(rv.comb[1][i], verb_in, len_r, room_sz, damp);
+            out_l += comb_step(rv.comb[0][i], verb_in, comb_len_l[i], room_sz, damp);
+            out_r += comb_step(rv.comb[1][i], verb_in, comb_len_r[i], room_sz, damp);
         }
 
         for (int i = 0; i < PB_REVERB_AP; ++i) {
-            int len_l = (int)(AP_LENGTHS_L[i] * sr_scale);
-            int len_r = (int)(AP_LENGTHS_R[i] * sr_scale);
-            len_l = std::max(1, std::min(len_l, MAX_AP_LEN-1));
-            len_r = std::max(1, std::min(len_r, MAX_AP_LEN-1));
-            out_l = allpass_step(rv.ap[0][i], out_l, len_l);
-            out_r = allpass_step(rv.ap[1][i], out_r, len_r);
+            out_l = allpass_step(rv.ap[0][i], out_l, ap_len_l[i]);
+            out_r = allpass_step(rv.ap[1][i], out_r, ap_len_r[i]);
         }
 
         float width_mix = width * 0.5f;
@@ -372,11 +495,58 @@ static void apply_reverb_param(int ch, aud::sample_t* buf, int frames, int n_ch,
 //     the feedback is written into
 //   - Dry signal is always passed through at full level (mix = wet only)
 //   - LP cutoff: 200 Hz (filter=0) → 20000 Hz (filter=1) on a log scale
+//   - The delay time is slewed (~20 ms) and read with linear interpolation, so
+//     turning the Time control glides like a tape delay instead of clearing the
+//     buffer and clicking.
 //
 // State is NOT reset between process_buffer() batch calls — DelayChannelState
 // lives in EngineState and persists across chunks so the tail rings through
-// correctly. It IS cleared on create_channel() / release_channel().
+// correctly.
 // ===========================================================================
+static inline int delay_buffer_size_for(float sr)
+{
+    return (int)std::ceil(2.0f * sr) + 68;     // max 2000 ms + interpolation/pad
+}
+
+// Delay lines that were replaced by a larger one. The audio thread may still be
+// reading the old block at that moment, so it is kept (not freed) until the
+// engine shuts down. This only happens when the sample rate asked for exceeds
+// what the line was first sized for - at most a handful of times per session.
+static std::mutex            g_delay_retired_mtx;
+static std::vector<float*>   g_delay_retired;
+
+void hj_ensure_delay_buffers(int ch, float sr)
+{
+    if (ch < 0 || ch >= PB_MAX_CHANNELS) return;
+    DelayChannelState& st = g_state.delay_state[ch];
+    int need = delay_buffer_size_for(sr);
+    if (st.buf_l && st.buf_r && st.buf_size >= need) return;
+    float* nl = new float[need]();
+    float* nr = new float[need]();
+    float* ol = st.buf_l; float* orr = st.buf_r;
+    st.cur_delay = -1.0f;
+    st.filter_z_l = st.filter_z_r = 0.0f;
+    st.write_l = st.write_r = 0;
+    st.buf_l = nl; st.buf_r = nr; st.buf_size = need;
+    if (ol || orr) {
+        std::lock_guard<std::mutex> lk(g_delay_retired_mtx);
+        if (ol)  g_delay_retired.push_back(ol);
+        if (orr) g_delay_retired.push_back(orr);
+    }
+}
+
+void hj_release_all_delay_buffers()
+{
+    for (int ch = 0; ch < PB_MAX_CHANNELS; ++ch) {
+        DelayChannelState& st = g_state.delay_state[ch];
+        delete[] st.buf_l; delete[] st.buf_r;
+        st = DelayChannelState{};
+    }
+    std::lock_guard<std::mutex> lk(g_delay_retired_mtx);
+    for (float* p : g_delay_retired) delete[] p;
+    g_delay_retired.clear();
+}
+
 static void apply_delay(int ch, aud::sample_t* buf, int frames, int n_ch,
                          const EffectSlot& fx, float sr)
 {
@@ -392,46 +562,46 @@ static void apply_delay(int ch, aud::sample_t* buf, int frames, int n_ch,
 
     int delay_samp = (int)(delay_ms * 0.001f * sr);
     delay_samp = std::max(1, delay_samp);
+    const float target = (float)delay_samp;
 
-    // Allocate or reallocate buffer when delay time changes.
-    // Buffer is sized to delay_samp + a small pad; this keeps it small
-    // and means the struct stays tiny (just two pointers).
-    // We add 64 samples of headroom so small knob nudges don't reallocate.
-    int needed = delay_samp + 64;
     DelayChannelState& st = g_state.delay_state[ch];
 
-    if (st.buf_l == nullptr || needed > st.buf_size) {
-        delete[] st.buf_l;
-        delete[] st.buf_r;
-        st.buf_l = new float[needed]();  // () zero-initialises
-        st.buf_r = new float[needed]();
-        st.buf_size = needed;
-        st.write_l = 0;
-        st.write_r = 0;
-        st.filter_z_l = 0.0f;
-        st.filter_z_r = 0.0f;
-        st.last_delay_samp = delay_samp;
-    } else if (std::abs(st.last_delay_samp - delay_samp) > 4) {
-        // Delay time changed — clear to avoid pitch artefacts
-        memset(st.buf_l, 0, st.buf_size * sizeof(float));
-        memset(st.buf_r, 0, st.buf_size * sizeof(float));
-        st.write_l = 0;
-        st.write_r = 0;
-        st.filter_z_l = 0.0f;
-        st.filter_z_r = 0.0f;
-        st.last_delay_samp = delay_samp;
-    }
+    // Normally allocated when the slot is assigned (hj_ensure_delay_buffers).
+    // This is only a safety net for the offline/batch path.
+    int need = delay_buffer_size_for(sr);
+    if (st.buf_l == nullptr || st.buf_r == nullptr || st.buf_size < need)
+        hj_ensure_delay_buffers(ch, sr);
 
-    int buf_sz = st.buf_size;
+    if (st.cur_delay < 0.0f) st.cur_delay = target;
+
+    const int   buf_sz = st.buf_size;
+    const float slew   = 1.0f - std::exp(-1.0f / (0.020f * sr));
+    float cur = st.cur_delay;
 
     for (int f = 0; f < frames; ++f) {
         float dry_l = buf[f * n_ch + 0];
         float dry_r = (n_ch > 1) ? buf[f * n_ch + 1] : dry_l;
 
-        int read_l = (st.write_l - delay_samp + buf_sz) % buf_sz;
-        int read_r = (st.write_r - delay_samp + buf_sz) % buf_sz;
-        float echo_l = st.buf_l[read_l];
-        float echo_r = st.buf_r[read_r];
+        if (cur != target) {
+            cur += (target - cur) * slew;
+            if (std::abs(target - cur) < 0.02f) cur = target;
+        }
+        int   di = (int)cur;
+        float fr = cur - (float)di;
+
+        int ia = st.write_l - di;  if (ia < 0) ia += buf_sz;
+        int ib = ia - 1;           if (ib < 0) ib += buf_sz;
+        int ja = st.write_r - di;  if (ja < 0) ja += buf_sz;
+        int jb = ja - 1;           if (jb < 0) jb += buf_sz;
+
+        float echo_l, echo_r;
+        if (fr == 0.0f) {
+            echo_l = st.buf_l[ia];
+            echo_r = st.buf_r[ja];
+        } else {
+            echo_l = st.buf_l[ia] + fr * (st.buf_l[ib] - st.buf_l[ia]);
+            echo_r = st.buf_r[ja] + fr * (st.buf_r[jb] - st.buf_r[ja]);
+        }
 
         st.filter_z_l = lp_a * echo_l + (1.0f - lp_a) * st.filter_z_l;
         st.filter_z_r = lp_a * echo_r + (1.0f - lp_a) * st.filter_z_r;
@@ -446,38 +616,53 @@ static void apply_delay(int ch, aud::sample_t* buf, int frames, int n_ch,
             st.buf_r[st.write_r] = dry_r + filt_r * feedback;
         }
 
-        st.write_l = (st.write_l + 1) % buf_sz;
-        st.write_r = (st.write_r + 1) % buf_sz;
+        if (++st.write_l >= buf_sz) st.write_l = 0;
+        if (++st.write_r >= buf_sz) st.write_r = 0;
 
         buf[f * n_ch + 0] = dry_l + echo_l * mix;
         if (n_ch > 1)
             buf[f * n_ch + 1] = dry_r + echo_r * mix;
     }
+    st.cur_delay = cur;
+    st.last_delay_samp = delay_samp;
 }
 
 // ===========================================================================
 // Full-spectrum analyser — 128 log-spaced bins 20Hz-20kHz
 // Called from apply_effect_chain_batch on the raw pre-EQ signal.
 // ===========================================================================
-// update_spec_buffer: ONLY fills the ring buffer — NO Goertzel computation.
-// The actual spectrum analysis (update_spec_compute) runs from the Python
-// meter timer (~10x/sec) which is OFF the audio thread. This keeps the
-// audio callback fast enough for real-time playback at low latency.
-// Previously: 128 bins × 4096 samples × 2 trig ops = 1M trig calls/buffer/channel
-// → ~40ms computation on audio thread with 5ms budget → buffer overruns → distortion.
-static void update_spec_buffer(int ch, const float* mono_buf, int frames)
-{
-    const int N = PB_SPEC_WIN;
-    for (int f = 0; f < frames; ++f) {
-        g_state.spec_window[ch][g_state.spec_wpos[ch]] = mono_buf[f];
-        g_state.spec_wpos[ch] = (g_state.spec_wpos[ch] + 1) % N;
+// The audio thread only fills a ring buffer. The actual spectrum analysis
+// (compute_spec_bins_all) runs from the Python meter timer (~10x/sec), which
+// is OFF the audio thread.
+
+// ===========================================================================
+// FFT (per-band display)
+//
+// A direct 64-point DFT. The Hann window and the cos/sin twiddles are
+// constants, so they are tabulated once instead of being recomputed with
+// trigonometry for each of the 32 x 64 products on every call.
+// ===========================================================================
+namespace {
+struct FFTTables {
+    float win[PB_FFT_BINS * 2];
+    float cs [PB_FFT_BINS][PB_FFT_BINS * 2];
+    float sn [PB_FFT_BINS][PB_FFT_BINS * 2];
+    FFTTables() {
+        const int N = PB_FFT_BINS * 2;
+        for (int n = 0; n < N; ++n)
+            win[n] = 0.5f * (1.0f - std::cos(2.0f * PI * n / (N - 1)));
+        for (int k = 0; k < PB_FFT_BINS; ++k)
+            for (int n = 0; n < N; ++n) {
+                float ang = 2.0f * PI * k * n / N;
+                cs[k][n] = std::cos(ang);
+                sn[k][n] = std::sin(ang);
+            }
     }
+};
+// Built during static initialisation (module load), i.e. before any audio runs.
+const FFTTables g_fft_tables;
 }
 
-
-// ===========================================================================
-// FFT
-// ===========================================================================
 static void update_fft(int ch, int band, const float* mono_buf, int frames)
 {
     FFTBandState& fs = g_state.fft_state[ch][band];
@@ -488,14 +673,19 @@ static void update_fft(int ch, int band, const float* mono_buf, int frames)
         fs.write_pos = (fs.write_pos + 1) % N;
     }
 
+    float xw[PB_FFT_BINS * 2];
+    for (int n = 0; n < N; ++n) {
+        int idx = fs.write_pos + n; if (idx >= N) idx -= N;
+        xw[n] = fs.window_buf[idx] * g_fft_tables.win[n];
+    }
+
     for (int k = 0; k < PB_FFT_BINS; ++k) {
         float re = 0.0f, im = 0.0f;
+        const float* cs = g_fft_tables.cs[k];
+        const float* sn = g_fft_tables.sn[k];
         for (int n = 0; n < N; ++n) {
-            float sample = fs.window_buf[(fs.write_pos + n) % N];
-            float w   = 0.5f * (1.0f - std::cos(2.0f * PI * n / (N - 1)));
-            float ang = 2.0f * PI * k * n / N;
-            re += sample * w * std::cos(ang);
-            im -= sample * w * std::sin(ang);
+            re += xw[n] * cs[n];
+            im -= xw[n] * sn[n];
         }
         float mag = std::sqrt(re*re + im*im) / (N * 0.5f);
         float normalised = std::max(0.0f, (lin2db(mag) + 80.0f) / 80.0f);
@@ -515,25 +705,25 @@ static void apply_comp_multi(int ch, aud::sample_t* buf,
                               const EffectSlot& fx,
                               float sr)
 {
-    static const int MAX_F = 4096;
-    if (frames > MAX_F) frames = MAX_F;
+    static const int MAX_F = 1024;
 
-    // Snapshot all params at the START of the buffer in one memcpy.
-    // Python's set_effect_slot() writes params[] from the main thread while
-    // the audio callback reads them. Without a snapshot, a preset change
-    // mid-callback produces a torn read (e.g. threshold updated, ratio not)
-    // → one buffer of wrong GR → audible pop.
-    // memcpy is not atomic but is far less likely to tear than 24 separate
-    // reads across a preset-change window. For full safety the engine would
-    // need a double-buffer, but this eliminates 99% of the problem.
+    // Longer buffers are processed in MAX_F-sized pieces (all filter and
+    // envelope state carries over, so the result is identical).
+    if (frames > MAX_F) {
+        for (int off = 0; off < frames; off += MAX_F)
+            apply_comp_multi(ch, buf + off * n_ch, std::min(MAX_F, frames - off),
+                             n_ch, fx, sr);
+        return;
+    }
+
     float p[24];
     memcpy(p, fx.params, sizeof(p));
-    if (frames > MAX_F) frames = MAX_F;
 
-    BiquadCoeffs lp_co[3], hp_co[3];
+    BiquadCoeffs lp_co[3], hp_co[3], ap_co[3];
     for (int x = 0; x < 3; ++x) {
         lp_co[x] = butter_lp(CROSSOVER_HZ[x], sr);
         hp_co[x] = butter_hp(CROSSOVER_HZ[x], sr);
+        ap_co[x] = butter_ap(CROSSOVER_HZ[x], sr);
     }
 
     // ---------------------------------------------------------------------------
@@ -543,52 +733,52 @@ static void apply_comp_multi(int ch, aud::sample_t* buf,
     // envelope follower per band using max(|L|, |R|) as the detector signal.
     // Apply the same GR to every audio channel simultaneously.
     //
-    // This eliminates:
-    //   - Envelope discontinuities between L/R passes (the main cause of pops)
-    //   - Stereo image shifts from different GR on L vs R
-    //   - Double-processing of the envelope state
+    // CROSSOVER (4th-order Linkwitz-Riley, cascaded tree):
+    //     x ─┬─ LP120 ──► AP800 ► AP5000 ─────────────────► band 0
+    //        └─ HP120 ─┬─ LP800 ───────────► AP5000 ───────► band 1
+    //                  └─ HP800 ─┬─ LP5000 ──────────────────► band 2
+    //                            └─ HP5000 ──────────────────► band 3
+    // The all-pass sections give the bands that skip a later split the same
+    // phase shift as the bands that go through it, so with the compressors
+    // idle the four bands sum back to an all-pass (flat magnitude) response.
     // ---------------------------------------------------------------------------
-
-    // band_bufs[channel][band][frame] — static per DSP channel to avoid
-    // 131KB stack allocation in the audio callback AND to prevent two
-    // different audio channels sharing the same buffer if both have COMP_MULTI.
     static float band_bufs[PB_MAX_CHANNELS][2][PB_MB_BANDS][MAX_F];
-    float tmp[MAX_F];
+    float mono[MAX_F];
+    float rest[MAX_F];
+    float rest2[MAX_F];
 
-    // Step 1: Filter all channels into band_bufs
+    CompressorChannelState& cs = g_state.comp_state[ch];
+
     for (int c = 0; c < n_ch && c < 2; ++c) {
-        float mono[MAX_F];
         for (int f = 0; f < frames; ++f) mono[f] = buf[f * n_ch + c];
 
-        float* lp0_a = &g_state.comp_state[ch].lp_z[0][0][c][0];
-        float* lp0_b = &g_state.comp_state[ch].lp_z[0][1][c][0];
-        float* hp0_a = &g_state.comp_state[ch].hp_z[0][0][c][0];
-        float* hp0_b = &g_state.comp_state[ch].hp_z[0][1][c][0];
-        float* lp1_a = &g_state.comp_state[ch].lp_z[1][0][c][0];
-        float* lp1_b = &g_state.comp_state[ch].lp_z[1][1][c][0];
-        float* hp1_a = &g_state.comp_state[ch].hp_z[1][0][c][0];
-        float* hp1_b = &g_state.comp_state[ch].hp_z[1][1][c][0];
-        float* lp2_a = &g_state.comp_state[ch].lp_z[2][0][c][0];
-        float* lp2_b = &g_state.comp_state[ch].lp_z[2][1][c][0];
-        float* hp2_a = &g_state.comp_state[ch].hp_z[2][0][c][0];
-        float* hp2_b = &g_state.comp_state[ch].hp_z[2][1][c][0];
+        float* b0 = band_bufs[ch][c][0];
+        float* b1 = band_bufs[ch][c][1];
+        float* b2 = band_bufs[ch][c][2];
+        float* b3 = band_bufs[ch][c][3];
 
-        // LR4 crossover — all paths 4th-order Linkwitz-Riley (LP+HP sums flat)
-        memcpy(band_bufs[ch][c][0], mono, frames * sizeof(float));
-        lr_filter(band_bufs[ch][c][0], frames, lp_co[0], lp0_a, lp0_b);
+        // split 1 @ 120 Hz
+        memcpy(b0,   mono, frames * sizeof(float));
+        lr_filter(b0,   frames, lp_co[0], &cs.lp_z[0][0][c][0], &cs.lp_z[0][1][c][0]);
+        memcpy(rest, mono, frames * sizeof(float));
+        lr_filter(rest, frames, hp_co[0], &cs.hp_z[0][0][c][0], &cs.hp_z[0][1][c][0]);
 
-        memcpy(tmp, mono, frames * sizeof(float));
-        lr_filter(tmp, frames, hp_co[0], hp0_a, hp0_b);
-        memcpy(band_bufs[ch][c][1], tmp, frames * sizeof(float));
-        lr_filter(band_bufs[ch][c][1], frames, lp_co[1], lp1_a, lp1_b);
+        // split 2 @ 800 Hz
+        memcpy(b1,    rest, frames * sizeof(float));
+        lr_filter(b1,    frames, lp_co[1], &cs.lp_z[1][0][c][0], &cs.lp_z[1][1][c][0]);
+        memcpy(rest2, rest, frames * sizeof(float));
+        lr_filter(rest2, frames, hp_co[1], &cs.hp_z[1][0][c][0], &cs.hp_z[1][1][c][0]);
 
-        memcpy(tmp, mono, frames * sizeof(float));
-        lr_filter(tmp, frames, hp_co[1], hp1_a, hp1_b);
-        memcpy(band_bufs[ch][c][2], tmp, frames * sizeof(float));
-        lr_filter(band_bufs[ch][c][2], frames, lp_co[2], lp2_a, lp2_b);
+        // split 3 @ 5 kHz
+        memcpy(b2, rest2, frames * sizeof(float));
+        lr_filter(b2, frames, lp_co[2], &cs.lp_z[2][0][c][0], &cs.lp_z[2][1][c][0]);
+        memcpy(b3, rest2, frames * sizeof(float));
+        lr_filter(b3, frames, hp_co[2], &cs.hp_z[2][0][c][0], &cs.hp_z[2][1][c][0]);
 
-        memcpy(band_bufs[ch][c][3], mono, frames * sizeof(float));
-        lr_filter(band_bufs[ch][c][3], frames, hp_co[2], hp2_a, hp2_b);
+        // phase compensation for the bands that skip later splits
+        ap_filter(b0, frames, ap_co[1], &cs.lp_z[3][0][c][0]);   // band 0 through 800 Hz AP
+        ap_filter(b0, frames, ap_co[2], &cs.lp_z[3][1][c][0]);   // band 0 through 5 kHz AP
+        ap_filter(b1, frames, ap_co[2], &cs.hp_z[3][0][c][0]);   // band 1 through 5 kHz AP
     }
     // If mono, copy channel 0 to channel 1 slot so the GR loop is uniform
     if (n_ch == 1) {
@@ -596,10 +786,9 @@ static void apply_comp_multi(int ch, aud::sample_t* buf,
             memcpy(band_bufs[ch][1][b], band_bufs[ch][0][b], frames * sizeof(float));
     }
 
-    // Step 2: Per-band stereo-linked compression
+    // Per-band stereo-linked compression
     float band_sum[PB_MB_BANDS][MAX_F];  // post-GR ch0 for display
     for (int b = 0; b < PB_MB_BANDS; ++b) {
-        // Use snapshotted params p[] — not fx.params[] directly
         float thr_db  = denorm_threshold(p[b]);
         float ratio   = denorm_ratio    (p[b + 4]);
         float atk_ms  = denorm_attack   (p[b + 8]);
@@ -609,27 +798,33 @@ static void apply_comp_multi(int ch, aud::sample_t* buf,
 
         float atk_c = time_coeff(atk_ms, sr);
         float rel_c = time_coeff(rel_ms, sr);
-        CompressorBandState& st = g_state.comp_state[ch].bands[b];
-        float max_gr_db = 0.0f;
+        float floor_lin = knee_floor_lin(thr_db, knee_db);
+        CompressorBandState& st = cs.bands[b];
+        float min_gr = 1.0f;
+
+        float* l = band_bufs[ch][0][b];
+        float* r = band_bufs[ch][1][b];
+        const bool two = (n_ch > 1);
 
         for (int f = 0; f < frames; ++f) {
             // Stereo-linked detector: max absolute value across all channels
-            float peak = std::abs(band_bufs[ch][0][b][f]);
-            for (int c = 1; c < n_ch && c < 2; ++c)
-                peak = std::max(peak, std::abs(band_bufs[ch][c][b][f]));
+            float peak = std::abs(l[f]);
+            if (two) peak = std::max(peak, std::abs(r[f]));
 
             float coeff = (peak > st.envelope) ? atk_c : rel_c;
             st.envelope = coeff * st.envelope + (1.0f - coeff) * peak;
 
-            float gr    = soft_knee_gr(st.envelope, thr_db, ratio, knee_db);
-            float gr_db = (gr < 1.0f) ? lin2db(gr) : 0.0f;
-            if (gr_db < max_gr_db) max_gr_db = gr_db;
+            float gr_db = soft_knee_gr_db(st.envelope, floor_lin, thr_db, ratio, knee_db);
+            float gr    = (gr_db < 0.0f) ? db2lin(gr_db) : 1.0f;
+            if (gr < min_gr) min_gr = gr;
 
             // Apply identical GR to all channels — preserves stereo image
-            for (int c = 0; c < n_ch && c < 2; ++c)
-                band_bufs[ch][c][b][f] *= gr * gain_lin;
+            float g = gr * gain_lin;
+            l[f] *= g;
+            if (two) r[f] *= g;
         }
 
+        float max_gr_db = (min_gr < 1.0f) ? lin2db(min_gr) : 0.0f;
         const float sm = 0.85f;
         g_state.gr_levels[ch][b] = sm * g_state.gr_levels[ch][b]
                                  + (1.0f - sm) * (-max_gr_db);
@@ -637,32 +832,14 @@ static void apply_comp_multi(int ch, aud::sample_t* buf,
         memcpy(band_sum[b], band_bufs[ch][0][b], frames * sizeof(float));
     }
 
-    // Step 3: Reconstruct — sum all bands back per channel.
-    //
-    // LR4 4-band phase correction:
-    // In a cascaded LR4 crossover bank, every additional HP stage adds a
-    // polarity inversion relative to the LP stage at the same frequency.
-    // For a 4-band bank the correct polarity signs are: +, -, +, -
-    // (alternating, starting positive for the Low band).
-    // Without this correction, bands constructively interfere at crossovers,
-    // producing up to 6dB of overshoot on transients → hard clips → pops.
-    //
-    // Empirically verified pattern for 4-band LR4:
-    //   Band 0 (Low,   LP only):          +1  (reference)
-    //   Band 1 (L-Mid, HP+LP cascade):    -1  (inverted)
-    //   Band 2 (H-Mid, HP+HP+LP cascade): +1  (double inversion = positive)
-    //   Band 3 (High,  HP only):          -1  (inverted)
-    static const float BAND_SIGN[4] = {1.0f, -1.0f, 1.0f, -1.0f};
-
+    // Reconstruct — sum the (phase-aligned) bands back per channel.
     for (int c = 0; c < n_ch && c < 2; ++c) {
-        for (int f = 0; f < frames; ++f) {
-            float out = band_bufs[ch][c][0][f] * BAND_SIGN[0]
-                      + band_bufs[ch][c][1][f] * BAND_SIGN[1]
-                      + band_bufs[ch][c][2][f] * BAND_SIGN[2]
-                      + band_bufs[ch][c][3][f] * BAND_SIGN[3];
-            // Safety soft-limiter: catches any residual overshoot.
-            buf[f * n_ch + c] = out;
-        }
+        const float* b0 = band_bufs[ch][c][0];
+        const float* b1 = band_bufs[ch][c][1];
+        const float* b2 = band_bufs[ch][c][2];
+        const float* b3 = band_bufs[ch][c][3];
+        for (int f = 0; f < frames; ++f)
+            buf[f * n_ch + c] = b0[f] + b1[f] + b2[f] + b3[f];
     }
 
     // Band RMS display
@@ -696,7 +873,7 @@ static void apply_noise_gate(int ch, aud::sample_t* buf,
     float range_lin  = db2lin(gate_range_db(fx.params[4]));
 
     GateChannelState& st = g_state.gate_state[ch];
-    float max_gr_db = 0.0f;
+    float min_gain = 1.0f;
 
     for (int f = 0; f < frames; ++f) {
         float peak = 0.0f;
@@ -716,24 +893,80 @@ static void apply_noise_gate(int ch, aud::sample_t* buf,
                 st.is_open = false;
         }
 
+        // Gain is smoothed directly in the linear domain (the previous
+        // version converted to dB and back with pow/log10 every sample).
         float target   = st.is_open ? 1.0f : range_lin;
-        float cur_lin  = db2lin(st.gain_db);
+        float cur_lin  = st.gain_lin;
         float gain_c   = (target > cur_lin) ? atk_c : rel_c;
         float smooth   = gain_c * cur_lin + (1.0f - gain_c) * target;
         smooth         = std::max(smooth, 1e-9f);
-        st.gain_db     = lin2db(smooth);
+        st.gain_lin    = smooth;
 
-        float gr_db = (smooth < 1.0f) ? lin2db(smooth) : 0.0f;
-        if (gr_db < max_gr_db) max_gr_db = gr_db;
+        if (smooth < min_gain) min_gain = smooth;
 
         for (int c = 0; c < n_ch; ++c)
             buf[f * n_ch + c] *= smooth;
     }
 
+    float max_gr_db = (min_gain < 1.0f) ? lin2db(min_gain) : 0.0f;
     const float sm = 0.85f;
     g_state.gr_levels[ch][1] = sm * g_state.gr_levels[ch][1]
                               + (1.0f - sm) * (-max_gr_db);
     g_state.gr_levels[ch][2] = st.is_open ? 1.0f : 0.0f;
+}
+
+// ===========================================================================
+// State helpers
+// ===========================================================================
+void hj_snapshot_slot(int ch, int slot, EffectSlot& out)
+{
+    const EffectSlot& src = g_state.effect_chain[ch][slot];
+    std::atomic<uint32_t>& seq = g_state.effect_seq[ch][slot];
+    for (int tries = 0; tries < 4; ++tries) {
+        uint32_t s1 = seq.load(std::memory_order_acquire);
+        if (s1 & 1u) continue;                       // writer in progress
+        memcpy(&out, &src, sizeof(EffectSlot));
+        std::atomic_thread_fence(std::memory_order_acquire);
+        uint32_t s2 = seq.load(std::memory_order_relaxed);
+        if (s1 == s2) return;                        // consistent copy
+    }
+    memcpy(&out, &src, sizeof(EffectSlot));          // give up: best effort
+}
+
+void hj_reset_channel_dsp(int ch)
+{
+    if (ch < 0 || ch >= PB_MAX_CHANNELS) return;
+    g_state.comp_state[ch] = CompressorChannelState{};
+    for (int bi = 0; bi < 7; ++bi) {
+        EqBandState& b = g_state.eq_state[ch].bands[bi];
+        b.z1[0] = b.z1[1] = b.z2[0] = b.z2[1] = 0.0f;
+    }
+    ReverbChannelState& rv = g_state.reverb_state[ch];
+    float sr = rv.sample_rate;
+    memset((void*)&rv, 0, sizeof(rv));
+    rv.sample_rate = sr;
+    g_state.gate_state[ch] = GateChannelState{};
+    DelayChannelState& d = g_state.delay_state[ch];
+    if (d.buf_l) memset(d.buf_l, 0, sizeof(float) * d.buf_size);
+    if (d.buf_r) memset(d.buf_r, 0, sizeof(float) * d.buf_size);
+    d.write_l = d.write_r = 0;
+    d.filter_z_l = d.filter_z_r = 0.0f;
+}
+
+bool hj_channel_has_fx(int ch)
+{
+    if (ch < 0 || ch >= PB_MAX_CHANNELS) return false;
+    EffectSlot fx;
+    for (int s = 0; s < PB_MAX_EFFECTS; ++s) {
+        hj_snapshot_slot(ch, s, fx);
+        if (fx.enabled) return true;
+    }
+    return false;
+}
+
+void hj_reset_dsp_for_active_fx(int ch)
+{
+    if (hj_channel_has_fx(ch)) hj_reset_channel_dsp(ch);
 }
 
 // ===========================================================================
@@ -742,21 +975,24 @@ static void apply_noise_gate(int ch, aud::sample_t* buf,
 void apply_effect_chain_batch(int ch, aud::sample_t* buf,
                                 int frames, int n_ch, float sr)
 {
-    // Build mono mix from raw signal for full-spectrum display ring buffer.
-    // ONLY fills the ring buffer — NO Goertzel computation here.
-    // The expensive spectrum analysis runs from the Python meter timer instead.
+    // Mono mix of the raw signal into the spectrum-display ring buffer.
+    // (Only a ring write here — the analysis itself runs on the Python timer.)
     {
-        std::vector<float> mono_raw(frames);
+        const int N = PB_SPEC_WIN;
+        int wpos = g_state.spec_wpos[ch];
+        const float inv = 1.0f / (float)n_ch;
         for (int f = 0; f < frames; ++f) {
             float s = 0.0f;
             for (int c = 0; c < n_ch; ++c) s += buf[f * n_ch + c];
-            mono_raw[f] = s / n_ch;
+            g_state.spec_window[ch][wpos] = s * inv;
+            if (++wpos >= N) wpos = 0;
         }
-        update_spec_buffer(ch, mono_raw.data(), frames);
+        g_state.spec_wpos[ch] = wpos;
     }
 
     for (int slot = 0; slot < PB_MAX_EFFECTS; ++slot) {
-        const EffectSlot& fx = g_state.effect_chain[ch][slot];
+        EffectSlot fx;                                // consistent snapshot
+        hj_snapshot_slot(ch, slot, fx);
         if (!fx.enabled) continue;
         switch (fx.type) {
         case EffectType::GAIN:
@@ -788,22 +1024,28 @@ void apply_effect_chain_batch(int ch, aud::sample_t* buf,
 extern "C" {
 
 // Called from Python meter timer (NOT audio thread).
-// Uses a 512-sample analysis window instead of the full 4096-sample ring buffer.
-// Cost: 128 bins × 512 samples = 65K muls per channel — 8x cheaper than before.
-// At 30Hz timer interval this is ~2M muls/sec/channel — fine for 1-4 channels.
-// Frequency resolution: 48000/512 = 93Hz/bin — sufficient for visual display.
-// The ring buffer (4096 samples) is still filled at full rate by the audio thread,
-// giving temporal accuracy. We just analyse fewer samples for speed.
+// Analyses the most recent 512 samples of each channel's ring buffer with a
+// Hann-windowed DFT at 128 log-spaced frequencies (20 Hz - 20 kHz).
+// Each bin is a complex oscillator stepped by a rotation (no trigonometry in
+// the inner loop) in double precision: far cheaper than before, and accurate
+// at high frequencies where the old single-precision angle (~1e6 rad)
+// had lost all its fractional bits.
 void compute_spec_bins_all(float sample_rate)
 {
-    // Use last 512 samples from the ring buffer — recent enough for live display
     const int WIN = 512;
     const float log_min = std::log10(20.0f);
     const float log_max = std::log10(20000.0f);
-    const float sm = 0.35f;  // slightly more smoothing to compensate shorter window
+    const float sm = 0.35f;
+
+    static float hann[WIN];
+    static bool  hann_ready = false;
+    if (!hann_ready) {
+        for (int n = 0; n < WIN; ++n)
+            hann[n] = 0.5f * (1.0f - std::cos(2.0f * PI * n / (WIN - 1)));
+        hann_ready = true;
+    }
 
     for (int ch = 0; ch < PB_MAX_CHANNELS; ++ch) {
-        // Quick check — skip silent channels
         bool has_signal = false;
         int wpos = g_state.spec_wpos[ch];
         for (int i = 0; i < WIN; i += 32) {
@@ -812,21 +1054,27 @@ void compute_spec_bins_all(float sample_rate)
         }
         if (!has_signal) continue;
 
+        double xw[WIN];
+        for (int n = 0; n < WIN; ++n) {
+            int idx = (wpos - WIN + n + PB_SPEC_WIN) % PB_SPEC_WIN;
+            xw[n] = (double)g_state.spec_window[ch][idx] * hann[n];
+        }
+
         for (int k = 0; k < PB_SPEC_BINS; ++k) {
             float t    = (float)k / (PB_SPEC_BINS - 1);
             float f_hz = std::pow(10.0f, log_min + t * (log_max - log_min));
-            float kf   = f_hz / sample_rate * (float)WIN;
-            float re   = 0.0f, im = 0.0f;
+            double theta = 2.0 * 3.14159265358979323846 * (double)f_hz / (double)sample_rate;
+            double rc = std::cos(theta), rs = std::sin(theta);
+            double zc = 1.0, zs = 0.0;
+            double re = 0.0, im = 0.0;
             for (int n = 0; n < WIN; ++n) {
-                // Read from the tail of the ring buffer (most recent WIN samples)
-                int idx    = (wpos - WIN + n + PB_SPEC_WIN) % PB_SPEC_WIN;
-                float samp = g_state.spec_window[ch][idx];
-                float w    = 0.5f * (1.0f - std::cos(2.0f * PI * n / (WIN - 1)));
-                float ang  = 2.0f * PI * kf * n / (float)WIN;
-                re += samp * w * std::cos(ang);
-                im -= samp * w * std::sin(ang);
+                re += xw[n] * zc;
+                im -= xw[n] * zs;
+                double nc = zc * rc - zs * rs;
+                double ns = zc * rs + zs * rc;
+                zc = nc; zs = ns;
             }
-            float mag        = std::sqrt(re * re + im * im) / (WIN * 0.5f);
+            float mag        = (float)std::sqrt(re * re + im * im) / (WIN * 0.5f);
             float normalised = std::max(0.0f, (lin2db(mag) + 80.0f) / 80.0f);
             g_state.spec_bins[ch][k] = sm * g_state.spec_bins[ch][k]
                                      + (1.0f - sm) * normalised;

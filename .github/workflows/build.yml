@@ -2,7 +2,7 @@ name: Build hijacker_engine
 
 on:
   push:
-    branches: [ feature/hijacker-engine ]
+    branches: [ feature/hijacker-engine, feature/audio-engine-hardening ]
   workflow_dispatch:
 
 env:

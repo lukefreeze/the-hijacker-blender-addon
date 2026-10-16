@@ -55,10 +55,11 @@ py::array_t<float> process_buffer(int channel_idx,
 
     {
         EngineState* st = g_hijacker_engine->get_state();
-        st->comp_state[channel_idx]   = CompressorChannelState{};
+        // Start from clean DSP memory (filters, envelopes, reverb and delay
+        // tails). hj_reset_channel_dsp() clears the large reverb state in place
+        // rather than building a ~350 KB temporary on the stack.
+        hj_reset_channel_dsp(channel_idx);
         st->eq_state[channel_idx]     = EqChannelState{};
-        st->reverb_state[channel_idx] = ReverbChannelState{};
-        st->gate_state[channel_idx]   = GateChannelState{};
         for (int b = 0; b < PB_MB_BANDS; ++b)
             st->fft_state[channel_idx][b] = FFTBandState{};
 
@@ -198,6 +199,16 @@ PYBIND11_MODULE(HIJACKER_MODULE_NAME, m)
         .def("get_meter_peak", &HijackerEngine::get_meter_peak,
              py::arg("channel"))
         .def("get_playhead_s", &HijackerEngine::get_playhead_s)
+        // Diagnostics (new): the rate the engine really opened the device at,
+        // the device's reported output latency in seconds, and a running count
+        // of audio dropouts (device underflows + disk-thread underruns).
+        .def("get_sample_rate",       &HijackerEngine::get_sample_rate)
+        .def("get_output_latency_s",  &HijackerEngine::get_output_latency_s)
+        .def("get_xrun_count",        &HijackerEngine::get_xrun_count)
+        .def("set_latency_compensation",   &HijackerEngine::set_latency_compensation,
+             py::arg("seconds"),
+             "seconds < 0: automatic (default), 0: off, > 0: fixed offset in seconds")
+        .def("get_latency_compensation_s", &HijackerEngine::get_latency_compensation_s)
         .def("get_state",      &HijackerEngine::get_state,
              py::return_value_policy::reference)
         .def("is_running",     &HijackerEngine::is_running);

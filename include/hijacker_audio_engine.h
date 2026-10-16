@@ -3,23 +3,40 @@
 // hijacker_audio_engine.h
 // The Hijacker — Real-time multi-channel audio engine for Blender
 //
-// Architecture:
-//   - PortAudio callback owns the audio thread
-//   - All channels start from the exact same sample (true atomic sync)
-//   - DSP runs in the audio thread (EQ, comp, reverb, gate, delay)
-//   - Python communicates via thread-safe atomic parameter writes
-//   - No rebuilds needed for parameter changes — takes effect next buffer
+// Architecture
+//   Audio thread (PortAudio callback)
+//     - owns the transport (playhead in integer sample frames)
+//     - pulls each channel's pre-rendered audio out of a lock-free ring buffer
+//     - applies fader / mute / pan with click-free gain smoothing, the DSP
+//       effect chain, metering, the master soft limiter
+//     - never allocates, never takes a lock, never touches a file
+//
+//   Disk thread (one worker for all channels)
+//     - opens the WAV files, decodes and (if needed) resamples them, and
+//       renders every channel's playlist - segment placement is
+//       sample-accurate, with short fades at segment edges - into that
+//       channel's ring buffer ahead of the playhead
+//
+//   Python thread(s)
+//     - publish playlists (shared_ptr swap under a short mutex that only the
+//       disk thread shares) and mixer/effect parameters
+//       (atomics / a seqlock per effect slot)
+//
+// All channels are rendered against ONE timeline, so every channel is
+// sample-aligned by construction, and mute / unmute never changes sync.
 // =============================================================================
 
 #include "hijacker_processor.h"
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 // Maximum segments per channel (strips in the VSE)
-#define HJ_MAX_SEGMENTS  64
-// Audio buffer size in frames
+#define HJ_MAX_SEGMENTS  8192
+// Legacy constant (the callback now handles whatever size the device uses)
 #define HJ_BUFFER_FRAMES 512
 
 // ---------------------------------------------------------------------------
@@ -32,49 +49,6 @@ struct HijackerSegment {
     double timeline_pos_s = 0.0;  // when it starts on the timeline
     float  volume         = 1.0f; // strip.volume baked in — per-segment gain
                                   // applied pre-DSP so the compressor sees it
-};
-
-// ---------------------------------------------------------------------------
-// ChannelPlaylist — all segments for one VSE channel
-// ---------------------------------------------------------------------------
-struct HijackerChannel {
-    HijackerSegment segments[HJ_MAX_SEGMENTS];
-    int    n_segments      = 0;
-
-    // Playback state (written by audio thread only)
-    int    cur_segment     = -1;
-    double file_pos_s      = 0.0;  // current read position in current segment's file
-
-    // File reader state (one open file at a time per channel)
-    FILE*  file_handle     = nullptr;
-    int    file_sr         = 44100;
-    int    file_nch        = 2;
-    int    file_bps        = 16;    // bits per sample: 16, 24, or 32
-    int    file_fmt_tag    = 1;     // 1=PCM, 3=IEEE float
-    long   file_data_start = 0;    // byte offset of PCM data in WAV
-    long   file_n_frames   = 0;    // total frames in file
-
-    // Real-time mixer params (written by Python, read by audio thread)
-    std::atomic<float> volume   {1.0f};
-    std::atomic<bool>  muted    {false};
-    std::atomic<bool>  soloed   {false};
-    std::atomic<float> pan      {0.5f};  // 0=full left, 0.5=centre, 1=full right
-    std::atomic<bool>  active   {false};  // has a playlist loaded
-
-    // Per-channel meter (written by audio thread, read by Python)
-    std::atomic<float> meter_rms  {0.0f};
-    std::atomic<float> meter_peak {0.0f};
-};
-
-// ---------------------------------------------------------------------------
-// Transport state (written by Python, read by audio thread)
-// ---------------------------------------------------------------------------
-struct HijackerTransport {
-    std::atomic<bool>   playing       {false};
-    std::atomic<double> playhead_s    {0.0};   // current timeline position
-    std::atomic<double> seek_target_s {-1.0};  // -1 = no pending seek
-    std::atomic<bool>   seek_pending  {false};
-    std::atomic<int>    sample_rate   {44100};
 };
 
 // ---------------------------------------------------------------------------
@@ -95,7 +69,7 @@ public:
     void  stop();
     void  seek(double timeline_pos_s);
 
-    // Channel setup — called from Python at play-start
+    // Channel setup — called from Python at play-start (safe during playback)
     void  set_channel_playlist(int ch, const std::vector<HijackerSegment>& segs);
     void  clear_channel(int ch);
     void  clear_all_channels();
@@ -116,6 +90,22 @@ public:
     float get_meter_peak(int ch) const;
     double get_playhead_s()      const;
 
+    // Diagnostics
+    int    get_sample_rate()      const;
+    double get_output_latency_s() const;   // device output latency (0 if unknown)
+    int    get_xrun_count()       const;   // output underflows + decoder underruns
+
+    // Latency compensation. The sound for a timeline position reaches the
+    // speakers one output-latency (plus the start-up pre-roll) after the engine
+    // renders it, so play()/seek() start the audio that much *ahead* of the
+    // position they are given. get_playhead_s() then reports the position the
+    // listener is hearing, which matches the Blender cursor / video.
+    //   seconds < 0 : automatic (device output latency + measured pre-roll)  [default]
+    //   seconds = 0 : off
+    //   seconds > 0 : fixed offset (capped at 250 ms)
+    void   set_latency_compensation(double seconds);
+    double get_latency_compensation_s() const;   // offset currently in effect
+
     // Expose EngineState for GR levels, FFT bins (used by rack UI)
     // Returns the global g_state which hijacker_processor.cpp also uses
     EngineState* get_state();  // defined in hijacker_audio_engine.cpp
@@ -123,30 +113,19 @@ public:
     // PortAudio callback — public so C callback can reach it
     int audio_callback(const void* input, void* output,
                        unsigned long frames_per_buffer);
+    void note_device_xrun();
 
 private:
-    void  _open_segment(int ch, int seg_idx, double seek_within_seg_s = 0.0);
-    void  _close_channel_file(int ch);
-    bool  _read_wav_header(int ch);
-    int   _read_pcm_frames(int ch, float* buf, int n_frames);
-    void  _process_channel_buffer(int ch, float* buf,
-                                  int frames, int n_ch, float sr);
-    void  _apply_seek(double target_s);
+    HijackerEngine(const HijackerEngine&) = delete;
+    HijackerEngine& operator=(const HijackerEngine&) = delete;
 
-    HijackerChannel  channels_[PB_MAX_CHANNELS];
-    HijackerTransport transport_;
-    // state_ removed — using global g_state shared with hijacker_processor.cpp
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 
     void*  pa_stream_   = nullptr;   // PaStream* — void* avoids portaudio.h in header
     bool   initialized_ = false;
     int    sample_rate_ = 44100;
     int    buffer_frames_ = HJ_BUFFER_FRAMES;
-    double playhead_s_  = 0.0;      // authoritative playhead (audio thread)
-
-    // Solo: if any channel is soloed, only soloed channels play
-    bool   any_soloed_  = false;
-
-    std::mutex playlist_mutex_;  // protects channel playlist writes
 };
 
 // Global engine instance (accessed via pybind11 wrapper)

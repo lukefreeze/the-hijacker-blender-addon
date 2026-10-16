@@ -41,6 +41,25 @@ except ImportError:
 RACK_RAIL_H = 32  # duplicated from Racks.py to avoid circular import
 
 # =============================================================================
+# DELAY KNOB TUNING (classic skin)
+# All values are unscaled px - multiplied by scale at draw time.
+#
+# DL_KNOB_SCALE : size multiplier for all 5 knobs (1.0 = no change)
+# DL_KNOB_X     : per-knob X nudge [Time, Feedback, Mix, Spread, Filter]
+# DL_KNOB_Y     : per-knob Y nudge [Time, Feedback, Mix, Spread, Filter]
+# Positive X = right, Negative X = left.
+# Positive Y = up,    Negative Y = down.
+# =============================================================================
+DL_KNOB_SCALE = 0.75
+#                   Time  Feedback   Mix  Spread  Filter
+DL_KNOB_X = [      0.0,    0.0,    -1.0,   -1.0,   -2.0]
+DL_KNOB_Y = [      0.0,    0.0,    0.0,   0.0,   0.0]
+
+# Value text nudge - shifts all 5 value readouts independently of the knobs.
+# Negative = move down, positive = move up.
+DL_VALUE_Y_OFFSET = -4.0
+
+# =============================================================================
 # PACKAPUNCH (Back to the Future) SKIN
 # Everything below is in art pixels of rack_delay_bg.png (1758 x 468, top-left origin).
 # =============================================================================

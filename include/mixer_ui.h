@@ -1,6 +1,8 @@
 #pragma once
 #include <vector>
 #include <string>
+#include <atomic>
+#include <cstdint>
 
 #define PB_MAX_CHANNELS  32
 #define PB_MAX_EFFECTS    8
@@ -90,6 +92,10 @@ struct FFTBandState {
 struct EqBandState {
     float z1[2] = {0.0f, 0.0f};  // [audio_channel]
     float z2[2] = {0.0f, 0.0f};
+    // Coefficients used at the end of the previous buffer {b0,b1,b2,a1,a2}.
+    // Identity filter by default. Coefficient changes are interpolated across
+    // the next buffer so dragging an EQ control does not produce zipper noise.
+    float pc[5] = {1.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 struct EqChannelState {
@@ -104,9 +110,12 @@ static const int COMB_LENGTHS_R[8] = {1116+23,1188+23,1277+23,1356+23,
                                         1422+23,1491+23,1557+23,1617+23};
 static const int AP_LENGTHS_L[4]   = {556, 441, 341, 225};
 static const int AP_LENGTHS_R[4]   = {556+23, 441+23, 341+23, 225+23};
-static const int MAX_COMB_LEN      = 1640 + 23 + 1;
-static const int MAX_AP_LEN        = 579 + 1;
-static const int MAX_PREDELAY_SAMP = 4411;   // 100ms @ 44100Hz
+// Buffer sizes cover sample rates up to 96 kHz (the comb/allpass tunings are
+// specified at 44.1 kHz and scaled by sr/44100; 100 ms of pre-delay at 96 kHz).
+// At 44.1 kHz the used lengths are unchanged from earlier versions.
+static const int MAX_COMB_LEN      = 3700;
+static const int MAX_AP_LEN        = 1300;
+static const int MAX_PREDELAY_SAMP = 9601;   // 100ms @ 96000Hz
 
 struct CombState {
     float buf[MAX_COMB_LEN] = {};
@@ -132,7 +141,8 @@ struct GateChannelState {
     float envelope  = 0.0f;
     float hold_samp = 0.0f;
     bool  is_open   = false;
-    float gain_db   = 0.0f;
+    float gain_db   = 0.0f;   // legacy (unused)
+    float gain_lin  = 1.0f;   // smoothed gate gain (linear)
 };
 
 // ---------------------------------------------------------------------------
@@ -149,6 +159,7 @@ struct DelayChannelState {
     float  filter_z_l   = 0.0f;
     float  filter_z_r   = 0.0f;
     int    last_delay_samp = 0;
+    float  cur_delay     = -1.0f;   // smoothed delay time in samples (<0 = unset)
 };
 
 struct EngineState {
@@ -186,6 +197,10 @@ struct EngineState {
     ReverbChannelState     reverb_state[PB_MAX_CHANNELS] = {};
     GateChannelState       gate_state  [PB_MAX_CHANNELS] = {};
     DelayChannelState      delay_state [PB_MAX_CHANNELS] = {};
+
+    // Seqlock counters for effect_chain[][] slots: odd while a slot is being
+    // written by set_effect_slot(). The audio thread snapshots slots with them.
+    std::atomic<uint32_t> effect_seq[PB_MAX_CHANNELS][PB_MAX_EFFECTS] = {};
 
     // Legacy
     int   active_track_id = 1;
