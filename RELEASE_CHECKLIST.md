@@ -20,6 +20,7 @@ bundle them, auto-download them, or only link to them. Check commercial-use term
 - [ ] Deadpool rack: redo so it is clearly its own design
 - [ ] Remove the rebel-fighter symbol from its rack
 - [ ] Review the PIPER logo (HAL 9000 logo layout with the name swapped)
+- [ ] Single-band compressor skin: the OFF version (rack_comp_single_bg_off.png, and the collapsed OFF version) still has the old emblem; update it to match the ON version
 - [ ] Final pass over every skin for logos, symbols, names or other recognisable elements
 
 ## 3. Documentation and positioning
