@@ -19,7 +19,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install Python packages
-        run: pip install numpy pybind11
+        # scipy: loudness reference. bpy: Blender as a Python module, for the keyframed-volume test
+        # (that test is skipped where bpy is not installed).
+        run: pip install numpy pybind11 scipy bpy==4.5.14
       - name: Engine tests, stress and sanitizers
         run: python tests/engine/run_tests.py --sanitize --pybind
 
@@ -33,6 +35,6 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install Python packages
-        run: pip install numpy pybind11
+        run: pip install numpy pybind11 scipy
       - name: Engine tests
         run: python tests/engine/run_tests.py --pybind

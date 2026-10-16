@@ -15,6 +15,7 @@ import bpy
 
 from core.engine import get_engine
 from core import vse_compat as _vse
+from core import strip_volume as _sv
 
 
 # ---------------------------------------------------------------------------
@@ -46,9 +47,12 @@ _pb_full_wav_cache  = {}        # channel_idx -> full-track wav from frame_start
 
 
 def apply_fader_to_channel(channel_idx, old_fader, new_fader):
-    """Apply fader change — multiplies strip.volume by new/old ratio.
-    Both fader and gain have a minimum of 0.001 so the ratio never
-    reaches zero and the original strip volume is always recoverable."""
+    """Apply fader change — multiplies each strip's volume by the new/old ratio.
+    Both fader and gain have a minimum of 0.001 so the ratio never reaches
+    zero and the user's own strip volume is always recoverable. The strip
+    value is deliberately NOT clamped: a clamp would overwrite quiet or
+    zero values the user set. If the strip's volume is keyframed, the
+    keyframes are scaled as well (see core/strip_volume.py)."""
     scene = bpy.context.scene
     if not scene or not scene.sequence_editor: return
     if abs(new_fader - old_fader) < 1e-6: return
@@ -57,12 +61,12 @@ def apply_fader_to_channel(channel_idx, old_fader, new_fader):
     for strip in _vse.get_all_strips(scene.sequence_editor):
         if strip.type != "SOUND": continue
         if (strip.channel - 1) != channel_idx: continue
-        strip.volume = max(0.001, strip.volume * ratio)
+        _sv.scale_volume(strip, ratio)
     _pb_engine_update_volume(channel_idx)
 
 
 def apply_gain_to_channel(channel_idx, old_gain, new_gain):
-    """Apply gain change — multiplies strip.volume by new/old ratio."""
+    """Apply gain change — multiplies each strip's volume (and keyframes) by the new/old ratio."""
     scene = bpy.context.scene
     if not scene or not scene.sequence_editor: return
     if abs(new_gain - old_gain) < 1e-6: return
@@ -71,7 +75,7 @@ def apply_gain_to_channel(channel_idx, old_gain, new_gain):
     for strip in _vse.get_all_strips(scene.sequence_editor):
         if strip.type != "SOUND": continue
         if (strip.channel - 1) != channel_idx: continue
-        strip.volume = max(0.001, strip.volume * ratio)
+        _sv.scale_volume(strip, ratio)
     _pb_engine_update_volume(channel_idx)
 
 
@@ -751,7 +755,37 @@ def _hj_build_segment_playlist(channel_idx, scene):
         gain_val  = max(gain_val,  0.001)
         # Divide out both fader AND gain — engine applies both via set_volume()
         # so seg_vol carries only the original per-strip volume difference.
-        seg_vol   = float(strip.volume) / (fader_vol * gain_val)
+        denom     = fader_vol * gain_val
+
+        # Volume automation: if the strip's volume is keyframed, follow the curve.
+        # It becomes a chain of straight-line gain pieces (the engine ramps the gain
+        # inside each piece and joins them without a fade).
+        poly = None
+        try:
+            poly = _sv.volume_polyline(strip, timeline_pos_s * fps,
+                                       (timeline_pos_s + duration_s) * fps)
+        except Exception as e:
+            print(f"[HIJACKER] ch{channel_idx+1} volume animation unreadable ({e}) - using the static volume")
+
+        if poly is not None and len(poly) >= 2 and any(abs(v - poly[0][1]) > 1e-6 for _, v in poly):
+            end_s = timeline_pos_s + duration_s
+            for i in range(len(poly) - 1):
+                (fa, va), (fb, vb) = poly[i], poly[i + 1]
+                ta = timeline_pos_s if i == 0 else fa / fps
+                tb = end_s if i == len(poly) - 2 else fb / fps
+                if tb - ta <= 1e-6:
+                    continue
+                segments.append({
+                    'filepath':       wav_path,
+                    'file_offset_s':  file_offset_s + (ta - timeline_pos_s),
+                    'duration_s':     tb - ta,
+                    'timeline_pos_s': ta,
+                    'volume':         va / denom,
+                    'volume_end':     vb / denom,
+                })
+            continue
+
+        seg_vol = (poly[0][1] if poly else float(strip.volume)) / denom
 
         segments.append({
             'filepath':       wav_path,
@@ -762,6 +796,36 @@ def _hj_build_segment_playlist(channel_idx, scene):
         })
 
     return segments
+
+
+_warned_no_ramps = False
+
+
+def _make_engine_segments(engine, segs):
+    """Convert segment dicts (from _hj_build_segment_playlist) to engine.Segment objects."""
+    global _warned_no_ramps
+    out = []
+    for seg in segs:
+        s = engine.Segment()
+        s.filepath       = seg['filepath']
+        s.file_offset_s  = seg['file_offset_s']
+        s.duration_s     = seg['duration_s']
+        s.timeline_pos_s = seg['timeline_pos_s']
+        v0 = seg.get('volume', 1.0)
+        v1 = seg.get('volume_end', -1.0)
+        s.volume = v0
+        if v1 >= 0.0:
+            try:
+                s.volume_end = v1
+            except AttributeError:
+                # The compiled engine is older than this script: it cannot ramp the gain.
+                s.volume = 0.5 * (v0 + v1)
+                if not _warned_no_ramps:
+                    _warned_no_ramps = True
+                    print("[HIJACKER] volume keyframes need the newer audio engine - "
+                          "run build.bat / build_py313.bat again and restart Blender")
+        out.append(s)
+    return out
 
 
 def _hj_wire_effects(channel_idx, scene):
@@ -873,15 +937,7 @@ def _hj_load_all_channels(scene):
             continue
 
         # Convert to engine.Segment objects
-        seg_objects = []
-        for seg in segs:
-            s = engine.Segment()
-            s.filepath       = seg['filepath']
-            s.file_offset_s  = seg['file_offset_s']
-            s.duration_s     = seg['duration_s']
-            s.timeline_pos_s = seg['timeline_pos_s']
-            s.volume         = seg.get('volume', 1.0)
-            seg_objects.append(s)
+        seg_objects = _make_engine_segments(engine, segs)
 
         hj.set_channel_playlist(ch, seg_objects)
 
@@ -943,6 +999,13 @@ def _pb_start_all_from_frame(scene, frame):
 
     # Load playlists
     _hj_load_all_channels(scene)
+
+    # A new play starts a fresh loudness measurement (integrated loudness, range, peaks)
+    try:
+        from core import master as _master
+        _master.reset_loudness()
+    except Exception:
+        pass
 
     # Start the engine — all channels begin from same sample atomically
     hj.play(timeline_s)
@@ -1245,6 +1308,58 @@ def _pb_recover_stuck_audio():
         print(f"[HIJACKER] could not schedule preferences save after recovery: {e}")
 
 
+_pb_watchdog_registered = False
+_pb_watchdog_failures   = 0
+
+
+def _pb_device_watchdog():
+    """Every couple of seconds, check the audio stream is still alive.
+
+    If the output device disappears (headphones unplugged, USB interface
+    removed, driver reset) PortAudio stops the stream and the Hijacker would
+    stay silent until restarted. Here we notice, restart the engine on
+    whichever device is now available (the preferences fall back to the
+    system default if the chosen one is gone) and carry on. Playlists are
+    reloaded from the timeline on the next Play, so nothing else is needed.
+    Backs off if restarts keep failing.
+    """
+    global _pb_watchdog_failures, _pb_watchdog_registered
+    if not _pb_engine_active:
+        _pb_watchdog_registered = False
+        return None
+    try:
+        engine = get_engine()
+        hj = engine.get_engine() if engine else None
+        if hj is None or not hasattr(hj, "is_running") or hj.is_running():
+            _pb_watchdog_failures = 0
+            return 2.0
+    except Exception:
+        return 5.0
+
+    print("[HIJACKER] audio device stopped — restarting the audio engine")
+    try:
+        if bpy.context.screen.is_animation_playing:
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+    except Exception:
+        pass
+    try:
+        _pb_engine_disable()
+        _pb_engine_enable()
+    except Exception as e:
+        print(f"[HIJACKER] audio restart failed: {e}")
+
+    if _pb_engine_active:
+        _pb_watchdog_failures = 0
+        print("[HIJACKER] audio engine recovered")
+        return None   # a fresh watchdog was registered by _pb_engine_enable
+    _pb_watchdog_failures += 1
+    # Engine is now disabled and Blender's own audio is restored; stop trying.
+    _pb_watchdog_registered = False
+    print("[HIJACKER] could not recover the audio device. Reopen the Hijacker "
+          "after reconnecting it.")
+    return None
+
+
 def _pb_engine_enable():
     """Start Hijacker engine, take over Blender's audio, register handlers.
 
@@ -1280,9 +1395,40 @@ def _pb_engine_enable():
                             break
                         except Exception:
                             pass
-            ok = engine.engine_init(sample_rate)
+            # Output device + buffer size come from the add-on preferences.
+            # An older compiled engine doesn't take them, so fall back to the
+            # plain call rather than failing to start.
+            try:
+                import core.prefs as _prefs
+                dev_name, buf_frames = _prefs.audio_settings()
+            except Exception as _pe:
+                print(f"[HIJACKER] could not read audio preferences: {_pe}")
+                dev_name, buf_frames = "", 0
+            try:
+                ok = engine.engine_init(sample_rate, dev_name, buf_frames)
+            except TypeError:
+                print("[HIJACKER] engine is older than the preferences page; "
+                      "rebuild it to use device / buffer selection")
+                ok = engine.engine_init(sample_rate)
             if ok:
-                print(f"[HIJACKER] audio engine active @ {sample_rate}Hz")
+                try:
+                    hj_now = engine.get_engine()
+                    _prefs.apply_latency(hj_now)
+                    try:
+                        from core import master as _master
+                        _master.reset_meter()
+                        _master.push_to_engine()
+                    except Exception as _me:
+                        print(f"[HIJACKER] master bus setup failed: {_me}")
+                    shown = hj_now.get_output_device_name() if hasattr(
+                        hj_now, "get_output_device_name") else ""
+                    bf = hj_now.get_buffer_frames() if hasattr(
+                        hj_now, "get_buffer_frames") else 0
+                    print(f"[HIJACKER] audio engine active @ {sample_rate}Hz, "
+                          f"device '{shown or 'default'}', buffer "
+                          f"{bf if bf else 'auto'}")
+                except Exception:
+                    print(f"[HIJACKER] audio engine active @ {sample_rate}Hz")
             else:
                 print("[HIJACKER] WARNING: engine_init failed — no audio output. "
                       "Falling back to Blender's native audio.")
@@ -1323,6 +1469,11 @@ def _pb_engine_enable():
     if not _pb_eq_timer_registered:
         bpy.app.timers.register(_pb_eq_timer, first_interval=0.033)
         _pb_eq_timer_registered = True
+
+    global _pb_watchdog_registered
+    if not _pb_watchdog_registered:
+        bpy.app.timers.register(_pb_device_watchdog, first_interval=2.0)
+        _pb_watchdog_registered = True
 
     _pb_engine_active = True
     print("[HIJACKER] audio engine enabled")
@@ -1368,6 +1519,12 @@ def _pb_engine_disable():
         except Exception: pass
         _pb_eq_timer_registered = False
 
+    global _pb_watchdog_registered
+    if _pb_watchdog_registered:
+        try: bpy.app.timers.unregister(_pb_device_watchdog)
+        except Exception: pass
+        _pb_watchdog_registered = False
+
     # Restore Blender audio
     try:
         bpy.context.preferences.system.audio_device = _pb_original_device
@@ -1409,16 +1566,7 @@ def _pb_reprocess_channel(channel_idx):
 
     segs = _hj_build_segment_playlist(channel_idx, scene)
     if segs:
-        seg_objects = []
-        eng_mod = get_engine()
-        for seg in segs:
-            s = eng_mod.Segment()
-            s.filepath       = seg['filepath']
-            s.file_offset_s  = seg['file_offset_s']
-            s.duration_s     = seg['duration_s']
-            s.timeline_pos_s = seg['timeline_pos_s']
-            s.volume         = seg.get('volume', 1.0)
-            seg_objects.append(s)
+        seg_objects = _make_engine_segments(get_engine(), segs)
         hj.set_channel_playlist(channel_idx, seg_objects)
 
     # Wire effects — use _pb_rebuild_eq to include channel strip EQ slot

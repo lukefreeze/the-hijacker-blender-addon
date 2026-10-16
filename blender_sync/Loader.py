@@ -49,6 +49,7 @@ from core.properties import register_properties, unregister_properties
 import core.perf_monitor as _perf_mod
 import core.packapunch as _pap_mod
 import core.rack_screen_sequence as _rackseq_mod
+import core.prefs as _prefs_mod
 
 # Re-export constants that Racks.py imports from Loader
 from core.constants import FADER_TRACK_BOTTOM, NUMBOX_H, NUMBOX_Y_OFFSET
@@ -242,6 +243,11 @@ def draw_header_buttons(self, context):
         # Icon failed to load (e.g. missing file) — fall back to text-only
         # so the button is never silently lost.
         self.layout.operator("vse.toggle_pb_gui", text="The Hijacker")
+    # Speaker button: opens the sidebar with the audio settings (Tool tab)
+    try:
+        self.layout.operator("hijacker.open_audio_settings", text="", icon='SPEAKER')
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -335,9 +341,13 @@ def register():
     _addon_modules = [
         "ui.mixer.channel_strip",
         "ui.mixer.draw_utils",
+        "ui.mixer.master_widget",
         "ui.mixer.mixer_hud",
         "ui.mixer.texture_cache",
         "ui.mixer.interaction",
+        "core.master",
+        "core.wav_writer",
+        "core.strip_volume",
         "core.audio",
         "core.meters",
         "core.constants",
@@ -345,6 +355,7 @@ def register():
         "core.perf_monitor",
         "core.packapunch",
         "core.rack_screen_sequence",
+        "core.prefs",
         "Racks",
         "ui.racks.rack_base",
         "ui.racks.rack_comp",
@@ -403,6 +414,18 @@ def register():
             pass
         bpy.utils.register_class(cls)
 
+    # Audio settings (output device, buffer size, latency compensation).
+    # Always shown in Sequence Editor > Sidebar > Hijacker > Audio Settings.
+    # When installed as a real add-on (__package__ is its package name) they
+    # also appear on the Edit > Preferences > Add-ons page. When Loader.py is
+    # run directly as a dev script __package__ is empty, and Blender doesn't
+    # treat it as an add-on, so only the sidebar panel is available.
+    try:
+        _prefs_mod.register(__package__ or "")
+    except Exception as _pe:
+        print(f"[HIJACKER] could not register audio settings: {_pe}")
+        import traceback; traceback.print_exc()
+
     bpy.types.NODE_HT_header.append(draw_header_buttons)
     _handle = bpy.types.SpaceNodeEditor.draw_handler_add(
         draw_callback_px, (None, None), "WINDOW", "POST_PIXEL")
@@ -440,6 +463,12 @@ def unregister():
         except Exception as e:
             print(f"[HIJACKER] could not free header icon: {e}")
         _icons = None
+
+    # The settings sub-panel is a child of VSE_PT_Hijacker_Panel, so it goes first
+    try:
+        _prefs_mod.unregister()
+    except Exception as _pe:
+        print(f"[HIJACKER] could not unregister audio settings: {_pe}")
 
     for cls in reversed(classes):
         try:

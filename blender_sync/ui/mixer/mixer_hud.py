@@ -91,12 +91,18 @@ def packapunch_button_rect(width: float, height: float, ui_scale: float):
     return bx, by, bw, bh
 
 
+MASTER_RESERVE_W = 100.0
+
+
 def compute_autofit(draw_w: float, draw_h: float):
     """Return (UI_SCALE, SCROLL_X, SCROLL_Y) to centre the mixer in the canvas."""
-    fit_x   = draw_w / AUTOFIT_CONTENT_W
+    # MASTER_RESERVE_W: unscaled width kept free at the right for the master
+    # fader/meter (ui/mixer/master_widget.py), which is pinned to the canvas edge.
+    content_w = AUTOFIT_CONTENT_W + MASTER_RESERVE_W
+    fit_x   = draw_w / content_w
     fit_y   = draw_h / AUTOFIT_CONTENT_H
     scale   = max(0.35, min(2.0, min(fit_x, fit_y) * AUTOFIT_PADDING))
-    scr_x   = (draw_w - AUTOFIT_CONTENT_W * scale) / 2.0 - 30.0 * scale
+    scr_x   = (draw_w - content_w * scale) / 2.0 - 30.0 * scale
     scr_y   = draw_h / 2.0 - 550.0 * scale
     return scale, scr_x, scr_y
 
@@ -354,6 +360,13 @@ def draw_callback_px(self, context) -> None:
             _draw_racks(width, height, SCROLL_X, SCROLL_Y, UI_SCALE)
         except Exception as e:
             print(f"[RACKS] draw error: {e}")
+
+        # Master bus fader + meter — fixed to the right edge, drawn over the desks
+        try:
+            import ui.mixer.master_widget as _mw_draw
+            _mw_draw.draw(width, height, UI_SCALE)
+        except Exception as _mwe:
+            print(f"[MASTER] draw error: {_mwe}")
 
         # Scrollbars
         _draw_scrollbars(width, height)

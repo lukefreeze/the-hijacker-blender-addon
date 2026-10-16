@@ -39,6 +39,12 @@ static const float PI = 3.14159265358979f;
 // Defaults to 2 (clean below 0.9, soft safety above). Build with
 // -DHJ_EQ_OUTPUT_MODE=1 to get the legacy colouring back.
 // ---------------------------------------------------------------------------
+// Reverb wet level at "Wet = 1", relative to the input level (dB). 0 = the same
+// loudness as the dry signal; the old engine was about +21..+35 dB.
+#ifndef HJ_REVERB_WET_TRIM_DB
+#define HJ_REVERB_WET_TRIM_DB 0.0f
+#endif
+
 #ifndef HJ_EQ_OUTPUT_MODE
 #define HJ_EQ_OUTPUT_MODE 2
 #endif
@@ -428,6 +434,14 @@ static void apply_reverb_param(int ch, aud::sample_t* buf, int frames, int n_ch,
     rv.sample_rate = sr;
     float sr_scale = sr / 44100.0f;
 
+    // Wet-path level trim. The summed comb filters amplify the input by roughly
+    // sqrt(N / (1 - g^2)) (g = comb feedback), which made the wet signal 21..35 dB
+    // louder than the input and grew with room size. Dividing that out (and the
+    // constant stereo/allpass gain, measured 11.7 dB) makes "wet = 1" about as
+    // loud as the input at any room size, so the Wet knob behaves like a mix control.
+    const float comb_gain = std::sqrt((float)PB_REVERB_COMB / (1.0f - room_sz * room_sz));
+    const float wet_trim  = std::pow(10.0f, HJ_REVERB_WET_TRIM_DB / 20.0f) / (3.86f * comb_gain);
+
     // Delay-line lengths depend only on the sample rate: compute them once per
     // buffer instead of once per sample.
     int comb_len_l[PB_REVERB_COMB], comb_len_r[PB_REVERB_COMB];
@@ -477,9 +491,9 @@ static void apply_reverb_param(int ch, aud::sample_t* buf, int frames, int n_ch,
         float wet_l = out_l * (0.5f + width_mix) + out_r * (0.5f - width_mix);
         float wet_r = out_r * (0.5f + width_mix) + out_l * (0.5f - width_mix);
 
-        buf[f*n_ch + 0] = in_l * dry + wet_l * wet;
+        buf[f*n_ch + 0] = in_l * dry + wet_l * wet * wet_trim;
         if (n_ch > 1)
-            buf[f*n_ch + 1] = in_r * dry + wet_r * wet;
+            buf[f*n_ch + 1] = in_r * dry + wet_r * wet * wet_trim;
     }
 }
 
@@ -940,6 +954,9 @@ void hj_reset_channel_dsp(int ch)
     for (int bi = 0; bi < 7; ++bi) {
         EqBandState& b = g_state.eq_state[ch].bands[bi];
         b.z1[0] = b.z1[1] = b.z2[0] = b.z2[1] = 0.0f;
+        // Forget the coefficients of the previous run too: they were computed for that run's sample
+        // rate and would otherwise be cross-faded into the first block of the next one.
+        b.pc[0] = 1.0f; b.pc[1] = b.pc[2] = b.pc[3] = b.pc[4] = 0.0f;
     }
     ReverbChannelState& rv = g_state.reverb_state[ch];
     float sr = rv.sample_rate;

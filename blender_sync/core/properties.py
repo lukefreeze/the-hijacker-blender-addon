@@ -41,6 +41,9 @@ def register_properties():
     bpy.types.Scene.pb_ui_scroll_x = bpy.props.FloatProperty(default=0.0)
     bpy.types.Scene.pb_ui_scroll_y = bpy.props.FloatProperty(default=0.0)
     bpy.types.Scene.pb_ui_enabled  = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.pb_master_db   = bpy.props.FloatProperty(
+        default=0.0, min=-60.0, max=6.0,
+        description="Master bus fader in dB (-60 = silence)")
 
 
 def unregister_properties():
@@ -49,7 +52,8 @@ def unregister_properties():
     except Exception:
         pass
     for attr in ("pb_sync_tracks", "pb_ui_scale",
-                 "pb_ui_scroll_x", "pb_ui_scroll_y", "pb_ui_enabled"):
+                 "pb_ui_scroll_x", "pb_ui_scroll_y", "pb_ui_enabled",
+                 "pb_master_db"):
         try:
             delattr(bpy.types.Scene, attr)
         except Exception:

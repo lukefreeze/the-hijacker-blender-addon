@@ -46,6 +46,18 @@ y=engine.process_buffer(3,buf,48000); check("process_buffer passthrough", np.all
 hj.set_effect_slot(3,0,engine.FX_DELAY_PARAM,[0.1,0.5,0.5,0.0,0.9]+[0.0]*19)
 y=engine.process_buffer(3,buf,48000); check("process_buffer delay changes signal and is finite", (not np.allclose(y,buf)) and np.isfinite(y).all())
 y2=engine.process_buffer(3,buf,48000); check("offline processing is deterministic (state reset)", np.allclose(y,y2))
+# master bus API
+hj.set_master_gain(0.5); check("master gain set/get", abs(hj.get_master_gain()-0.5)<1e-6)
+hj.set_master_gain(9.0); check("master gain capped at 2.0", abs(hj.get_master_gain()-2.0)<1e-6)
+hj.set_master_gain(1.0); hj.clear_master_clip(); check("master clip clear + peak readable", hj.get_master_clip() is False and hj.get_master_peak()>=0.0)
+# loudness API + segment volume ramp
+ld = hj.get_loudness()
+check("loudness readings available", set(ld) == {"momentary", "short_term", "integrated", "lra", "momentary_max", "short_term_max", "true_peak_db", "sample_peak_db", "duration_s"}
+     )
+hj.reset_loudness(); time.sleep(0.05); check("reset_loudness clears the readings", hj.get_loudness()["integrated"] <= -150 and hj.get_loudness()["true_peak_db"] <= -150)
+check("offline_loudness readable", hj.offline_loudness()["integrated"] <= -150)
+seg = engine.Segment(); check("Segment.volume_end defaults to 'constant' (-1)", seg.volume_end == -1.0)
+seg.volume_end = 0.25; check("Segment.volume_end settable", abs(seg.volume_end - 0.25) < 1e-6)
 hj.stop(); run(480,12)
 engine.engine_shutdown()
 print("RESULT","PASS" if not FAILS else "FAIL "+str(FAILS)); sys.exit(0 if not FAILS else 1)

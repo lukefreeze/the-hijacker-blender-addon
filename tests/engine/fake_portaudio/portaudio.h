@@ -9,7 +9,8 @@ enum { paFramesPerBufferUnspecified = 0 };
 enum { paClipOff = 1 };
 enum : unsigned long { paOutputUnderflow = 4, paOutputOverflow = 8 };
 typedef struct { int type; const char* name; PaDeviceIndex defaultOutputDevice; } PaHostApiInfo;
-typedef struct { const char* name; double defaultSampleRate; PaTime defaultLowOutputLatency, defaultHighOutputLatency; } PaDeviceInfo;
+typedef struct { int structVersion; const char* name; PaHostApiIndex hostApi; int maxInputChannels, maxOutputChannels;
+  PaTime defaultLowInputLatency, defaultLowOutputLatency, defaultHighInputLatency, defaultHighOutputLatency; double defaultSampleRate; } PaDeviceInfo;
 typedef struct { PaDeviceIndex device; int channelCount; int sampleFormat; PaTime suggestedLatency; void* hostApiSpecificStreamInfo; } PaStreamParameters;
 typedef struct { int structVersion; PaTime inputLatency, outputLatency; double sampleRate; } PaStreamInfo;
 typedef struct { PaTime inputBufferAdcTime, currentTime, outputBufferDacTime; } PaStreamCallbackTimeInfo;
@@ -17,7 +18,7 @@ typedef int PaStreamCallback(const void*, void*, unsigned long, const PaStreamCa
 extern "C++" {
 PaError Pa_Initialize(); PaError Pa_Terminate(); const char* Pa_GetErrorText(PaError);
 int Pa_GetHostApiCount(); const PaHostApiInfo* Pa_GetHostApiInfo(int);
-PaDeviceIndex Pa_GetDefaultOutputDevice(); const PaDeviceInfo* Pa_GetDeviceInfo(PaDeviceIndex);
+PaDeviceIndex Pa_GetDefaultOutputDevice(); int Pa_GetDeviceCount(); const PaDeviceInfo* Pa_GetDeviceInfo(PaDeviceIndex);
 PaError Pa_IsFormatSupported(const PaStreamParameters*, const PaStreamParameters*, double);
 PaError Pa_OpenStream(PaStream**, const PaStreamParameters*, const PaStreamParameters*, double, unsigned long, unsigned long, PaStreamCallback*, void*);
 PaError Pa_StartStream(PaStream*); PaError Pa_StopStream(PaStream*); PaError Pa_CloseStream(PaStream*);

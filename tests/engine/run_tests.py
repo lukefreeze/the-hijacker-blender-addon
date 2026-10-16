@@ -12,7 +12,8 @@ needs no audio hardware - and runs the test scripts against that build.
     python tests/engine/run_tests.py --pybind        # + test the real pybind11 module surface
     python tests/engine/run_tests.py --only 02 06    # run just some tests
 
-Needs: a C++17 compiler (g++ or clang++, set CXX to choose), python3 and numpy.
+Needs: a C++17 compiler (g++ or clang++, set CXX to choose), python3, numpy and scipy.
+Optional: `pip install bpy` (Blender as a Python module, Python 3.11) enables the keyframed-volume test.
 Works on Linux and macOS. (The Windows/MSVC build is covered by build.bat / CI.)
 """
 import argparse, glob, os, shutil, subprocess, sys, sysconfig, time
@@ -145,11 +146,15 @@ def run_pybind():
     r = run(cmd)
     if r.returncode:
         print(r.stdout[-3000:]); print("[FAIL] pybind module build"); return False
-    r = run([sys.executable, os.path.join(HERE, "pybind", "test_pybind_module.py"), out_dir])
-    ok = r.returncode == 0
-    print(f"[{'PASS' if ok else 'FAIL'}] pybind_module")
-    if not ok:
-        print("\n".join("    " + l for l in r.stdout.splitlines()[-25:]))
+    ok = True
+    for t in sorted(glob.glob(os.path.join(HERE, "pybind", "test_*.py"))):
+        name = os.path.basename(t)[:-3]
+        r = run([sys.executable, t, out_dir])
+        good = r.returncode == 0
+        ok &= good
+        print(f"[{'PASS' if good else 'FAIL'}] pybind/{name}")
+        if not good:
+            print("\n".join("    " + l for l in r.stdout.splitlines()[-30:]))
     return ok
 
 

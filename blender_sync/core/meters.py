@@ -92,6 +92,13 @@ def _meter_timer():
                 _meter_timer._no_hj_warned = True
                 print("[METER] WARNING: hj is None — engine not available, meters will be 0")
 
+        # Master bus meter (peak + clip latch) — see core/master.py
+        try:
+            from core import master as _master
+            _master.poll(hj)
+        except Exception:
+            pass
+
         # Update EngineState.current_frame for rack waveform display.
         # No cursor driving — Blender's cursor stays under its own control.
         if hj and is_playing:

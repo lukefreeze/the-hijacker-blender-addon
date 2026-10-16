@@ -223,6 +223,7 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                _ai_knob_anchor_mouse_y, _ai_knob_anchor_value
 
         import ui.mixer.mixer_hud as _hud
+        import ui.mixer.master_widget as _mw
         pb_ui_enabled = _hud.pb_ui_enabled
         UI_SCALE      = _hud.UI_SCALE
         SCROLL_X      = _hud.SCROLL_X
@@ -251,7 +252,8 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                        or active_rack_knob is not None
                        or active_ai_knob is not None
                        or _active_text_field is not None
-                       or is_dragging_h or is_dragging_v or is_dragging_text)
+                       or is_dragging_h or is_dragging_v or is_dragging_text
+                       or _mw.is_dragging())
 
         if not (is_inside or mid_drag or widget_drag):
             return {"PASS_THROUGH"}
@@ -325,6 +327,11 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                 _v_ratio = 2000.0 / _v_track
                 SCROLL_Y = _vdrag_anchor_scroll_y + (event.mouse_y - _vdrag_anchor_mouse_y) * _v_ratio
                 save_ui_state(); context.area.tag_redraw()
+                return {"RUNNING_MODAL"}
+
+            if _mw.is_dragging():
+                _mw.handle_move(region.width, region.height, UI_SCALE, event.mouse_y)
+                context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
 
             if active_fader_track != -1:
@@ -464,6 +471,14 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                         return {"RUNNING_MODAL"}
                 except Exception as _pape:
                     print(f"[PACKAPUNCH] button click error: {_pape}")
+
+                # Master bus widget — fixed to the right edge, screen-space
+                try:
+                    if _mw.handle_press(rx, ry, region.width, region.height, UI_SCALE, event.mouse_y):
+                        context.area.tag_redraw()
+                        return {"RUNNING_MODAL"}
+                except Exception as _mwe:
+                    print(f"[MASTER] click error: {_mwe}")
 
                 if ry < 14:   # horizontal scrollbar hit zone (8px track + margin)
                     is_dragging_h = True
@@ -778,6 +793,9 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                     print(f"[AI RACKS] hit test error: {_ai_e}")
 
             elif event.value == "RELEASE":
+                if _mw.handle_release():
+                    _pb_push_undo("Hijacker: master fader changed")
+                    context.area.tag_redraw()
                 _had_active_drag = (
                     active_knob_track  != -1 or
                     active_fader_track != -1 or

@@ -49,7 +49,45 @@ struct HijackerSegment {
     double timeline_pos_s = 0.0;  // when it starts on the timeline
     float  volume         = 1.0f; // strip.volume baked in — per-segment gain
                                   // applied pre-DSP so the compressor sees it
+    float  volume_end     = -1.0f;// < 0: constant `volume`. >= 0: the gain moves in a straight line from
+                                  // `volume` at the segment start to `volume_end` at its end (volume
+                                  // automation; a keyframed strip is sent as a chain of these)
 };
+
+// ---------------------------------------------------------------------------
+// Loudness reading (ITU-R BS.1770-4 / EBU R128). Levels in LUFS / dBFS / dBTP;
+// -200 means "no reading yet".
+// ---------------------------------------------------------------------------
+struct HijackerLoudness {
+    double momentary      = -200.0;   // LUFS, last 400 ms
+    double short_term     = -200.0;   // LUFS, last 3 s
+    double integrated     = -200.0;   // LUFS, gated, since the last reset
+    double lra            = 0.0;      // LU, loudness range since the last reset
+    double momentary_max  = -200.0;
+    double short_term_max = -200.0;
+    double true_peak_db   = -200.0;   // dBTP since the last reset
+    double sample_peak_db = -200.0;   // dBFS since the last reset
+    double duration_s     = 0.0;      // seconds of signal measured since the last reset
+};
+
+// ---------------------------------------------------------------------------
+// Output device description (for the settings page)
+// ---------------------------------------------------------------------------
+struct HijackerOutputDevice {
+    int         index = -1;               // PortAudio device index (changes between sessions - use the name)
+    std::string name;                     // device name, as the driver reports it
+    std::string host_api;                 // "WASAPI", "Core Audio", "ALSA", ...
+    int         max_output_channels = 0;
+    double      default_sample_rate = 0.0;
+    double      low_latency_s  = 0.0;
+    double      high_latency_s = 0.0;
+    bool        is_default = false;       // the system default output of that driver
+};
+
+// Lists the stereo-capable output devices of the driver the engine uses
+// (WASAPI on Windows). Safe to call before init(), and while it is running
+// (a running engine reports the device list from when it started).
+std::vector<HijackerOutputDevice> hj_list_output_devices();
 
 // ---------------------------------------------------------------------------
 // HijackerEngine — main engine class
@@ -60,7 +98,10 @@ public:
     ~HijackerEngine();
 
     // Lifecycle
-    bool  init(int sample_rate = 44100, int buffer_frames = HJ_BUFFER_FRAMES);
+    // buffer_frames: 0 = let the driver choose (default), otherwise the requested
+    // device buffer size in frames. The device must be chosen with
+    // set_output_device() *before* init(); an empty name = the system default.
+    bool  init(int sample_rate = 44100, int buffer_frames = 0);
     void  shutdown();
     bool  is_running() const;
 
@@ -88,7 +129,40 @@ public:
     // Metering — called from Python meter timer
     float get_meter_rms(int ch)  const;
     float get_meter_peak(int ch) const;
+
+    // Master bus: fader after the channel sum (before the safety limiter).
+    void  set_master_gain(float linear);    // 0..2 (+6 dB max), smoothed
+    float get_master_gain() const;
+    float get_master_peak() const;          // max |sample| since last call (post-fader, pre-limiter)
+    bool  get_master_clip() const;          // true if the master reached 0 dBFS since clear_master_clip()
+    void  clear_master_clip();
+
+    // Loudness of the master output (what you hear, after the master fader and limiter).
+    // Measured continuously while the engine runs; reset_loudness() starts a fresh measurement.
+    HijackerLoudness get_loudness() const;
+    void  reset_loudness();
     double get_playhead_s()      const;
+
+    // Offline render: runs the same mix as live playback (fader, effects, pan,
+    // mute/solo, resampling, master gain and limiter) faster than real time, into
+    // memory, at any sample rate. For mixdowns and stems.
+    //   offline_begin : refuses while playing. Live audio stays silent until offline_end().
+    //                   channel_mask: bit n = channel n. respect_mute_solo: obey the desk's
+    //                   mute/solo. apply_master: master fader + safety limiter (mixes yes, stems no).
+    //   offline_render: renders the next n_frames (interleaved stereo float) and returns n_frames.
+    bool offline_begin(double start_s, int sample_rate, unsigned channel_mask,
+                       bool respect_mute_solo = true, bool apply_master = true);
+    int  offline_render(float* out_interleaved, int n_frames);
+    void offline_end();
+    bool offline_active() const;
+    // Loudness of the offline render so far (valid during the render and after offline_end()
+    // until the next offline_begin()).
+    HijackerLoudness offline_loudness() const;
+
+    // Output device (call before init())
+    void        set_output_device(const std::string& name);
+    std::string get_output_device_name() const;   // the device the stream is actually using
+    int         get_buffer_frames() const;        // requested buffer size (0 = driver's choice)
 
     // Diagnostics
     int    get_sample_rate()      const;
@@ -125,7 +199,7 @@ private:
     void*  pa_stream_   = nullptr;   // PaStream* — void* avoids portaudio.h in header
     bool   initialized_ = false;
     int    sample_rate_ = 44100;
-    int    buffer_frames_ = HJ_BUFFER_FRAMES;
+    int    buffer_frames_ = 0;
 };
 
 // Global engine instance (accessed via pybind11 wrapper)

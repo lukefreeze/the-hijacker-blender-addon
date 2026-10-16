@@ -2,6 +2,7 @@
 // wrapper.cpp — The Hijacker pybind11 Python bindings
 // =============================================================================
 #include <pybind11/pybind11.h>
+#include <string>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 #include "mixer_ui.h"
@@ -85,10 +86,28 @@ py::array_t<float> process_buffer(int channel_idx,
 // ---------------------------------------------------------------------------
 // Engine lifecycle helpers
 // ---------------------------------------------------------------------------
-static bool engine_init(int sample_rate) {
+static bool engine_init(int sample_rate, const std::string& device_name, int buffer_frames) {
     if (!g_hijacker_engine)
         g_hijacker_engine = new HijackerEngine();
-    return g_hijacker_engine->init(sample_rate);
+    g_hijacker_engine->set_output_device(device_name);
+    return g_hijacker_engine->init(sample_rate, buffer_frames);
+}
+
+static py::list list_output_devices() {
+    py::list out;
+    for (const HijackerOutputDevice& d : hj_list_output_devices()) {
+        py::dict e;
+        e["index"]               = d.index;
+        e["name"]                = d.name;
+        e["host_api"]            = d.host_api;
+        e["max_output_channels"] = d.max_output_channels;
+        e["default_sample_rate"] = d.default_sample_rate;
+        e["low_latency_s"]       = d.low_latency_s;
+        e["high_latency_s"]      = d.high_latency_s;
+        e["is_default"]          = d.is_default;
+        out.append(e);
+    }
+    return out;
 }
 
 static void engine_shutdown() {
@@ -118,13 +137,28 @@ static HijackerEngine* get_engine() {
 #define HIJACKER_MODULE_NAME hijacker_engine
 #endif
 
+static py::dict loudness_dict(const HijackerLoudness& l) {
+    py::dict d;
+    d["momentary"] = l.momentary;       d["short_term"] = l.short_term;
+    d["integrated"] = l.integrated;     d["lra"] = l.lra;
+    d["momentary_max"] = l.momentary_max; d["short_term_max"] = l.short_term_max;
+    d["true_peak_db"] = l.true_peak_db; d["sample_peak_db"] = l.sample_peak_db;
+    d["duration_s"] = l.duration_s;
+    return d;
+}
+
 PYBIND11_MODULE(HIJACKER_MODULE_NAME, m)
 {
     m.doc() = "The Hijacker — audio engine for Blender";
 
     // ── Engine lifecycle ──────────────────────────────────────────────────
     m.def("engine_init",     &engine_init,     py::arg("sample_rate") = 44100,
-          "Initialise PortAudio and start the audio thread");
+          py::arg("device_name") = std::string(), py::arg("buffer_frames") = 0,
+          "Initialise PortAudio and start the audio thread. device_name: output device "
+          "(empty = system default); buffer_frames: 0 = driver's choice");
+    m.def("list_output_devices", &list_output_devices,
+          "Stereo-capable output devices: list of dicts (index, name, host_api, "
+          "max_output_channels, default_sample_rate, low_latency_s, high_latency_s, is_default)");
     m.def("engine_shutdown", &engine_shutdown,
           "Stop the audio thread and release PortAudio");
     m.def("get_engine",      &get_engine,
@@ -164,7 +198,8 @@ PYBIND11_MODULE(HIJACKER_MODULE_NAME, m)
         .def_readwrite("file_offset_s",  &HijackerSegment::file_offset_s)
         .def_readwrite("duration_s",     &HijackerSegment::duration_s)
         .def_readwrite("timeline_pos_s", &HijackerSegment::timeline_pos_s)
-        .def_readwrite("volume",         &HijackerSegment::volume);
+        .def_readwrite("volume",         &HijackerSegment::volume)
+        .def_readwrite("volume_end",     &HijackerSegment::volume_end);
 
     // ── HijackerEngine ────────────────────────────────────────────────────
     py::class_<HijackerEngine>(m, "Engine")
@@ -199,12 +234,46 @@ PYBIND11_MODULE(HIJACKER_MODULE_NAME, m)
         .def("get_meter_peak", &HijackerEngine::get_meter_peak,
              py::arg("channel"))
         .def("get_playhead_s", &HijackerEngine::get_playhead_s)
+        .def("offline_begin",
+             [](HijackerEngine& e, double start_s, int sample_rate, const std::vector<int>& channels,
+                bool respect_mute_solo, bool apply_master) {
+                 unsigned mask = 0;
+                 for (int c : channels) if (c >= 0 && c < PB_MAX_CHANNELS) mask |= (1u << c);
+                 return e.offline_begin(start_s, sample_rate, mask, respect_mute_solo, apply_master);
+             },
+             py::arg("start_s"), py::arg("sample_rate"), py::arg("channels"),
+             py::arg("respect_mute_solo") = true, py::arg("apply_master") = true,
+             "Start an offline render of the given channels (list of ints) using the live mix code. "
+             "Returns False if playback is running.")
+        .def("offline_render",
+             [](HijackerEngine& e, int n_frames) {
+                 if (n_frames <= 0 || n_frames > (1 << 24))
+                     throw std::invalid_argument("n_frames out of range");
+                 py::array_t<float> a({n_frames, 2});
+                 e.offline_render(a.mutable_data(), n_frames);
+                 return a;
+             },
+             py::arg("n_frames"), "Render the next n_frames; returns a (n_frames, 2) float32 array")
+        .def("offline_end",    &HijackerEngine::offline_end)
+        .def("offline_active", &HijackerEngine::offline_active)
+        .def("set_master_gain",  &HijackerEngine::set_master_gain, py::arg("linear"))
+        .def("get_master_gain",  &HijackerEngine::get_master_gain)
+        .def("get_master_peak",  &HijackerEngine::get_master_peak)
+        .def("get_master_clip",  &HijackerEngine::get_master_clip)
+        .def("clear_master_clip",&HijackerEngine::clear_master_clip)
+        .def("get_loudness", [](const HijackerEngine& e) { return loudness_dict(e.get_loudness()); },
+             "Loudness of the master output since the last reset (LUFS / LU / dBFS / dBTP; -200 = no reading yet)")
+        .def("reset_loudness", &HijackerEngine::reset_loudness)
+        .def("offline_loudness", [](const HijackerEngine& e) { return loudness_dict(e.offline_loudness()); },
+             "Loudness of the offline render (during it, or after offline_end until the next offline_begin)")
         // Diagnostics (new): the rate the engine really opened the device at,
         // the device's reported output latency in seconds, and a running count
         // of audio dropouts (device underflows + disk-thread underruns).
         .def("get_sample_rate",       &HijackerEngine::get_sample_rate)
         .def("get_output_latency_s",  &HijackerEngine::get_output_latency_s)
         .def("get_xrun_count",        &HijackerEngine::get_xrun_count)
+        .def("get_output_device_name", &HijackerEngine::get_output_device_name)
+        .def("get_buffer_frames",      &HijackerEngine::get_buffer_frames)
         .def("set_latency_compensation",   &HijackerEngine::set_latency_compensation,
              py::arg("seconds"),
              "seconds < 0: automatic (default), 0: off, > 0: fixed offset in seconds")

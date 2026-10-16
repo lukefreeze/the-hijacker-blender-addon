@@ -25,6 +25,7 @@
 // =============================================================================
 
 #include "hijacker_audio_engine.h"
+#include "hijacker_loudness.h"
 #include <portaudio.h>
 #include <cstring>
 #include <cmath>
@@ -34,6 +35,7 @@
 #include <vector>
 #include <thread>
 #include <condition_variable>
+#include <memory>
 #include <chrono>
 
 #if defined(_WIN32)
@@ -309,6 +311,14 @@ inline float edge_gain(int64_t rel, int64_t len, bool fin, bool fout, int fi, in
     return g;
 }
 
+// Segment gain at frame `rel` (0..len-1): constant, or a straight line from `volume`
+// at the start to `volume_end` at the end when the segment carries volume automation.
+inline float seg_gain(const HijackerSegment& seg, int64_t rel, int64_t len)
+{
+    if (seg.volume_end < 0.0f) return seg.volume;
+    return seg.volume + (seg.volume_end - seg.volume) * ((float)rel / (float)len);
+}
+
 // ---------------------------------------------------------------------------
 // Sample-rate-conversion kernel: Kaiser-windowed sinc, 16 zero crossings per
 // side, 512 sub-sample phases (linearly interpolated). When the file rate is
@@ -406,6 +416,87 @@ struct Stream {
     char                             failed_path[512] = {};
 };
 
+// Everything that depends on the output sample rate, so the same render code can
+// run for the live stream (device rate) and for an offline render (any rate).
+struct RenderCtx {
+    int   sr = 44100;
+    float k_fader = 0.0f, k_mute = 0.0f, k_pan = 0.0f;
+    SrcKernel kernels[4];
+    int   n_kernels = 0;
+    void set_rate(int rate) {
+        sr = rate;
+        const float fs = (float)rate;
+        k_fader = 1.0f - std::exp(-1.0f / (0.004f * fs));
+        k_mute  = 1.0f - std::exp(-1.0f / (0.004f * fs));
+        k_pan   = 1.0f - std::exp(-1.0f / (0.010f * fs));
+        n_kernels = 0;
+    }
+};
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)   // padded because of alignas(16) on the mix buffers - intentional
+#endif
+// State of one offline render (see HijackerEngine::offline_begin). It owns private
+// copies of the per-channel playback state and its own file readers, so it never
+// touches the disk thread's data.
+struct OfflineJob {
+    RenderCtx ctx;
+    std::unique_ptr<Stream> st[PB_MAX_CHANNELS];
+    bool    used[PB_MAX_CHANNELS] = {};
+    bool    any_solo = false;
+    bool    respect_ms = true;
+    bool    apply_master = true;
+    float   master_gain = 1.0f;
+    int64_t frame = 0;
+    hjl::LoudnessMeter meter;                 // loudness of this render's output
+    alignas(16) float chbuf[MAX_BLOCK * 2];
+    alignas(16) float mixbuf[MAX_BLOCK * 2];
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+// Smoothed gains (fader, mute, pan, master) jump to their target once they are this
+// close. It has to be well above the float resolution: with a one-pole smoother the
+// remaining distance stops shrinking when each step is smaller than half a float
+// step, which happens at about 3e-5 for a 10 ms smoother, so a smaller threshold
+// is never reached and the gain stays slightly off target for ever.
+constexpr float kSnap = 1e-4f;
+
+// Master-stage safety net, shared by the live callback and the offline renderer:
+// sanitises NaN/runaway samples and (optionally) soft-limits. Transparent below
+// 0.95. Above it the level is bent smoothly towards 1.0 and never reaches it:
+//   y = 0.95 + o / (1 + o/0.05),  o = |x| - 0.95   (slope 1 at the knee, asymptote 1.0)
+// Returns the largest |sample| seen before limiting (the master meter reading).
+inline float hj_limit_block(float* out, unsigned long n_out, bool limit)
+{
+    float pk = 0.0f;
+    for (unsigned long i = 0; i < n_out; ++i) {
+        float s = out[i];
+        if (!(s == s) || s > 1e6f || s < -1e6f) { out[i] = 0.0f; continue; }   // NaN / runaway
+        { const float a = s < 0.0f ? -s : s; if (a > pk) pk = a; }
+        if (!limit) continue;
+        if (s > 0.95f) {
+            float over = s - 0.95f;
+            out[i] = 0.95f + over / (1.0f + over * 20.0f);
+        } else if (s < -0.95f) {
+            float over = -s - 0.95f;
+            out[i] = -(0.95f + over / (1.0f + over * 20.0f));
+        }
+    }
+    return pk;
+}
+
+inline HijackerLoudness to_public(const hjl::Result& r)
+{
+    HijackerLoudness o;
+    o.momentary = r.momentary; o.short_term = r.short_term; o.integrated = r.integrated; o.lra = r.lra;
+    o.momentary_max = r.momentary_max; o.short_term_max = r.short_term_max;
+    o.true_peak_db = r.true_peak_db; o.sample_peak_db = r.sample_peak_db; o.duration_s = r.duration_s;
+    return o;
+}
+
 } // namespace
 
 // =============================================================================
@@ -425,9 +516,18 @@ struct HijackerEngine::Impl {
     std::condition_variable wake_cv;
     bool                    worker_running = false;
 
+    // output device selection (set before init)
+    std::string device_pref;          // wanted device name ("" = system default)
+    std::string device_active;        // device the stream was opened on
+
     // engine rate (set before the worker / stream start)
     int   sr = 44100;
-    float k_fader = 0.0f, k_mute = 0.0f, k_pan = 0.0f;
+    RenderCtx live;                   // render settings for the live stream (rate, smoothing, SRC kernels)
+
+    // offline rendering (HijackerEngine::offline_begin / _render / _end)
+    std::atomic<bool> offline_active {false};   // audio callback stays silent while true
+    std::atomic<int>  cb_busy {0};              // 1 while the audio callback is running
+    std::unique_ptr<OfflineJob> job;
 
     // transport (Python -> audio thread)
     std::atomic<bool>     playing      {false};
@@ -446,6 +546,21 @@ struct HijackerEngine::Impl {
     std::atomic<int64_t>  bias_frames  {0};      // frames added to the last play()/seek() position
     std::atomic<double>   hold_est_s   {0.0};    // measured play()->first-audio delay (smoothed)
     std::atomic<int64_t>  play_t0_ns   {0};      // steady-clock time of the last play()
+    // Master bus: a fader after the channel sum and before the safety limiter.
+    // master_target is set from Python; master_cur is the smoothed value the
+    // audio thread actually applies (touched only by the audio thread).
+    std::atomic<float>    master_target{1.0f};
+    float                 master_cur   {1.0f};
+    std::atomic<float>    master_peak  {0.0f};   // max |sample| since get_master_peak() last read it
+    std::atomic<bool>     master_clip  {false};  // latched until clear_master_clip()
+    // Loudness of the master output. `loud` is touched only by the audio thread; the readings
+    // are published through `loud_pub` (one atomic per field) for Python to read.
+    hjl::LoudnessMeter    loud;
+    std::atomic<bool>     loud_ok      {false};  // loud.init() has run for the current stream
+    std::atomic<bool>     loud_reset   {false};  // asks the audio thread to restart the measurement
+    static constexpr int  LOUD_FIELDS = 9;
+    std::atomic<double>   loud_pub[LOUD_FIELDS];
+    HijackerLoudness      off_loud;              // result of the last offline render
 
     // audio-thread-only state
     int64_t  play_frame   = 0;
@@ -454,10 +569,10 @@ struct HijackerEngine::Impl {
     int64_t  hold_waited  = 0;
     int      fadeout_pos  = 0;
     bool     any_solo     = false;
-    SrcKernel kernels[4];                 // disk thread only
-    int       n_kernels = 0;
     alignas(16) float chbuf[MAX_BLOCK * 2];
     alignas(16) float mixbuf[MAX_BLOCK * 2];
+
+    Impl() { for (int i = 0; i < LOUD_FIELDS; ++i) loud_pub[i].store(i == 3 || i == 8 ? 0.0 : -200.0, std::memory_order_relaxed); }
 
     // ---- control / helpers --------------------------------------------------
     void start_worker(int rate);
@@ -470,10 +585,10 @@ struct HijackerEngine::Impl {
     // producer
     bool service(Stream& s);
     void producer_reset(Stream& s, uint32_t epoch);
-    void adopt_playlist(Stream& s);
-    void render_block(Stream& s, int64_t frame0, int n, float* out);
+    void adopt_playlist(Stream& s, int rate);
+    void render_block(Stream& s, int64_t frame0, int n, float* out, RenderCtx& c);
     void render_piece(Stream& s, const SegFrames& sf, int64_t i0, int64_t i1,
-                      int64_t frame0, float* out);
+                      int64_t frame0, float* out, RenderCtx& c);
 
     // consumer
     void issue_request(Stream& s, int64_t frame);
@@ -481,6 +596,12 @@ struct HijackerEngine::Impl {
     void do_seek(int64_t frame);
     bool stream_ready(Stream& s, int need);
     void mix_chunk(float* out, int n);
+    // fader -> DSP -> meters -> pan/mute/declick -> added into `out`, for one channel's block `cb`
+    void mix_stream(Stream& s, int ch, float* cb, int n, float* out, RenderCtx& c,
+                    bool any_solo_f, bool live_meters, bool respect_ms);
+    bool offline_begin(double start_s, int rate, uint32_t mask, bool respect_ms, bool apply_master);
+    int  offline_render(float* out, int n);
+    void offline_end();
 };
 #if defined(_MSC_VER)
 #pragma warning(pop)
@@ -493,10 +614,11 @@ void HijackerEngine::Impl::start_worker(int rate)
 {
     if (worker_running) return;
     sr = rate;
-    const float fs = (float)rate;
-    k_fader = 1.0f - std::exp(-1.0f / (0.004f * fs));
-    k_mute  = 1.0f - std::exp(-1.0f / (0.004f * fs));
-    k_pan   = 1.0f - std::exp(-1.0f / (0.010f * fs));
+    live.set_rate(rate);
+    loud_ok.store(false, std::memory_order_seq_cst);
+    loud.init(rate);
+    for (int i = 0; i < LOUD_FIELDS; ++i) loud_pub[i].store(i == 3 || i == 8 ? 0.0 : -200.0, std::memory_order_relaxed);
+    loud_ok.store(true, std::memory_order_seq_cst);
 
     for (int i = 0; i < PB_MAX_CHANNELS; ++i) {
         Stream& s = streams[i];
@@ -563,7 +685,7 @@ void HijackerEngine::Impl::wait_released(Stream& s, uint32_t gen)
 // -----------------------------------------------------------------------------
 // Producer
 // -----------------------------------------------------------------------------
-void HijackerEngine::Impl::adopt_playlist(Stream& s)
+void HijackerEngine::Impl::adopt_playlist(Stream& s, int rate)
 {
     {
         std::lock_guard<std::mutex> lk(s.pl_mtx);
@@ -571,7 +693,7 @@ void HijackerEngine::Impl::adopt_playlist(Stream& s)
     }
     s.p_segs.clear();
     if (!s.p_pl) return;
-    const double fs = (double)sr;
+    const double fs = (double)rate;
     for (const PlaylistSeg& ps : s.p_pl->segs) {
         SegFrames sf;
         sf.ps = &ps;
@@ -588,7 +710,7 @@ void HijackerEngine::Impl::producer_reset(Stream& s, uint32_t epoch)
 {
     s.p_epoch = epoch;
     uint32_t g = s.pl_gen.load(std::memory_order_acquire);
-    adopt_playlist(s);
+    adopt_playlist(s, live.sr);
     s.p_gen_seen = g;
     s.p_stale = false;
     s.reader.close();
@@ -602,7 +724,7 @@ void HijackerEngine::Impl::producer_reset(Stream& s, uint32_t epoch)
 
 void HijackerEngine::Impl::render_piece(Stream& s, const SegFrames& sf,
                                         int64_t i0, int64_t i1,
-                                        int64_t frame0, float* out)
+                                        int64_t frame0, float* out, RenderCtx& c)
 {
     const HijackerSegment& seg = sf.ps->seg;
     const int64_t len = sf.s1 - sf.s0;
@@ -621,13 +743,13 @@ void HijackerEngine::Impl::render_piece(Stream& s, const SegFrames& sf,
     static thread_local std::vector<float> src;
     if (tmp.empty()) { tmp.resize((size_t)PROD_BLOCK * 2); src.resize((size_t)SRC_CAP * 2); }
 
-    if (fsr == sr) {
+    if (fsr == c.sr) {
         const int64_t src0 = (int64_t)std::llround(seg.file_offset_s * (double)fsr) + (i0 - sf.s0);
         const int cnt = (int)(i1 - i0);
         s.reader.read_frames(src0, cnt, tmp.data());
         for (int k = 0; k < cnt; ++k) {
             int64_t rel = i0 - sf.s0 + k;
-            float g = seg.volume * edge_gain(rel, len, sf.ps->fade_in, sf.ps->fade_out, sf.fi, sf.fo);
+            float g = seg_gain(seg, rel, len) * edge_gain(rel, len, sf.ps->fade_in, sf.ps->fade_out, sf.fi, sf.fo);
             float* o = out + 2 * (i0 - frame0 + k);
             o[0] += tmp[2 * k]     * g;
             o[1] += tmp[2 * k + 1] * g;
@@ -638,15 +760,15 @@ void HijackerEngine::Impl::render_piece(Stream& s, const SegFrames& sf,
     // Sample-rate conversion (windowed sinc). The phase is derived from the
     // absolute timeline position, so it is continuous across blocks (no drift,
     // no clicks at block joins).
-    const double ratio = (double)fsr / (double)sr;
+    const double ratio = (double)fsr / (double)c.sr;
     if (ratio > 16.0 || ratio < 1.0 / 16.0) return;
     SrcKernel* kern = nullptr;
-    for (int i = 0; i < n_kernels; ++i)
-        if (kernels[i].fsr == fsr && kernels[i].esr == sr) { kern = &kernels[i]; break; }
+    for (int i = 0; i < c.n_kernels; ++i)
+        if (c.kernels[i].fsr == fsr && c.kernels[i].esr == c.sr) { kern = &c.kernels[i]; break; }
     if (!kern) {
-        int idx = (n_kernels < 4) ? n_kernels++ : 0;
-        kernels[idx].build(fsr, sr);
-        kern = &kernels[idx];
+        int idx = (c.n_kernels < 4) ? c.n_kernels++ : 0;
+        c.kernels[idx].build(fsr, c.sr);
+        kern = &c.kernels[idx];
     }
     const int T    = kern->taps;
     const int left = T / 2 - 1;
@@ -676,7 +798,7 @@ void HijackerEngine::Impl::render_piece(Stream& s, const SegFrames& sf,
                 accr += c * y[2 * j + 1];
             }
             int64_t rel = a - sf.s0 + k;
-            float g = seg.volume * edge_gain(rel, len, sf.ps->fade_in, sf.ps->fade_out, sf.fi, sf.fo);
+            float g = seg_gain(seg, rel, len) * edge_gain(rel, len, sf.ps->fade_in, sf.ps->fade_out, sf.fi, sf.fo);
             float* d = out + 2 * (a - frame0 + k);
             d[0] += accl * g;
             d[1] += accr * g;
@@ -684,13 +806,13 @@ void HijackerEngine::Impl::render_piece(Stream& s, const SegFrames& sf,
     }
 }
 
-void HijackerEngine::Impl::render_block(Stream& s, int64_t frame0, int n, float* out)
+void HijackerEngine::Impl::render_block(Stream& s, int64_t frame0, int n, float* out, RenderCtx& c)
 {
     memset(out, 0, sizeof(float) * 2 * (size_t)n);
     const int64_t frame1 = frame0 + n;
     for (const SegFrames& sf : s.p_segs) {
         if (sf.s1 <= frame0 || sf.s0 >= frame1) continue;
-        render_piece(s, sf, std::max(frame0, sf.s0), std::min(frame1, sf.s1), frame0, out);
+        render_piece(s, sf, std::max(frame0, sf.s0), std::min(frame1, sf.s1), frame0, out, c);
     }
 }
 
@@ -730,7 +852,7 @@ bool HijackerEngine::Impl::service(Stream& s)
         if (s.p_end - rp >= PREFETCH_FRAMES) break;
         if (s.p_end + PROD_BLOCK - rp > RING_FRAMES) break;
 
-        render_block(s, s.p_end, PROD_BLOCK, blk);
+        render_block(s, s.p_end, PROD_BLOCK, blk, live);
 
         // copy into the ring (at most two pieces across the wrap point)
         int slot = (int)(s.p_end & RING_MASK);
@@ -837,6 +959,105 @@ inline void pan_gains(float pan, float& gl, float& gr)
 }
 } // namespace
 
+void HijackerEngine::Impl::mix_stream(Stream& s, int ch, float* cb, int n, float* out, RenderCtx& c,
+                                      bool any_solo_f, bool live_meters, bool respect_ms)
+{
+    // ---- mute / solo / fader targets ----------------------------------
+    const bool  silent_t = respect_ms &&
+                           (s.muted.load(std::memory_order_relaxed) ||
+                            (any_solo_f && !s.soloed.load(std::memory_order_relaxed)));
+    const float vol_t    = s.volume.load(std::memory_order_relaxed);
+    const float mute_t   = silent_t ? 0.0f : 1.0f;
+    if (s.fader_g < 0.0f) s.fader_g = vol_t;      // first use: no ramp from zero
+    if (s.mute_g  < 0.0f) s.mute_g  = mute_t;
+
+    if ((mute_t == 0.0f && s.mute_g <= 1e-4f) || (vol_t < 1e-4f && s.fader_g < 1e-4f)) {
+        // Fully silent: skip DSP and mixing (as before), keep meters at zero.
+        if (mute_t == 0.0f) s.mute_g = 0.0f;
+        if (vol_t < 1e-4f)  s.fader_g = vol_t;
+        if (live_meters) {
+            s.meter_rms.store(0.0f);
+            s.meter_peak.store(0.0f);
+            g_state.meter_levels[ch] = 0.0f;
+        }
+        return;
+    }
+
+    // ---- fader (pre-DSP, so the compressor sees the right level) -------
+    {
+        float g = s.fader_g;
+        if (g == vol_t) {
+            if (g != 1.0f)
+                for (int i = 0; i < n * 2; ++i) cb[i] *= g;
+        } else {
+            for (int i = 0; i < n; ++i) {
+                g += (vol_t - g) * c.k_fader;
+                if (std::fabs(vol_t - g) < kSnap) g = vol_t;
+                cb[2 * i] *= g; cb[2 * i + 1] *= g;
+            }
+            s.fader_g = g;
+        }
+    }
+
+    // ---- DSP effect chain ---------------------------------------------
+    {
+        if (hj_channel_has_fx(ch)) apply_effect_chain_batch(ch, cb, n, 2, (float)c.sr);
+    }
+
+    // ---- metering (post-fader, post-DSP) + runaway protection ---------
+    {
+        float rms_sum = 0.0f, peak = 0.0f;
+        for (int i = 0; i < n * 2; ++i) {
+            float v = cb[i];
+            rms_sum += v * v;
+            float a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+        }
+        if (!std::isfinite(rms_sum)) {
+            // A NaN/Inf got into the IIR state: it would never recover by itself.
+            hj_reset_channel_dsp(ch);
+            memset(cb, 0, sizeof(float) * 2 * (size_t)n);
+            rms_sum = 0.0f; peak = 0.0f;
+        }
+        float rms = std::sqrt(rms_sum / (float)(n * 2));
+        if (live_meters) {
+            s.meter_rms.store(rms);
+            s.meter_peak.store(peak);
+            {   // keep the loudest peak until Python reads it, so a poll never misses a short peak
+                float prev = s.peak_acc.load(std::memory_order_relaxed);
+                while (peak > prev && !s.peak_acc.compare_exchange_weak(prev, peak, std::memory_order_relaxed)) {}
+            }
+            g_state.meter_levels[ch] = rms;
+        }
+    }
+
+    // ---- mute ramp, pan, declick fade-in, mix ---------------------------
+    {
+        const float pan_t = s.pan.load(std::memory_order_relaxed);
+        float pc = s.pan_c, mg = s.mute_g;
+        float gl, gr;
+        pan_gains(pc, gl, gr);
+        int fl = s.fade_in_left;
+        for (int i = 0; i < n; ++i) {
+            if (mg != mute_t) {
+                mg += (mute_t - mg) * c.k_mute;
+                if (std::fabs(mute_t - mg) < kSnap) mg = mute_t;
+            }
+            if (pc != pan_t) {
+                pc += (pan_t - pc) * c.k_pan;
+                if (std::fabs(pan_t - pc) < kSnap) pc = pan_t;
+                pan_gains(pc, gl, gr);
+            }
+            float fg = 1.0f;
+            if (fl > 0) { fg = 1.0f - (float)fl / (float)(DECLICK_FRAMES + 1); --fl; }
+            float g = mg * fg;
+            out[2 * i]     += cb[2 * i]     * gl * g;
+            out[2 * i + 1] += cb[2 * i + 1] * gr * g;
+        }
+        s.pan_c = pc; s.mute_g = mg; s.fade_in_left = fl;
+    }
+}
+
 void HijackerEngine::Impl::mix_chunk(float* out, int n)
 {
     for (int ch = 0; ch < PB_MAX_CHANNELS; ++ch) {
@@ -870,95 +1091,7 @@ void HijackerEngine::Impl::mix_chunk(float* out, int n)
             if (s.fade_in_left < DECLICK_FRAMES) s.fade_in_left = DECLICK_FRAMES;
         }
 
-        // ---- mute / solo / fader targets ----------------------------------
-        const bool  silent_t = s.muted.load(std::memory_order_relaxed) ||
-                               (any_solo && !s.soloed.load(std::memory_order_relaxed));
-        const float vol_t    = s.volume.load(std::memory_order_relaxed);
-        const float mute_t   = silent_t ? 0.0f : 1.0f;
-        if (s.fader_g < 0.0f) s.fader_g = vol_t;      // first use: no ramp from zero
-        if (s.mute_g  < 0.0f) s.mute_g  = mute_t;
-
-        if ((mute_t == 0.0f && s.mute_g <= 1e-4f) || (vol_t < 1e-4f && s.fader_g < 1e-4f)) {
-            // Fully silent: skip DSP and mixing (as before), keep meters at zero.
-            if (mute_t == 0.0f) s.mute_g = 0.0f;
-            if (vol_t < 1e-4f)  s.fader_g = vol_t;
-            s.meter_rms.store(0.0f);
-            s.meter_peak.store(0.0f);
-            g_state.meter_levels[ch] = 0.0f;
-            continue;
-        }
-
-        // ---- fader (pre-DSP, so the compressor sees the right level) -------
-        {
-            float g = s.fader_g;
-            if (g == vol_t) {
-                if (g != 1.0f)
-                    for (int i = 0; i < n * 2; ++i) cb[i] *= g;
-            } else {
-                for (int i = 0; i < n; ++i) {
-                    g += (vol_t - g) * k_fader;
-                    if (std::fabs(vol_t - g) < 1e-5f) g = vol_t;
-                    cb[2 * i] *= g; cb[2 * i + 1] *= g;
-                }
-                s.fader_g = g;
-            }
-        }
-
-        // ---- DSP effect chain ---------------------------------------------
-        {
-            if (hj_channel_has_fx(ch)) apply_effect_chain_batch(ch, cb, n, 2, (float)sr);
-        }
-
-        // ---- metering (post-fader, post-DSP) + runaway protection ---------
-        {
-            float rms_sum = 0.0f, peak = 0.0f;
-            for (int i = 0; i < n * 2; ++i) {
-                float v = cb[i];
-                rms_sum += v * v;
-                float a = v < 0 ? -v : v;
-                if (a > peak) peak = a;
-            }
-            if (!std::isfinite(rms_sum)) {
-                // A NaN/Inf got into the IIR state: it would never recover by itself.
-                hj_reset_channel_dsp(ch);
-                memset(cb, 0, sizeof(float) * 2 * (size_t)n);
-                rms_sum = 0.0f; peak = 0.0f;
-            }
-            float rms = std::sqrt(rms_sum / (float)(n * 2));
-            s.meter_rms.store(rms);
-            s.meter_peak.store(peak);
-            {   // keep the loudest peak until Python reads it, so a poll never misses a short peak
-                float prev = s.peak_acc.load(std::memory_order_relaxed);
-                while (peak > prev && !s.peak_acc.compare_exchange_weak(prev, peak, std::memory_order_relaxed)) {}
-            }
-            g_state.meter_levels[ch] = rms;
-        }
-
-        // ---- mute ramp, pan, declick fade-in, mix ---------------------------
-        {
-            const float pan_t = s.pan.load(std::memory_order_relaxed);
-            float pc = s.pan_c, mg = s.mute_g;
-            float gl, gr;
-            pan_gains(pc, gl, gr);
-            int fl = s.fade_in_left;
-            for (int i = 0; i < n; ++i) {
-                if (mg != mute_t) {
-                    mg += (mute_t - mg) * k_mute;
-                    if (std::fabs(mute_t - mg) < 1e-5f) mg = mute_t;
-                }
-                if (pc != pan_t) {
-                    pc += (pan_t - pc) * k_pan;
-                    if (std::fabs(pan_t - pc) < 1e-5f) pc = pan_t;
-                    pan_gains(pc, gl, gr);
-                }
-                float fg = 1.0f;
-                if (fl > 0) { fg = 1.0f - (float)fl / (float)(DECLICK_FRAMES + 1); --fl; }
-                float g = mg * fg;
-                out[2 * i]     += cb[2 * i]     * gl * g;
-                out[2 * i + 1] += cb[2 * i + 1] * gr * g;
-            }
-            s.pan_c = pc; s.mute_g = mg; s.fade_in_left = fl;
-        }
+        mix_stream(s, ch, cb, n, out, live, any_solo, true, true);
     }
     play_frame += n;
 }
@@ -977,11 +1110,167 @@ static int _pa_callback(const void* input, void* output,
     return eng->audio_callback(input, output, frames);
 }
 
+// -----------------------------------------------------------------------------
+// Offline render: the same per-channel mix code as the live callback, run on the
+// caller's thread against private copies of the playback state.
+// -----------------------------------------------------------------------------
+bool HijackerEngine::Impl::offline_begin(double start_s, int rate, uint32_t mask,
+                                         bool respect_ms, bool apply_master)
+{
+    if (job) { printf("[HIJACKER] offline render already running\n"); return false; }
+    if (playing.load(std::memory_order_acquire)) {
+        printf("[HIJACKER] offline render refused: playback is running (stop it first)\n");
+        return false;
+    }
+    if (rate < 8000 || rate > 384000) return false;
+
+    // Keep the live callback silent, and wait for one that is already running to finish.
+    offline_active.store(true, std::memory_order_seq_cst);
+    auto t0 = std::chrono::steady_clock::now();
+    while (cb_busy.load(std::memory_order_seq_cst) != 0 &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(250))
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+
+    auto j = std::make_unique<OfflineJob>();
+    j->ctx.set_rate(rate);
+    j->respect_ms    = respect_ms;
+    j->apply_master  = apply_master;
+    j->master_gain   = master_target.load(std::memory_order_relaxed);
+    j->meter.init(rate);
+    off_loud = HijackerLoudness();
+    for (int ch = 0; ch < PB_MAX_CHANNELS; ++ch)
+        if (streams[ch].soloed.load(std::memory_order_relaxed)) j->any_solo = true;
+
+    for (int ch = 0; ch < PB_MAX_CHANNELS; ++ch) {
+        if (!((mask >> ch) & 1u)) continue;
+        Stream& ls = streams[ch];
+        if (!ls.has_playlist.load(std::memory_order_acquire)) continue;
+        auto t = std::make_unique<Stream>();
+        {
+            std::lock_guard<std::mutex> lk(ls.pl_mtx);
+            t->pl_ptr = ls.pl_ptr;
+        }
+        t->volume.store(ls.volume.load());
+        t->muted.store(ls.muted.load());
+        t->soloed.store(ls.soloed.load());
+        t->pan.store(ls.pan.load());
+        t->pan_c = t->pan.load();
+        t->fader_g = -1.0f; t->mute_g = -1.0f;       // snap to target on first use
+        t->fade_in_left = 0; t->was_ready = false;
+        adopt_playlist(*t, rate);
+        if (t->p_segs.empty()) continue;
+        hj_reset_dsp_for_active_fx(ch);              // start from clean filter / reverb / delay state
+        j->used[ch] = true;
+        j->st[ch] = std::move(t);
+    }
+    j->frame = std::max<int64_t>(0, (int64_t)std::llround(start_s * (double)rate));
+    job = std::move(j);
+    return true;
+}
+
+int HijackerEngine::Impl::offline_render(float* out, int n)
+{
+    if (!job || n <= 0) return 0;
+    OfflineJob& j = *job;
+    int done = 0;
+    while (done < n) {
+        const int m = std::min(MAX_BLOCK, n - done);
+        float* mix = j.mixbuf;
+        memset(mix, 0, sizeof(float) * 2 * (size_t)m);
+        for (int ch = 0; ch < PB_MAX_CHANNELS; ++ch) {
+            if (!j.used[ch]) continue;
+            Stream& s = *j.st[ch];
+            render_block(s, j.frame, m, j.chbuf, j.ctx);
+            if (!s.was_ready) {                       // same start-of-audio declick the live path applies
+                s.was_ready = true;
+                if (s.fade_in_left < DECLICK_FRAMES) s.fade_in_left = DECLICK_FRAMES;
+            }
+            mix_stream(s, ch, j.chbuf, m, mix, j.ctx, j.any_solo, false, j.respect_ms);
+        }
+        if (j.master_gain != 1.0f)
+            for (int i = 0; i < m * 2; ++i) mix[i] *= j.master_gain;
+        hj_limit_block(mix, (unsigned long)m * 2, j.apply_master);
+        j.meter.process(mix, m);
+        memcpy(out + (size_t)done * 2, mix, sizeof(float) * 2 * (size_t)m);
+        j.frame += m;
+        done += m;
+    }
+    return done;
+}
+
+void HijackerEngine::Impl::offline_end()
+{
+    if (job) {
+        off_loud = to_public(job->meter.result());
+        for (int ch = 0; ch < PB_MAX_CHANNELS; ++ch)
+            if (job->used[ch]) hj_reset_dsp_for_active_fx(ch);   // don't leak reverb tails into live playback
+        job.reset();                                              // closes the render's own file readers
+    }
+    offline_active.store(false, std::memory_order_seq_cst);
+}
+
 HijackerEngine::HijackerEngine() : impl_(new Impl) {}
 
 HijackerEngine::~HijackerEngine() {
     shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Output devices
+// ---------------------------------------------------------------------------
+namespace {
+struct HostPick { PaHostApiIndex idx = -1; const char* label = "default"; };
+
+// The driver the engine uses: WASAPI, else WMME, else the platform default (idx -1).
+HostPick pick_host_api()
+{
+    PaHostApiIndex wasapi = -1, wmme = -1;
+    const int n = Pa_GetHostApiCount();
+    for (int i = 0; i < n; ++i) {
+        const PaHostApiInfo* api = Pa_GetHostApiInfo(i);
+        if (!api) continue;
+        if (api->type == paMME)    wmme   = i;
+        if (api->type == paWASAPI) wasapi = i;
+    }
+    if (wasapi >= 0 && Pa_GetHostApiInfo(wasapi)->defaultOutputDevice != paNoDevice)
+        return {wasapi, "WASAPI"};
+    if (wmme >= 0 && Pa_GetHostApiInfo(wmme)->defaultOutputDevice != paNoDevice)
+        return {wmme, "WMME"};
+    return {};
+}
+} // namespace
+
+std::vector<HijackerOutputDevice> hj_list_output_devices()
+{
+    std::vector<HijackerOutputDevice> out;
+    if (Pa_Initialize() != paNoError) return out;          // (reference counted: safe while running)
+    const HostPick host = pick_host_api();
+    PaDeviceIndex default_dev = (host.idx >= 0) ? Pa_GetHostApiInfo(host.idx)->defaultOutputDevice
+                                                : Pa_GetDefaultOutputDevice();
+    const int n = Pa_GetDeviceCount();
+    for (int i = 0; i < n; ++i) {
+        const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+        if (!di || di->maxOutputChannels < 2) continue;
+        if (host.idx >= 0 && di->hostApi != host.idx) continue;
+        HijackerOutputDevice d;
+        d.index = i;
+        d.name = di->name ? di->name : "";
+        const PaHostApiInfo* api = Pa_GetHostApiInfo(di->hostApi);
+        d.host_api = (api && api->name) ? api->name : "";
+        d.max_output_channels = di->maxOutputChannels;
+        d.default_sample_rate = di->defaultSampleRate;
+        d.low_latency_s  = di->defaultLowOutputLatency;
+        d.high_latency_s = di->defaultHighOutputLatency;
+        d.is_default = (i == default_dev);
+        out.push_back(std::move(d));
+    }
+    Pa_Terminate();
+    return out;
+}
+
+void HijackerEngine::set_output_device(const std::string& name) { impl_->device_pref = name; }
+std::string HijackerEngine::get_output_device_name() const { return impl_->device_active; }
+int HijackerEngine::get_buffer_frames() const { return buffer_frames_; }
 
 bool HijackerEngine::init(int sample_rate, int buffer_frames) {
     if (initialized_) return true;
@@ -998,33 +1287,38 @@ bool HijackerEngine::init(int sample_rate, int buffer_frames) {
     // Print all available host APIs for diagnostics
     int n_apis = Pa_GetHostApiCount();
     printf("[HIJACKER] Available host APIs:\n");
-    PaHostApiIndex wmme_idx   = -1;
-    PaHostApiIndex wasapi_idx = -1;
     for (int i = 0; i < n_apis; ++i) {
         const PaHostApiInfo* api = Pa_GetHostApiInfo(i);
         printf("[HIJACKER]   [%d] %s (default device: %d)\n",
                i, api->name, api->defaultOutputDevice);
-        if (api->type == paMME)    wmme_idx   = i;
-        if (api->type == paWASAPI) wasapi_idx = i;
     }
 
-    // Prefer WASAPI on Windows — natively supports float32 output.
+    // Prefer WASAPI on Windows - natively supports float32 output.
     // WMME may reinterpret float32 bytes as int16 causing distortion.
+    const HostPick host = pick_host_api();
     PaDeviceIndex dev_idx = Pa_GetDefaultOutputDevice();
-    const char* api_name  = "default";
-    if (wasapi_idx >= 0) {
-        const PaHostApiInfo* wasapi = Pa_GetHostApiInfo(wasapi_idx);
-        if (wasapi->defaultOutputDevice != paNoDevice) {
-            dev_idx  = wasapi->defaultOutputDevice;
-            api_name = "WASAPI";
-            printf("[HIJACKER] Using WASAPI output device\n");
+    const char* api_name  = host.label;
+    if (host.idx >= 0) {
+        dev_idx = Pa_GetHostApiInfo(host.idx)->defaultOutputDevice;
+        printf("[HIJACKER] Using %s output device\n", host.label);
+    }
+
+    // A specific device was asked for in the settings: find it by name.
+    if (!impl_->device_pref.empty()) {
+        PaDeviceIndex found = paNoDevice;
+        const int n_dev = Pa_GetDeviceCount();
+        for (int i = 0; i < n_dev; ++i) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+            if (!di || di->maxOutputChannels < 2) continue;
+            if (host.idx >= 0 && di->hostApi != host.idx) continue;
+            if (impl_->device_pref == di->name) { found = i; break; }
         }
-    } else if (wmme_idx >= 0) {
-        const PaHostApiInfo* wmme = Pa_GetHostApiInfo(wmme_idx);
-        if (wmme->defaultOutputDevice != paNoDevice) {
-            dev_idx  = wmme->defaultOutputDevice;
-            api_name = "WMME";
-            printf("[HIJACKER] Using WMME output device\n");
+        if (found != paNoDevice) {
+            dev_idx = found;
+            printf("[HIJACKER] Output device chosen in settings: %s\n", impl_->device_pref.c_str());
+        } else {
+            printf("[HIJACKER] Output device '%s' not found - using the system default\n",
+                   impl_->device_pref.c_str());
         }
     }
 
@@ -1040,6 +1334,9 @@ bool HijackerEngine::init(int sample_rate, int buffer_frames) {
     out_params.channelCount              = 2;
     out_params.sampleFormat              = paFloat32;
     out_params.suggestedLatency          = dev_info->defaultHighOutputLatency;
+    if (buffer_frames_ > 0)   // a buffer size was requested: ask the driver for (at least) that latency
+        out_params.suggestedLatency = std::max(dev_info->defaultLowOutputLatency,
+                                               (double)buffer_frames_ / (double)sample_rate);
     out_params.hostApiSpecificStreamInfo = nullptr;
 
     double device_sr = dev_info->defaultSampleRate;
@@ -1073,7 +1370,7 @@ bool HijackerEngine::init(int sample_rate, int buffer_frames) {
         nullptr,
         &out_params,
         sample_rate_,
-        paFramesPerBufferUnspecified,  // let PortAudio choose buffer size
+        buffer_frames_ > 0 ? (unsigned long)buffer_frames_ : (unsigned long)paFramesPerBufferUnspecified,
         paClipOff,
         _pa_callback,
         this
@@ -1100,14 +1397,21 @@ bool HijackerEngine::init(int sample_rate, int buffer_frames) {
     const PaStreamInfo* si = Pa_GetStreamInfo((PaStream*)pa_stream_);
     if (si) impl_->out_latency_s.store(si->outputLatency);
 
+    impl_->device_active = dev_info->name ? dev_info->name : "";
     initialized_ = true;
-    printf("[HIJACKER] Audio engine started — %dHz, device-chosen buffer size, "
-           "output latency %.1f ms\n",
-           sample_rate_, si ? si->outputLatency * 1000.0 : 0.0);
+    if (buffer_frames_ > 0)
+        printf("[HIJACKER] Audio engine started on '%s' - %dHz, %d-frame buffer requested, "
+               "output latency %.1f ms\n",
+               impl_->device_active.c_str(), sample_rate_, buffer_frames_, si ? si->outputLatency * 1000.0 : 0.0);
+    else
+        printf("[HIJACKER] Audio engine started on '%s' - %dHz, driver-chosen buffer size, "
+               "output latency %.1f ms\n",
+               impl_->device_active.c_str(), sample_rate_, si ? si->outputLatency * 1000.0 : 0.0);
     return true;
 }
 
 void HijackerEngine::shutdown() {
+    impl_->offline_end();
     if (!initialized_) return;
     impl_->playing.store(false);
     if (pa_stream_) {
@@ -1121,6 +1425,17 @@ void HijackerEngine::shutdown() {
     initialized_ = false;
     printf("[HIJACKER] Audio engine shut down\n");
 }
+
+bool HijackerEngine::offline_begin(double start_s, int sample_rate, unsigned channel_mask,
+                                   bool respect_mute_solo, bool apply_master) {
+    return impl_->offline_begin(start_s, sample_rate, (uint32_t)channel_mask,
+                                respect_mute_solo, apply_master);
+}
+int  HijackerEngine::offline_render(float* out_interleaved, int n_frames) {
+    return impl_->offline_render(out_interleaved, n_frames);
+}
+void HijackerEngine::offline_end()           { impl_->offline_end(); }
+bool HijackerEngine::offline_active() const  { return impl_->job != nullptr; }
 
 bool HijackerEngine::is_running() const {
     return initialized_ && pa_stream_ &&
@@ -1164,6 +1479,10 @@ double HijackerEngine::get_latency_compensation_s() const
 }
 
 void HijackerEngine::play(double timeline_pos_s) {
+    if (impl_->offline_active.load()) {
+        printf("[HIJACKER] play ignored: an offline render is running\n");
+        return;
+    }
     if (!(timeline_pos_s > 0.0)) timeline_pos_s = 0.0;
     int64_t bias  = hj_comp_frames(impl_->comp_s.load(), impl_->out_latency_s.load(),
                                    impl_->hold_est_s.load(), true, sample_rate_);
@@ -1214,20 +1533,22 @@ void HijackerEngine::set_channel_playlist(int ch,
         PlaylistSeg ps; ps.seg = segs[i];
         ps.seg.filepath[sizeof(ps.seg.filepath) - 1] = 0;
         if (!std::isfinite(ps.seg.volume)) ps.seg.volume = 1.0f;
+        if (!std::isfinite(ps.seg.volume_end) || ps.seg.volume_end < 0.0f) ps.seg.volume_end = -1.0f;   // constant gain
         pl->segs.push_back(ps);
     }
     std::stable_sort(pl->segs.begin(), pl->segs.end(),
         [](const PlaylistSeg& a, const PlaylistSeg& b) {
             return a.seg.timeline_pos_s < b.seg.timeline_pos_s; });
-    // Segments that continue straight on from the previous one (same file, same
-    // gain, contiguous in both timeline and file) are not faded at the join.
+    // Segments that continue straight on from the previous one (same file, contiguous
+    // in both timeline and file, and the gain carries on from where the last one ended)
+    // are not faded at the join.
     for (size_t i = 1; i < pl->segs.size(); ++i) {
         PlaylistSeg& a = pl->segs[i - 1];
         PlaylistSeg& b = pl->segs[i];
         if (strcmp(a.seg.filepath, b.seg.filepath) == 0 &&
             std::fabs(a.seg.timeline_pos_s + a.seg.duration_s - b.seg.timeline_pos_s) < 1e-4 &&
             std::fabs(a.seg.file_offset_s  + a.seg.duration_s - b.seg.file_offset_s)  < 1e-4 &&
-            std::fabs(a.seg.volume - b.seg.volume) < 1e-6f) {
+            std::fabs((a.seg.volume_end >= 0.0f ? a.seg.volume_end : a.seg.volume) - b.seg.volume) < 1e-6f) {
             a.fade_out = false;
             b.fade_in  = false;
         }
@@ -1355,6 +1676,33 @@ double HijackerEngine::get_playhead_s() const {
     return impl_->playhead_s.load();
 }
 int    HijackerEngine::get_sample_rate() const { return sample_rate_; }
+void  HijackerEngine::set_master_gain(float g) {
+    if (!(g == g)) return;
+    impl_->master_target.store(std::min(2.0f, std::max(0.0f, g)), std::memory_order_relaxed);
+}
+float HijackerEngine::get_master_gain() const { return impl_->master_target.load(std::memory_order_relaxed); }
+float HijackerEngine::get_master_peak() const { return impl_->master_peak.exchange(0.0f, std::memory_order_relaxed); }
+bool  HijackerEngine::get_master_clip() const { return impl_->master_clip.load(std::memory_order_relaxed); }
+void  HijackerEngine::clear_master_clip()     { impl_->master_clip.store(false, std::memory_order_relaxed); }
+
+HijackerLoudness HijackerEngine::get_loudness() const {
+    HijackerLoudness o; const auto& p = impl_->loud_pub; const auto rl = std::memory_order_relaxed;
+    o.momentary = p[0].load(rl); o.short_term = p[1].load(rl); o.integrated = p[2].load(rl); o.lra = p[3].load(rl);
+    o.momentary_max = p[4].load(rl); o.short_term_max = p[5].load(rl);
+    o.true_peak_db = p[6].load(rl); o.sample_peak_db = p[7].load(rl); o.duration_s = p[8].load(rl);
+    return o;
+}
+void HijackerEngine::reset_loudness() {
+    // The audio thread restarts the measurement at its next buffer. The published numbers are
+    // cleared here too so a stopped (or silent) engine does not keep showing the old ones.
+    impl_->loud_reset.store(true, std::memory_order_release);
+    for (int i = 0; i < Impl::LOUD_FIELDS; ++i)
+        impl_->loud_pub[i].store(i == 3 || i == 8 ? 0.0 : -200.0, std::memory_order_relaxed);
+}
+HijackerLoudness HijackerEngine::offline_loudness() const {
+    return impl_->job ? to_public(impl_->job->meter.result()) : impl_->off_loud;
+}
+
 double HijackerEngine::get_output_latency_s() const { return impl_->out_latency_s.load(); }
 int    HijackerEngine::get_xrun_count() const { return impl_->xruns.load(); }
 void   HijackerEngine::note_device_xrun() { impl_->xruns.fetch_add(1, std::memory_order_relaxed); }
@@ -1370,6 +1718,14 @@ int HijackerEngine::audio_callback(const void* /*input*/, void* output,
     float* out = static_cast<float*>(output);
     const unsigned long n_out = frames_per_buffer * 2;
     memset(out, 0, n_out * sizeof(float));
+
+    // While an offline render owns the DSP state the live stream stays silent.
+    struct BusyGuard {
+        std::atomic<int>& b;
+        explicit BusyGuard(std::atomic<int>& x) : b(x) { b.store(1, std::memory_order_seq_cst); }
+        ~BusyGuard() { b.store(0, std::memory_order_release); }
+    } busy_guard(I.cb_busy);
+    if (I.offline_active.load(std::memory_order_seq_cst)) return paContinue;
 
 #ifdef HJ_HAS_SSE
     // Flush denormals to zero: reverb/filter tails decaying through the
@@ -1431,6 +1787,23 @@ int HijackerEngine::audio_callback(const void* /*input*/, void* output,
         done += (unsigned long)n;
     }
 
+    // ---- master fader (smoothed over ~10 ms so dragging it never zippers) -----
+    {
+        const float tgt = I.master_target.load(std::memory_order_relaxed);
+        float cur = I.master_cur;
+        if (cur != tgt) {
+            const float k = 1.0f - expf(-1.0f / (0.010f * (float)I.sr));
+            for (unsigned long i = 0; i < frames_per_buffer; ++i) {
+                cur += (tgt - cur) * k;
+                if (fabsf(tgt - cur) < kSnap) cur = tgt;
+                out[2 * i] *= cur; out[2 * i + 1] *= cur;
+            }
+            I.master_cur = cur;
+        } else if (cur != 1.0f) {
+            for (unsigned long i = 0; i < n_out; ++i) out[i] *= cur;
+        }
+    }
+
     // ---- stop request: short fade-out so stopping never clicks ----------------
     if (I.stop_req.load(std::memory_order_acquire)) {
         for (unsigned long i = 0; i < frames_per_buffer; ++i) {
@@ -1446,20 +1819,31 @@ int HijackerEngine::audio_callback(const void* /*input*/, void* output,
         }
     }
 
-    // ---- master soft limiter + sanitiser ------------------------------------
-    // Transparent below 0.95. Above it the level is bent smoothly towards 1.0
-    // and never reaches it:  y = 0.95 + o / (1 + o/0.05),  o = |x| - 0.95
-    // (slope 1 at the knee, asymptote 1.0). The previous formula,
-    // 0.95 + o/(1+o), approached 1.95 and so did not limit anything above 1.0.
-    for (unsigned long i = 0; i < n_out; ++i) {
-        float s = out[i];
-        if (!(s == s) || s > 1e6f || s < -1e6f) { out[i] = 0.0f; continue; }   // NaN / runaway
-        if (s > 0.95f) {
-            float over = s - 0.95f;
-            out[i] = 0.95f + over / (1.0f + over * 20.0f);
-        } else if (s < -0.95f) {
-            float over = -s - 0.95f;
-            out[i] = -(0.95f + over / (1.0f + over * 20.0f));
+    // ---- master soft limiter + sanitiser (shared with the offline renderer) -----
+    const float master_pk = hj_limit_block(out, n_out, true);
+
+    // ---- master meter: peak since last read (pre-limiter, post-fader) + clip latch
+    if (master_pk > 0.0f) {
+        float prev = I.master_peak.load(std::memory_order_relaxed);
+        while (master_pk > prev && !I.master_peak.compare_exchange_weak(prev, master_pk, std::memory_order_relaxed)) {}
+        if (master_pk >= 1.0f) I.master_clip.store(true, std::memory_order_relaxed);
+    }
+
+    // ---- loudness (BS.1770): measures exactly what leaves the engine --------------
+    if (I.loud_ok.load(std::memory_order_acquire)) {
+        if (I.loud_reset.exchange(false, std::memory_order_acq_rel)) I.loud.reset();
+        I.loud.process(out, (int)frames_per_buffer);
+        if (I.loud.take_fresh()) {
+            const hjl::Result r = I.loud.result();
+            I.loud_pub[0].store(r.momentary, std::memory_order_relaxed);
+            I.loud_pub[1].store(r.short_term, std::memory_order_relaxed);
+            I.loud_pub[2].store(r.integrated, std::memory_order_relaxed);
+            I.loud_pub[3].store(r.lra, std::memory_order_relaxed);
+            I.loud_pub[4].store(r.momentary_max, std::memory_order_relaxed);
+            I.loud_pub[5].store(r.short_term_max, std::memory_order_relaxed);
+            I.loud_pub[6].store(r.true_peak_db, std::memory_order_relaxed);
+            I.loud_pub[7].store(r.sample_peak_db, std::memory_order_relaxed);
+            I.loud_pub[8].store(r.duration_s, std::memory_order_relaxed);
         }
     }
 

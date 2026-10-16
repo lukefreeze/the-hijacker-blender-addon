@@ -173,6 +173,7 @@ _mx_state = {
     'status_msg': 'ready',
     'rack_idx':   -1,
     'error':      '',
+    'loudness':   [],      # [(label, readings dict)] of the last finished render
     # Frame box text input
     'text_focus':  None,   # None, 'p5', or 'p6'
     'text_buf':    '',     # current typed string
@@ -197,7 +198,8 @@ def _fmt_from_norm(n):
     return 'FLAC' if n > 0.5 else 'WAV'
 
 def _frame_from_norm(n):
-    return max(1, int(1 + n * 9999))
+    # round, not truncate: (f-1)/9999*9999 can come back as f-0.0000000000001 and lose a frame
+    return max(1, int(round(1 + n * 9999)))
 
 def _norm_from_frame(f):
     return max(0.0, min(1.0, (f - 1) / 9999.0))
@@ -254,167 +256,17 @@ def _increment_blend_version(blend_path):
 # Core render functions
 # ---------------------------------------------------------------------------
 
-def _render_channel_to_numpy(channel_idx, start_frame, end_frame, scene,
-                              engine_mod, target_sr=44100):
-    """
-    Render one VSE channel offline to a numpy float32 array.
-    Returns (numpy_array, target_sr) or (None, 0) on failure.
-
-    Decodes each strip individually and applies its own strip.volume,
-    then assembles them with correct silence gaps. This correctly handles
-    channels where different strips have different volumes.
-    """
-    import numpy as _np
-    from core import vse_compat as _vse
-
-    fps         = scene.render.fps / scene.render.fps_base
-    tl_start_s  = scene.frame_start / fps
-    tl_end_s    = scene.frame_end   / fps
-    duration_s  = tl_end_s - tl_start_s
-
-    if duration_s < 0.01:
-        return None, 0
-
-    try:
-        import aud as _aud
-
-        seq_start_s = (scene.frame_preview_start if scene.use_preview_range
-                       else scene.frame_start) / fps
-        seq_end_s   = (scene.frame_preview_end if scene.use_preview_range
-                       else scene.frame_end) / fps
-
-        strips = sorted(
-            [s for s in _vse.get_all_strips(scene.sequence_editor)
-             if s.type == 'SOUND' and s.sound
-             and (s.channel - 1) == channel_idx],
-            key=lambda s: s.frame_final_end - s.frame_final_duration
-        )
-        if not strips:
-            return None, 0
-
-        total_frames = max(1, int(round(duration_s * target_sr)))
-        out_buf = _np.zeros((total_frames, 2), dtype=_np.float32)
-
-        for strip in strips:
-            actual_start_frame = strip.frame_final_end - strip.frame_final_duration
-            vis_start_s = max(actual_start_frame / fps, seq_start_s)
-            vis_end_s   = min(strip.frame_final_end / fps, seq_end_s)
-
-            if vis_end_s <= tl_start_s: continue
-            if vis_start_s >= tl_end_s: continue
-
-            play_start_s = max(vis_start_s, tl_start_s)
-            play_end_s   = min(vis_end_s, tl_end_s)
-            strip_dur    = play_end_s - play_start_s
-            if strip_dur < 0.001: continue
-
-            file_offset_start_s = getattr(strip, 'frame_offset_start', 0.0) / fps
-            file_pos_start = file_offset_start_s + (play_start_s - vis_start_s)
-            file_pos_end   = file_pos_start + strip_dur
-            if file_pos_start < 0.0: file_pos_start = 0.0
-            if file_pos_end <= file_pos_start: continue
-
-            try:
-                raw_sound = _aud.Sound.file(bpy.path.abspath(strip.sound.filepath))
-                chunk     = raw_sound.limit(file_pos_start, file_pos_end)
-                raw       = chunk.data()
-                spec      = chunk.specs
-                src_sr    = int(spec[0])
-                src_nch   = max(1, int(spec[1]))
-
-                n = len(raw) // 4
-                n = (n // src_nch) * src_nch
-                if n == 0: continue
-
-                s = _np.frombuffer(raw[:n*4], dtype=_np.float32).copy()
-                s = s.reshape(-1, src_nch)
-                if src_nch == 1:
-                    s = _np.column_stack([s, s])
-
-                # Apply this strip's own volume
-                sv = float(strip.volume)
-                if abs(sv - 1.0) > 0.0001:
-                    s = (s * sv).astype(_np.float32)
-
-                # Resample to target_sr if needed
-                if src_sr != target_sr and src_sr > 0:
-                    n_out = max(1, int(round(len(s) * target_sr / src_sr)))
-                    idx   = _np.linspace(0, len(s) - 1, n_out)
-                    lo    = _np.floor(idx).astype(_np.int32)
-                    hi    = _np.minimum(lo + 1, len(s) - 1)
-                    frac  = (idx - lo)[:, None]
-                    s     = (s[lo] * (1.0 - frac) + s[hi] * frac
-                             ).astype(_np.float32)
-
-                # Write into output buffer at correct timeline position
-                out_start = int(round((play_start_s - tl_start_s) * target_sr))
-                out_end   = min(out_start + len(s), total_frames)
-                copy_len  = out_end - out_start
-                if copy_len > 0:
-                    out_buf[out_start:out_end] += s[:copy_len]
-
-                print(f"[MIXDOWN] ch{channel_idx+1} strip '{strip.name}' "
-                      f"vol={sv:.3f}  {strip_dur:.2f}s → "
-                      f"out[{out_start}:{out_end}]")
-
-            except Exception as e:
-                print(f"[MIXDOWN] ch{channel_idx+1} strip '{strip.name}' "
-                      f"decode error: {e}")
-                continue
-
-        if _np.max(_np.abs(out_buf)) < 1e-9:
-            return None, 0
-
-        # Apply the same soft-limiter the engine uses on its output mix
-        pos_over = out_buf >  0.95
-        neg_over = out_buf < -0.95
-        if _np.any(pos_over):
-            over = out_buf[pos_over] - 0.95
-            out_buf[pos_over] = 0.95 + over / (1.0 + over)
-        if _np.any(neg_over):
-            over = -out_buf[neg_over] - 0.95
-            out_buf[neg_over] = -(0.95 + over / (1.0 + over))
-
-        print(f"[MIXDOWN] ch{channel_idx+1} ready: "
-              f"{len(out_buf)} frames @ {target_sr}Hz "
-              f"({len(out_buf)/target_sr:.2f}s)")
-
-        return out_buf, target_sr
-
-    except Exception as e:
-        print(f"[MIXDOWN] ch{channel_idx+1} render error: {e}")
-        import traceback; traceback.print_exc()
-        return None, 0
+# NOTE: the render itself lives in the audio engine (HijackerEngine.offline_begin /
+# offline_render / offline_end). It runs the same mixing code as live playback, so a
+# mixdown contains exactly what you hear: faders, pan, EQ, compressor / reverb / gate /
+# delay racks, mute / solo, the master fader and the safety limiter.
 
 
 def _write_wav(filepath, audio_np, sr, bit_depth):
-    """Write numpy float32 stereo array to WAV at given bit depth."""
-    import wave as _wave
-    import struct as _struct
-    import numpy as _np
-
-    n_frames, n_ch = audio_np.shape
-    audio_np = _np.clip(audio_np, -1.0, 1.0)
-
-    with _wave.open(filepath, 'w') as wf:
-        wf.setnchannels(n_ch)
-        wf.setframerate(sr)
-        if bit_depth == 32:
-            wf.setsampwidth(4)
-            raw = _struct.pack(f'{n_frames * n_ch}f',
-                               *audio_np.flatten().tolist())
-        elif bit_depth == 24:
-            wf.setsampwidth(3)
-            # Vectorised — ~1000x faster than a per-sample Python loop.
-            # Pack as little-endian int32 then keep only the 3 low bytes of each.
-            samples = _np.clip(audio_np.flatten() * 8388607.0,
-                               -8388608, 8388607).astype('<i4')
-            raw = samples.view(_np.uint8).reshape(-1, 4)[:, :3].tobytes()
-        else:  # 16-bit
-            wf.setsampwidth(2)
-            samples = (audio_np.flatten() * 32767.0).astype(_np.int16)
-            raw = samples.tobytes()
-        wf.writeframes(raw)
+    """Write a float stereo array as 16-bit / 24-bit PCM or 32-bit float WAV
+    (see core/wav_writer.py: dithered 16-bit, exact float)."""
+    from core.wav_writer import write_wav
+    return write_wav(filepath, audio_np, sr, bit_depth)
 
 
 def _write_flac(filepath, audio_np, sr, bit_depth):
@@ -422,7 +274,7 @@ def _write_flac(filepath, audio_np, sr, bit_depth):
     try:
         import soundfile as sf
         import numpy as _np
-        subtype_map = {16: 'PCM_16', 24: 'PCM_24', 32: 'FLOAT'}
+        subtype_map = {16: 'PCM_16', 24: 'PCM_24', 32: 'PCM_24'}   # FLAC has no float format
         sf.write(filepath, audio_np,
                  samplerate=sr,
                  subtype=subtype_map.get(bit_depth, 'PCM_24'))
@@ -455,13 +307,6 @@ def _start_render(rack_idx, rack, scene):
     sr         = _sr_from_norm(rack.p2)
     bd         = _bd_from_norm(rack.p3)
     is_bake    = rack.p0 > 0.5
-    # hijacker_engine WAV reader only supports 16-bit PCM.
-    # Clamp WAV renders to 16-bit so the imported strip plays back immediately.
-    # FLAC is written via soundfile so all bit depths work there.
-    if fmt == 'WAV' and bd != 16:
-        print(f"[MIXDOWN] clamping bit depth {bd}-bit → 16-bit for WAV "
-              f"(hijacker_engine requires 16-bit PCM)")
-        bd = 16
     f_start, f_end = _get_timeline_frames(rack, scene)
 
     # Collect channels to render
@@ -489,6 +334,7 @@ def _start_render(rack_idx, rack, scene):
         'status_msg': 'starting…',
         'rack_idx':   rack_idx,
         'error':      '',
+        'loudness':   [],
     })
 
     _mx_job.update({
@@ -506,9 +352,19 @@ def _start_render(rack_idx, rack, scene):
         'blend_path': blend_path,
         'mix_buffer': None,   # accumulates summed audio for mix mode
         'baked_files': [],    # [(ch_idx, filepath), …]
+        'loudness':   [],     # [(label, readings)] measured by the engine while rendering
         'import_mode': rack.p7,
         'blend_saved': False,
+        # offline render state (see _render_tick)
+        'jobs':       [],      # [('mix', channels)] or [('bake', [ch]), ...]
+        'ji':         0,
+        'active':     False,
+        'buf':        None,
+        'done':       0,
+        'total':      0,
+        'retry':      0,
     })
+    _mx_job['jobs'] = ([('bake', [c]) for c in assigned] if is_bake else [('mix', list(assigned))])
 
     if not bpy.app.timers.is_registered(_render_tick):
         bpy.app.timers.register(_render_tick, first_interval=0.05)
@@ -517,85 +373,123 @@ def _start_render(rack_idx, rack, scene):
           f"frames {f_start}–{f_end}, mode={'bake' if is_bake else 'mix'}")
 
 
+def _engine_hj():
+    from core.engine import get_engine as _ge
+    eng = _ge()
+    return eng.get_engine() if eng else None
+
+
+def _abort_offline():
+    try:
+        hj = _engine_hj()
+        if hj is not None and hasattr(hj, "offline_end"):
+            hj.offline_end()
+    except Exception:
+        pass
+
+
 def _render_tick():
-    """Timer callback — renders one channel per tick to keep Blender responsive."""
+    """Timer callback: renders the mix (or one channel's stem) through the audio engine
+    in short slices so Blender stays responsive and the progress bar moves."""
     global _mx_state, _mx_job
 
     if not _mx_state['running']:
         return None   # unregister
 
+    import time as _time
+    import numpy as _np
+
     try:
-        import numpy as _np
+        job = _mx_job
+        hj  = _engine_hj()
+        if hj is None or not hasattr(hj, "offline_begin"):
+            raise RuntimeError("the compiled audio engine is too old for mixdown: "
+                               "run build.bat / build_py313.bat again and restart Blender")
 
-        job     = _mx_job
-        chs     = job['channels']
-        cursor  = job['ch_cursor']
-        total   = len(chs)
+        rate = job['sr']
+        t0   = _time.perf_counter()
+        while _time.perf_counter() - t0 < 0.04:
+            n_jobs = len(job['jobs'])
+            if not job['active']:
+                if job['ji'] >= n_jobs:
+                    _finalise_render()
+                    return None
+                kind, chs = job['jobs'][job['ji']]
 
-        if cursor >= total:
-            # All channels processed — finalise
-            _finalise_render()
-            return None
+                if job['ji'] == 0 and job['done'] == 0 and job['retry'] == 0:
+                    # Load the playlists, faders, pan, mute/solo and effect settings into the
+                    # engine exactly as pressing Play would.
+                    from core.audio import _hj_load_all_channels
+                    _hj_load_all_channels(bpy.context.scene)
 
-        ch      = chs[cursor]
-        scene   = bpy.context.scene
+                fps       = job['fps']
+                start_s   = job['f_start'] / fps
+                dur_s     = (job['f_end'] - job['f_start'] + 1) / fps
+                is_mix    = (kind == 'mix')
+                if not hj.offline_begin(start_s, rate, list(chs), is_mix, is_mix):
+                    job['retry'] += 1
+                    if job['retry'] > 40:
+                        raise RuntimeError("could not start the render: stop playback and try again")
+                    return 0.05
+                job['retry']  = 0
+                job['total']  = max(1, int(round(dur_s * rate)))
+                job['buf']    = _np.zeros((job['total'], 2), dtype=_np.float32)
+                job['done']   = 0
+                job['active'] = True
+                what = "mix" if is_mix else f"ch{chs[0]+1}"
+                print(f"[MIXDOWN] rendering {what}: {len(chs)} channel(s), "
+                      f"{dur_s:.2f}s @ {rate} Hz")
 
-        _mx_state['status_msg'] = f"rendering ch{ch+1}… ({cursor+1}/{total})"
-        _mx_state['progress']   = cursor / total
+            kind, chs = job['jobs'][job['ji']]
+            n = min(rate // 2, job['total'] - job['done'])
+            if n > 0:
+                job['buf'][job['done']:job['done'] + n] = hj.offline_render(n)
+                job['done'] += n
 
-        # Get engine module
-        try:
-            from core.engine import get_engine as _get_eng
-            eng_mod = _get_eng()
-        except Exception:
-            eng_mod = None
+            what = "mix" if kind == 'mix' else f"ch{chs[0]+1}"
+            n_jobs = len(job['jobs'])
+            _mx_state['progress']   = (job['ji'] + job['done'] / job['total']) / n_jobs
+            _mx_state['status_msg'] = (f"rendering {what}… {int(100 * job['done'] / job['total'])}%"
+                                       if kind == 'mix' else
+                                       f"rendering {what}… ({job['ji']+1}/{n_jobs})")
 
-        audio, sr = _render_channel_to_numpy(
-            ch, job['f_start'], job['f_end'], scene, eng_mod,
-            target_sr=job['sr'])
-
-        if audio is not None and len(audio) > 0:
-            if job['is_bake']:
-                # Write immediately per channel — use sr returned from render
-                # (equals target_sr after resampling)
-                fname = _auto_filename(job['blend_path'], job['fmt'], ch)
-                if os.path.isdir(job['out_path']):
-                    fpath = os.path.join(job['out_path'], fname)
+            if job['done'] >= job['total']:
+                if hasattr(hj, "offline_loudness"):
+                    try:
+                        job['loudness'].append((what, hj.offline_loudness()))
+                    except Exception:
+                        pass
+                hj.offline_end()
+                job['active'] = False
+                audio = job['buf']; job['buf'] = None
+                if float(_np.max(_np.abs(audio))) < 1e-9:
+                    print(f"[MIXDOWN] {what} rendered silence — skipped")
+                elif kind == 'mix':
+                    job['mix_buffer'] = audio
                 else:
-                    fpath = job['out_path']
+                    ch    = chs[0]
+                    fname = _auto_filename(job['blend_path'], job['fmt'], ch)
+                    fpath = (os.path.join(job['out_path'], fname)
+                             if os.path.isdir(job['out_path']) else job['out_path'])
+                    if job['fmt'] == 'FLAC':
+                        fpath = _write_flac(fpath, audio, rate, job['bd'])
+                    else:
+                        _write_wav(fpath, audio, rate, job['bd'])
+                    job['baked_files'].append((ch, fpath))
+                    print(f"[MIXDOWN] baked ch{ch+1} → {fpath}")
+                job['ji'] += 1
+                break       # give Blender a moment between stems
 
-                if job['fmt'] == 'FLAC':
-                    fpath = _write_flac(fpath, audio, sr, job['bd'])
-                else:
-                    _write_wav(fpath, audio, sr, job['bd'])
-
-                job['baked_files'].append((ch, fpath))
-                print(f"[MIXDOWN] baked ch{ch+1} → {fpath}")
-            else:
-                # Accumulate into mix buffer
-                if job['mix_buffer'] is None:
-                    job['mix_buffer'] = audio.copy()
-                else:
-                    # Pad shorter buffer
-                    a, b = job['mix_buffer'], audio
-                    if len(a) < len(b):
-                        a = _np.pad(a, ((0, len(b)-len(a)), (0,0)))
-                    elif len(b) < len(a):
-                        b = _np.pad(b, ((0, len(a)-len(b)), (0,0)))
-                    job['mix_buffer'] = _np.clip(a + b, -1.0, 1.0)
-
-        job['ch_cursor'] += 1
-
-        # Force HUD redraw so progress bar updates
         for window in bpy.context.window_manager.windows:
             for area in window.screen.areas:
                 if area.type == 'NODE_EDITOR':
                     area.tag_redraw()
 
-        return 0.05   # next tick in 50ms
+        return 0.02
 
     except Exception as e:
         import traceback
+        _abort_offline()
         _mx_state.update({
             'running': False,
             'error':   str(e),
@@ -666,7 +560,7 @@ def _finalise_render():
                                      for s in orig_strips)
                     # Remove originals
                     for s in orig_strips:
-                        seq.sequences.remove(s)
+                        _vse.get_strips_collection(seq).remove(s)
                 else:
                     # Find next free channel above this one
                     used = {s.channel for s in _vse.get_all_strips(seq)}
@@ -711,7 +605,7 @@ def _finalise_render():
                         if eng: eng.set_mute(ch_idx, True)
                     except Exception: pass
                 elif mode > 0.75:    # remove + place on free channel
-                    for s in orig: seq.sequences.remove(s)
+                    for s in orig: _vse.get_strips_collection(seq).remove(s)
 
             _vse.get_strips_collection(seq).new_sound(
                 name="mixdown",
@@ -726,7 +620,10 @@ def _finalise_render():
             'progress':   1.0,
             'status_msg': 'done ✓',
             'error':      '',
+            'loudness':   list(job.get('loudness', [])),
         })
+        for lbl, ld in job.get('loudness', []):
+            print(f"[MIXDOWN] loudness {lbl}: {loudness_summary(ld)}")
 
     except Exception as e:
         import traceback
@@ -737,6 +634,26 @@ def _finalise_render():
         })
         print(f"[MIXDOWN] finalise error: {e}")
         traceback.print_exc()
+
+
+def _lv(v, places=1):
+    return "--" if v <= -150.0 else f"{v:.{places}f}"
+
+
+def loudness_summary(ld):
+    """One line: integrated loudness, loudness range and true peak of a finished render."""
+    return (f"{_lv(ld['integrated'])} LUFS integrated, LRA {_lv(ld['lra'])} LU, "
+            f"true peak {_lv(ld['true_peak_db'])} dBTP")
+
+
+def _loudness_lines(max_lines=4):
+    """Short text lines for the stats column: the last finished render's loudness."""
+    out = []
+    for lbl, ld in _mx_state.get('loudness', [])[:max_lines]:
+        name = "mix" if lbl == "mix" else lbl
+        out.append((f"{name}  {_lv(ld['integrated'])} LUFS",
+                    f"LRA {_lv(ld['lra'])}  TP {_lv(ld['true_peak_db'])} dBTP"))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1221,8 +1138,21 @@ def _draw_mixdown_body(rx, ry, rw, rh, rack, rack_idx, scale):
         ptw = _text_width(pct, fs9)
         _draw_text(status, c_xi + ptw + 10*ui, sy, fs9, (0.45, 0.55, 0.45, 0.9))
 
-    # Offline hint — absolute position, no longer in c_nxt flow
-    hint = "renders offline — timeline doesn't need to play"
+    # Offline hint — absolute position, no longer in c_nxt flow. After a finished render it
+    # makes way for the measured loudness of what was just written.
+    _ld_lines = _loudness_lines() if done else []
+    if _ld_lines:
+        _ly = body_top - MX_OFFLINE_Y*ui
+        _draw_text("LOUDNESS (EBU R128)", c_xi + 2*ui, _ly, fs8, (0.42, 0.45, 0.55, 1.0))
+        _ly -= (fs9 + 5*ui)
+        for _a, _b in _ld_lines:
+            _draw_text(_a, c_xi + 2*ui, _ly, fs9, (0.55, 0.85, 1.0, 1.0))
+            _ly -= (fs8 + 3*ui)
+            _draw_text(_b, c_xi + 2*ui, _ly, fs8, (0.45, 0.55, 0.50, 1.0))
+            _ly -= (fs9 + 4*ui)
+        hint = ""
+    else:
+        hint = "renders offline — timeline doesn't need to play"
     _hint_x = c_xi + MX_OFFLINE_X*ui
     _hint_y = body_top - MX_OFFLINE_Y*ui
     words = hint.split(); line = ""

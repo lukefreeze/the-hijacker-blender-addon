@@ -36,13 +36,13 @@ int main(int argc,char**argv){
         while(!stop){ int fr=frames_cfg.load(); t_in_cb=true; fake_pa_run(out.data(),fr,0); t_in_cb=false; ncb++;
             for(int i=0;i<fr*2;i++){ float v=out[i]; if(!(v==v) || v>1.0f || v<-1.0f){ bad++; break; } }
             std::this_thread::sleep_for(std::chrono::microseconds(fr*1000000LL/SR/8)); } }); // 8x realtime
-    std::thread meters([&]{ while(!stop){ for(int c=0;c<8;c++){ (void)E->get_meter_rms(c); (void)E->get_meter_peak(c);} (void)E->get_playhead_s(); (void)E->get_xrun_count(); std::this_thread::sleep_for(std::chrono::milliseconds(3)); } });
+    std::thread meters([&]{ while(!stop){ for(int c=0;c<8;c++){ (void)E->get_meter_rms(c); (void)E->get_meter_peak(c);} (void)E->get_playhead_s(); (void)E->get_xrun_count(); (void)E->get_loudness(); (void)E->offline_loudness(); (void)E->get_master_peak(); std::this_thread::sleep_for(std::chrono::milliseconds(3)); } });
     std::mt19937 r(7); auto rnd=[&](int n){ return (int)(r()%n); }; auto rf=[&](){ return (r()%1000)/1000.0f; };
     auto t0=std::chrono::steady_clock::now(); long ops=0;
     while(std::chrono::duration<double>(std::chrono::steady_clock::now()-t0).count()<seconds){
-        int op=rnd(14); int ch=rnd(8);
+        int op=rnd(16); int ch=rnd(8);
         switch(op){
-        case 0: case 1: { int n=1+rnd(6); std::vector<HijackerSegment> v(n); double pos=rf()*2; for(int i=0;i<n;i++){ strcpy(v[i].filepath,files[rnd(6)].c_str()); v[i].file_offset_s=rf()*3; v[i].duration_s=0.05+rf()*1.5; v[i].timeline_pos_s=pos; pos+=v[i].duration_s*(rnd(3)?1.0:1.3); v[i].volume=0.2f+rf(); } E->set_channel_playlist(ch,v);} break;
+        case 0: case 1: { int n=1+rnd(6); std::vector<HijackerSegment> v(n); double pos=rf()*2; for(int i=0;i<n;i++){ strcpy(v[i].filepath,files[rnd(6)].c_str()); v[i].file_offset_s=rf()*3; v[i].duration_s=0.05+rf()*1.5; v[i].timeline_pos_s=pos; pos+=v[i].duration_s*(rnd(3)?1.0:1.3); v[i].volume=0.2f+rf(); v[i].volume_end=rnd(2)? -1.0f : rf()*1.5f; } E->set_channel_playlist(ch,v);} break;
         case 2: E->clear_channel(ch); break;
         case 3: E->play(rf()*4); break;
         case 4: E->seek(rf()*4); break;
@@ -55,6 +55,8 @@ int main(int argc,char**argv){
         case 11: E->clear_effect_slot(ch,rnd(8)); break;
         case 12: frames_cfg=(int[]){64,480,512,1024,1500,2048}[rnd(6)]; break;
         case 13: E->clear_all_channels(); break;
+        case 14: E->reset_loudness(); break;
+        case 15: E->set_master_gain(rf()*2.0f); break;
         }
         ops++; std::this_thread::sleep_for(std::chrono::microseconds(200+rnd(1500)));
     }
