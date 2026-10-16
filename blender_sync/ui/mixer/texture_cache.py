@@ -22,6 +22,7 @@
 
 import os
 import math
+import time
 import gpu
 from gpu_extras.batch import batch_for_shader
 
@@ -212,6 +213,20 @@ SKIN_MAP = {
     "rack_voicefixer_collapsed_bg": "rack_voicefixer_collapsed_bg.png",
     "rack_whisper_collapsed_bg":    "rack_whisper_collapsed_bg.png",
     "rack_demucs_collapsed_bg":     "rack_demucs_collapsed_bg.png",
+    # packApunch collapsed strips: lights-off twins (faded in over the powered strip; see ui/racks/pp_collapsed.py)
+    "rack_booster_collapsed_bg_off": "rack_booster_collapsed_bg_off.png",
+    "rack_comp_multi_collapsed_bg_off": "rack_comp_multi_collapsed_bg_off.png",
+    "rack_comp_single_collapsed_bg_off": "rack_comp_single_collapsed_bg_off.png",
+    "rack_delay_collapsed_bg_off": "rack_delay_collapsed_bg_off.png",
+    "rack_eq_collapsed_bg_off": "rack_eq_collapsed_bg_off.png",
+    "rack_noisegate_collapsed_bg_off": "rack_noisegate_collapsed_bg_off.png",
+    "rack_reverb_collapsed_bg_off": "rack_reverb_collapsed_bg_off.png",
+    "rack_mixdown_collapsed_bg_off": "rack_mixdown_collapsed_bg_off.png",
+    "rack_piper_collapsed_bg_off": "rack_piper_collapsed_bg_off.png",
+    "rack_knnvc_collapsed_bg_off": "rack_knnvc_collapsed_bg_off.png",
+    "rack_voicefixer_collapsed_bg_off": "rack_voicefixer_collapsed_bg_off.png",
+    "rack_whisper_collapsed_bg_off": "rack_whisper_collapsed_bg_off.png",
+    "rack_demucs_collapsed_bg_off": "rack_demucs_collapsed_bg_off.png",
     "rack_knnvc_bg":       "rack_knnvc_bg.png",
     "rack_knnvc_bg_off":   "rack_knnvc_bg_off.png",
     "rack_knnvc_off_btn":  "rack_knnvc_off_btn.png",
@@ -281,6 +296,8 @@ _texture_cache: dict = {}
 _active_skin:   str  = "default"
 _skin_dir:      str  = ""
 _blit_logged:   set  = set()   # keys already logged to console
+_tex_meta:      dict = {}              # key -> [filepath, mtime, next_check_time]  (hot-reload of edited PNGs)
+HOT_RELOAD_SEC = 1.5                   # how often (per texture) the file's modified time is checked while drawing
 
 
 def set_skin_dir(assets_dir: str, skin_name: str = "default") -> None:
@@ -307,8 +324,24 @@ def get_texture(key: str):
     None means the caller should fall back to GPU primitive drawing.
     This is the only function draw_utils.py needs to call.
     """
+    force_reload = False
     if key in _texture_cache:
-        return _texture_cache[key]
+        meta = _tex_meta.get(key)
+        if meta is None or _texture_cache[key] is None:
+            return _texture_cache[key]
+        _now = time.monotonic()
+        if _now < meta[2]:
+            return _texture_cache[key]
+        meta[2] = _now + HOT_RELOAD_SEC
+        try:
+            _mt = os.path.getmtime(meta[0])
+        except OSError:
+            return _texture_cache[key]
+        # edited on disk and no longer being written -> reload it (otherwise Blender keeps showing the old pixels
+        # until restart: bpy.data.images.load(check_existing=True) hands back the already-loaded image)
+        if _mt == meta[1] or time.time() - _mt < 1.0:
+            return _texture_cache[key]
+        force_reload = True
 
     filename = SKIN_MAP.get(key)
     if not filename or not _skin_dir:
@@ -326,7 +359,14 @@ def get_texture(key: str):
 
     try:
         import bpy
+        _n_before = len(bpy.data.images)
         img = bpy.data.images.load(filepath, check_existing=True)
+        if force_reload or len(bpy.data.images) == _n_before:
+            # the image datablock already existed (earlier skin load / edited file): re-read it from disk
+            try:
+                img.reload()
+            except Exception:
+                pass
         # Skin PNGs are pre-rendered UI chrome, not scene-referred color
         # photography — they need to land on screen as literally the bytes
         # in the file. Per Blender's own GPU color-management docs, an
@@ -354,10 +394,22 @@ def get_texture(key: str):
             img.colorspace_settings.name = 'Non-Color'
         tex = gpu.texture.from_image(img)
         _texture_cache[key] = tex
-        print(f"[SKIN] loaded '{key}' from {os.path.basename(filepath)}")
+        try:
+            _tex_meta[key] = [filepath, os.path.getmtime(filepath), time.monotonic() + HOT_RELOAD_SEC]
+        except OSError:
+            pass
+        print(f"[SKIN] {'reloaded' if force_reload else 'loaded'} '{key}' from {os.path.basename(filepath)}")
         return tex
     except Exception as e:
         print(f"[SKIN] failed to load '{key}': {e}")
+        if force_reload and _texture_cache.get(key) is not None:
+            meta = _tex_meta.get(key)
+            if meta:
+                try:
+                    meta[1] = os.path.getmtime(meta[0])   # don't hammer a broken file; keep showing the old art
+                except OSError:
+                    pass
+            return _texture_cache[key]
         _texture_cache[key] = None   # don't retry
         return None
 
@@ -518,3 +570,4 @@ def clear_cache() -> None:
     """Flush the texture cache (call on file load or skin change)."""
     global _texture_cache
     _texture_cache = {}
+    _tex_meta.clear()

@@ -3946,6 +3946,25 @@ def hit_test(rx, ry, region_height, scroll_x, scroll_y, ui_scale):
                 # Hit in this rack — determine zone (all existing zone logic unchanged)
                 rail_top = rack_y + rh - RACK_RAIL_H*ui_scale
 
+                # packApunch collapsed strip: its own click zones (art positions), nothing else on the row applies
+                if rack.collapsed:
+                    try:
+                        from ui.racks.pp_collapsed import pp_collapsed_active as _ppc_on, pp_collapsed_hit as _ppc_hit, pp_collapsed_rects as _ppc_rects
+                        if _ppc_on(rack):
+                            _z = _ppc_hit(rack, rack_x, rack_y, rw, rh, rx, ry)
+                            if _z == 'collapse':
+                                return {'zone': 'collapse', 'rack_idx': i}
+                            if _z == 'close':
+                                return {'zone': 'delete_rack', 'rack_idx': i}
+                            if _z == 'on':
+                                return {'zone': 'on_off', 'rack_idx': i}
+                            if _z == 'badge':
+                                _br = _ppc_rects(rack, rack_x, rack_y, rw, rh)['badge']
+                                return {'zone': 'rack_badge', 'rack_idx': i, 'bx': _br[0], 'by': _br[3]}
+                            return {'zone': 'rack_body', 'rack_idx': i}
+                    except Exception as _e_ppch:
+                        print(f"[RACKS] packApunch collapsed hit error: {_e_ppch}")
+
                 # Collapse button
                 col_btn_x2 = rack_x + 4*ui_scale
                 col_btn_y2 = rack_y + rh - 28*ui_scale
@@ -5051,6 +5070,14 @@ def _draw_ai_rack_collapsed(rx, ry, rw, rh, rack, ai_idx, scale):
             _draw_rect, _draw_text, _text_width, _draw_circle, _draw_line,
         )
 
+    # packApunch skin: the rack's own collapsed strip (see ui/racks/pp_collapsed.py)
+    try:
+        from ui.racks.pp_collapsed import pp_collapsed_draw as _pp_cd_ai
+        if _pp_cd_ai(rx, ry, rw, rh, rack, ai_idx, scale):
+            return
+    except Exception as _e_ppcdai:
+        print(f"[SKIN] packApunch collapsed draw error: {_e_ppcdai}")
+
     HAL_BG     = (0.05, 0.04, 0.04, 1.0)
     HAL_BORDER = (0.20, 0.08, 0.08, 1.0)
     HAL_TEXT   = (0.80, 0.22, 0.14, 1.0)
@@ -6035,6 +6062,22 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                     return _wh_pp_hit(mouse_x, mouse_y, rack, ai_idx, rack_x, rack_y, rw, rack_h)
             except Exception as _e_whh:
                 print(f"[AI RACKS] Whisper packApunch hit-test error: {_e_whh}")
+
+        # packApunch collapsed strip: its own click zones (art positions)
+        if rack.collapsed:
+            try:
+                from ui.racks.pp_collapsed import pp_collapsed_active as _ppc_on2, pp_collapsed_hit as _ppc_hit2
+                if _ppc_on2(rack):
+                    _z2 = _ppc_hit2(rack, rack_x, rack_y, rw, rack_h, mouse_x, mouse_y)
+                    if _z2 == 'collapse':
+                        return {'zone': 'ai_collapse', 'ai_idx': ai_idx}
+                    if _z2 == 'close':
+                        return {'zone': 'ai_delete', 'ai_idx': ai_idx}
+                    if _z2 == 'on':
+                        return {'zone': 'ai_on_off', 'ai_idx': ai_idx}
+                    return {'zone': 'ai_rack_body', 'ai_idx': ai_idx}
+            except Exception as _e_ppch2:
+                print(f"[AI RACKS] packApunch collapsed hit error: {_e_ppch2}")
 
         # Collapse button
         col_x = rack_x + 4*scale

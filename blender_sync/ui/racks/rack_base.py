@@ -866,6 +866,9 @@ PACKAPUNCH_BTN_HITBOXES = {
         "on":    (1750, 16, 1814, 47),    # the red ON glass
         "close": (1820, 16, 1849, 44),    # the X
         "art":   (1864, 503),
+        # collapse key and rack-number box (top left of the art)
+        "collapse": (17, 16, 54, 50),
+        "badge":    (63, 16, 101, 50),
         # 3x3 channel keypad (centres of the key faces, row-major)
         "keys":  {"cx": (1718.0, 1766.0, 1814.0), "cy": (106.0, 152.0, 198.0), "w": 38.0, "h": 36.0},
         # preset display: the dark box between the two bone ends (arrow zones are the outer ends)
@@ -875,6 +878,9 @@ PACKAPUNCH_BTN_HITBOXES = {
     # normal rail click zones, so there are no "on" / "close" entries).
     "COMP_SINGLE": {
         "art":   (2240, 479),
+        # collapse key (the logo key) and the rack-number box (top left of the art)
+        "collapse": (13, 12, 54, 54),
+        "badge":    (62, 13, 102, 53),
         # 3x3 channel keypad (centres of the key faces, row-major), measured from the art
         "keys":  {"cx": (2072.0, 2128.5, 2184.5), "cy": (118.5, 176.0, 231.5), "w": 44.0, "h": 40.0},
         # preset display: the dark green box. The two arrows are baked into the bone either side of it (outside the box),
@@ -885,6 +891,9 @@ PACKAPUNCH_BTN_HITBOXES = {
         "on":    (1581, 16, 1658, 104),   # the lit ON glass
         "close": (1680, 28, 1708, 70),    # the small red button
         "art":   (1758, 468),
+        # collapse key and rack-number box (top left of the art)
+        "collapse": (28, 3, 73, 47),
+        "badge":    (94, 5, 138, 48),
         # 3x3 channel keypad (centres of the key faces, row-major), measured from the art
         "keys":  {"cx": (1522.0, 1583.0, 1643.0), "cy": (200.0, 263.0, 325.0), "w": 50.0, "h": 44.0},
         # preset display: the dark box; the two arrows are baked into the metal either side of it
@@ -915,6 +924,9 @@ PACKAPUNCH_BTN_HITBOXES = {
         "on":    (1537, 60, 1651, 126),   # the lit ON glass
         "close": (1691, 59, 1759, 130),   # the red square button
         "art":   (1908, 544),
+        # collapse key and rack-number box (top left of the art)
+        "collapse": (153, 40, 204, 95),
+        "badge":    (213, 47, 256, 87),
         # 3x3 channel keypad (centres of the key faces, row-major: 1-3 top row, 4-6, 7-9)
         "keys":  {"cx": (1572.5, 1638.0, 1703.5), "cy": (229.5, 298.0, 368.0), "w": 50.0, "h": 50.0},
         # preset display: the amber box above the screen (arrow zones are the outer ends)
@@ -971,7 +983,10 @@ def packapunch_rect(rack, name, rack_x, rack_y, rw, rh):
 # Racks whose packApunch art has its own number plate for the rack number:
 #   effect type -> ((centre x, centre y) in art px, art w, art h, digit height in art px, colour)
 PACKAPUNCH_BADGE = {
-    "DELAY": ((116.0, 27.0), 1758, 468, 26.0, (0.86, 0.86, 0.82, 1.0)),
+    "DELAY": ((116.0, 26.5), 1758, 468, 26.0, (0.86, 0.86, 0.82, 1.0)),
+    "COMP_SINGLE": ((82.0, 33.0), 2240, 479, 26.0, (0.35, 0.10, 0.05, 1.0)),   # dark digit in the inset box
+    "NOISE_GATE": ((82.0, 33.0), 1864, 503, 26.0, (1.00, 0.45, 0.42, 1.0)),   # red glow digit in the box next to the collapse key
+    "REVERB": ((234.5, 67.0), 1908, 544, 26.0, (1.00, 0.72, 0.22, 1.0)),
     "BOOSTER": ((81.0, 30.0), 1988, 528, 24.0, (0.94, 0.94, 0.96, 1.0)),
     "MIXDOWN": ((211.0, 50.0), 2000, 528, 32.0, (1.00, 0.45, 0.42, 1.0)),   # red phosphor digit in the black window
 }
@@ -1775,6 +1790,14 @@ def _draw_rack_collapsed(rx, ry, rack, rack_idx, scale, rack_width=None):
     rh = RACK_COLLAPSED_H * scale
     cy = ry + rh / 2   # vertical centre
     etype = rack.effect_type
+
+    # packApunch skin: the rack's own collapsed strip (number, ON / close and channel lights are drawn by pp_collapsed)
+    try:
+        from ui.racks.pp_collapsed import pp_collapsed_draw as _pp_cd
+        if _pp_cd(rx, ry, rw, rh, rack, rack_idx, scale):
+            return
+    except Exception as _e_ppcd:
+        print(f"[SKIN] packApunch collapsed draw error: {_e_ppcd}")
 
     # Background — per-effect-type PNG skin (see _COLLAPSED_BG_KEY above).
     # Falls back to the old flat rect + border for any type without art yet.

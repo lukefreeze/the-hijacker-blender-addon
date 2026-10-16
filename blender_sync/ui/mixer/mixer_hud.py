@@ -223,7 +223,7 @@ def draw_callback_px(self, context) -> None:
         # ── 3-part strip skin backgrounds (drawn per group, once per group's strips) ──
         # Drawn BEFORE strip elements so knobs/faders draw on top of the background.
         try:
-            from ui.mixer.texture_cache import get_texture as _gt
+            from ui.mixer.texture_cache import get_texture as _gt, get_active_skin as _gas
             from ui.mixer.draw_utils import blit_texture as _bt
             from ui.mixer.channel_strip import (
                 SEC_HEADER_H as _SHH, SEC_GAIN_H as _SGH,
@@ -276,7 +276,15 @@ def draw_callback_px(self, context) -> None:
                 _btex = _gt("strip_bottom_bg")
                 # the strip-bottom art is 572px tall: the original 565 plus 7px extending UP over the desk art for a
                 # cleaner blend at the seam (bottom edge unchanged)
-                _bot_ht = _bot_h2 + 7 * UI_SCALE
+                # ONLY when the art really is taller than the 565px layout (packApunch ships 572): every other skin's
+                # 565px art must be drawn 1:1, otherwise it is stretched and its knob holes drift off the live knobs.
+                _bot_extra = 0.0
+                if _btex is not None:
+                    try:
+                        _bot_extra = max(0.0, min(float(_btex.height) - 565.0, 16.0))
+                    except Exception:
+                        _bot_extra = 7.0 if _gas() == "packapunch" else 0.0
+                _bot_ht = _bot_h2 + _bot_extra * UI_SCALE
                 if _btex: _bt(_btex, _dx, _bot_top - _bot_h2, _dw, _bot_ht, key="strip_bottom_bg")
                 if _btex:
                     try:   # packApunch: animated lava cracks on top of the (dimmed) strip art
