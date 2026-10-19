@@ -116,6 +116,35 @@ VIDEO_FPS            = 24.0
 # its own full length regardless).
 FALLBACK_DURATION_S  = 3.0
 
+# The exported sequence ends on a hold of fully opaque BLACK frames, then a
+# few fully transparent ones. Rather than cutting from black straight to the
+# new skin, the overlay's own alpha is faded 1 -> 0 over the LAST
+# FADE_FRAMES frames of the (trimmed) sequence, at VIDEO_FPS — 24 frames is
+# one second. The fade is computed from wall-clock time like everything
+# else here, so it stays smooth even if redraws are skipped. Set to 0 to
+# restore the old hard cut.
+FADE_FRAMES          = 24
+
+# While the transition audio plays, the mixing desk's channel meters follow
+# the MUSIC instead of the channels' own signal (see audio_meter_levels()
+# and the hook in core/meters.py), then hand back to the channels the
+# moment the audio ends.
+#   "bands": the 9 desk meters act as a 9-band spectrum analyser — channel
+#            1 = bass up to channel 9 = treble — so they jump independently
+#            instead of nine bars moving in lockstep. (Channels past 9, if
+#            the desk has more, repeat the same bands.)
+#   "level": every meter shows the overall loudness of the music.
+METER_MODE           = "bands"
+METER_BANDS          = 9
+METER_BAND_LO_HZ     = 50.0
+METER_BAND_HI_HZ     = 14000.0
+METER_DB_RANGE       = 30.0    # each band spans this many dB below its own
+                                # loud passages, so quiet bands still move
+METER_LATENCY_S      = 0.0     # + delays the meters, - makes them lead the
+                                # audio; nudge if they feel off the beat
+_ENV_HOP_S           = 0.01    # envelope resolution (10ms)
+_ENV_WIN             = 2048    # FFT window in samples
+
 # How many already-shown frames to keep cached behind the current
 # playhead, plus how far ahead to opportunistically pre-load. Playback is
 # strictly forward and one-shot, so a small window is enough to smooth
@@ -145,6 +174,9 @@ _frame_tex_cache  = {}       # frame index -> gpu.types.GPUTexture, rolling wind
 _frame_img_cache  = {}       # frame index -> bpy.types.Image, freed alongside the texture
 _fps              = VIDEO_FPS
 _duration_s       = FALLBACK_DURATION_S
+_fade_start_frame = 0.0      # frame position where the alpha fade begins
+_meter_env        = None     # (wav_path, mtime, ndarray[n, METER_BANDS], hop_s)
+_meter_t0         = None     # perf_counter() when the audio cue was started
 _target_skin      = TARGET_SKIN
 _redraw_timer_registered = False
 
@@ -203,7 +235,32 @@ def _scan_frames():
         if key not in seen:
             seen.add(key)
             paths.append(p)
-    return sorted(paths)
+    return _trim_trailing_clear_frames(sorted(paths))
+
+
+def _trim_trailing_clear_frames(paths):
+    """Drop the fully transparent frames the export leaves after the black
+    hold, so the alpha fade (see FADE_FRAMES) lands on the end of the video
+    instead of partly on frames that draw nothing.
+
+    Detected without decoding any image: a uniform frame compresses to the
+    same byte count every time, so trailing files whose size equals the
+    LAST file's size are the same blank frame. This only ever trims when an
+    earlier frame has a different size, and always keeps at least one frame,
+    so a differently-exported sequence is left alone rather than damaged
+    (worst case: the fade just runs over the trailing frames as they are)."""
+    if len(paths) < 2:
+        return paths
+    try:
+        last_size = os.path.getsize(paths[-1])
+        keep = len(paths)
+        while keep > 1 and os.path.getsize(paths[keep - 1]) == last_size:
+            keep -= 1
+    except OSError:
+        return paths
+    if keep == len(paths):
+        return paths
+    return paths[:keep]
 
 
 def _load_frame(idx, blocking):
@@ -363,6 +420,100 @@ def _wav_duration_s(wav_path):
         return None
 
 
+def _build_meter_envelope(wav_path):
+    """Pre-compute the meter envelope for the transition audio: an array of
+    shape (n_steps, METER_BANDS) of 0..1 levels, one row per _ENV_HOP_S of
+    audio. Done once per audio file (cached on its path + mtime) so the
+    per-tick cost while the transition plays is a single array lookup.
+
+    "bands" mode splits the music into METER_BANDS log-spaced frequency
+    bands with an FFT; "level" mode uses overall loudness for every column.
+    Either way each column is normalised against its OWN loud passages
+    (98th percentile) and mapped over METER_DB_RANGE dB, because music's
+    spectrum tilts heavily toward the bass — without that, the treble
+    meters would barely twitch. Returns None if the file can't be read."""
+    global _meter_env
+    try:
+        import wave as _wave
+        import numpy as np
+        mtime = os.path.getmtime(wav_path)
+        if (_meter_env is not None and _meter_env[0] == wav_path
+                and _meter_env[1] == mtime):
+            return _meter_env
+        with _wave.open(wav_path, 'rb') as wf:
+            nch, sw, sr = wf.getnchannels(), wf.getsampwidth(), wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        if sw != 2 or sr <= 0:
+            print(f"[PACKAPUNCH] meter envelope: unsupported WAV ({sw*8}-bit)")
+            return None
+        x = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if nch > 1:
+            x = x[: (len(x) // nch) * nch].reshape(-1, nch).mean(axis=1)
+        hop = max(1, int(round(sr * _ENV_HOP_S)))
+        win = _ENV_WIN
+        if len(x) < win:
+            x = np.pad(x, (0, win - len(x)))
+        x = np.pad(x, (win // 2, win))                 # centre each window
+        n = (len(x) - win) // hop
+        hann = np.hanning(win).astype(np.float32)
+        freqs = np.fft.rfftfreq(win, 1.0 / sr)
+        if METER_MODE == "level":
+            groups = [np.ones_like(freqs, dtype=bool)] * METER_BANDS
+        else:
+            hi = min(METER_BAND_HI_HZ, sr * 0.5 * 0.95)
+            edges = np.geomspace(METER_BAND_LO_HZ, hi, METER_BANDS + 1)
+            groups = [(freqs >= edges[b]) & (freqs < edges[b + 1])
+                      for b in range(METER_BANDS)]
+            for b in range(METER_BANDS):               # never an empty band
+                if not groups[b].any():
+                    groups[b][np.argmin(np.abs(freqs - edges[b]))] = True
+        out = np.zeros((n, METER_BANDS), dtype=np.float32)
+        view = np.lib.stride_tricks.sliding_window_view(x, win)[::hop][:n]
+        CH = 256
+        for a in range(0, n, CH):
+            mag2 = np.abs(np.fft.rfft(view[a:a + CH] * hann, axis=1)) ** 2
+            for b, m in enumerate(groups):
+                out[a:a + CH, b] = np.sqrt(mag2[:, m].mean(axis=1))
+        for b in range(METER_BANDS):
+            ref = float(np.percentile(out[:, b], 98))
+            if ref <= 1e-9:
+                out[:, b] = 0.0
+                continue
+            db = 20.0 * np.log10(np.maximum(out[:, b], 1e-9) / ref)
+            out[:, b] = np.clip(1.0 + db / METER_DB_RANGE, 0.0, 1.0)
+        _meter_env = (wav_path, mtime, out, hop / float(sr))
+        print(f"[PACKAPUNCH] meter envelope: {n} steps x {METER_BANDS} "
+              f"({METER_MODE}), {n * hop / float(sr):.1f}s")
+        return _meter_env
+    except Exception as e:
+        print(f"[PACKAPUNCH] meter envelope failed: {e}")
+        return None
+
+
+def audio_meter_levels():
+    """Read by core/meters.py's timer on every tick. Returns None when the
+    transition audio isn't playing (meters then show their channels as
+    normal), or (rms[METER_BANDS], peak[METER_BANDS]) of 0..1 levels for
+    the music at this instant. The envelope is sampled by wall-clock time
+    since the audio cue was started — the same clock the video overlay
+    uses — and goes back to None the moment the audio's length has
+    elapsed, which is what hands the meters back to their channels."""
+    global _meter_t0
+    if _meter_t0 is None or _meter_env is None:
+        return None
+    env, hop_s = _meter_env[2], _meter_env[3]
+    t = time.perf_counter() - _meter_t0 - METER_LATENCY_S
+    i = int(t / hop_s) if t >= 0.0 else -1
+    if i >= len(env):
+        _meter_t0 = None
+        return None
+    if i < 0:
+        z = [0.0] * METER_BANDS
+        return z, list(z)
+    lo = max(0, i - int(0.05 / hop_s))                 # peak = last ~50ms
+    return env[i].tolist(), env[lo:i + 1].max(axis=0).tolist()
+
+
 def _reset_debug_stats():
     global _dbg_redraws_total, _dbg_last_report_t, _dbg_last_report_n, \
            _dbg_last_frame_idx, _dbg_skipped_frames, _dbg_shown_frames, \
@@ -447,7 +598,7 @@ def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: b
     the way back out there's nothing to reveal, so there's no reason to
     play the sequence (or wait through it) at all."""
     global _active, _start_wall, _frame_paths, _fps, \
-           _duration_s, _target_skin, _redraw_timer_registered
+           _duration_s, _fade_start_frame, _target_skin, _redraw_timer_registered
 
     if _active:
         return
@@ -465,9 +616,16 @@ def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: b
     set_skin_dir(ASSETS_DIR, _target_skin)
     clear_cache()
 
+    global _meter_t0
+    _meter_t0 = None
     if play_audio:
         wav = _ensure_wav_audio()
         if wav:
+            # Envelope first (cached after the first run) so nothing is
+            # computed between the audio starting and the meters reading it.
+            have_env = _build_meter_envelope(wav) is not None
+            if have_env:
+                _meter_t0 = time.perf_counter()
             play_oneshot(wav)   # fire-and-forget — plays to its own full
                                  # length, decoupled from the overlay below
 
@@ -480,6 +638,7 @@ def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: b
     _frame_paths = _scan_frames()
     _fps        = VIDEO_FPS
     _duration_s = (len(_frame_paths) / _fps) if _frame_paths else FALLBACK_DURATION_S
+    _fade_start_frame = max(0.0, float(len(_frame_paths) - FADE_FRAMES))
 
     _start_wall = time.perf_counter()
     _active     = True
@@ -496,11 +655,14 @@ def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: b
 
 
 def get_overlay_frame():
-    """Called once per HUD redraw. Returns (texture_or_None, progress 0..1)
-    while the transition is playing, or None once it has finished (or was
-    never active). texture_or_None is None whenever no frame art exists yet
-    for this index — the caller should just skip drawing the overlay that
-    tick, the skin swap underneath already happened at start()."""
+    """Called once per HUD redraw. Returns (texture_or_None, progress 0..1,
+    alpha 0..1) while the transition is playing, or None once it has
+    finished (or was never active). texture_or_None is None whenever no
+    frame art exists yet for this index — the caller should just skip
+    drawing the overlay that tick, the skin swap underneath already
+    happened at start(). alpha is 1.0 until the final FADE_FRAMES frames,
+    then eases down to 0 so the overlay dissolves to reveal the skin; the
+    caller multiplies it into the frame's own alpha."""
     global _active, _dbg_redraws_total, _dbg_last_report_t, \
            _dbg_last_report_n, _dbg_last_frame_idx, _dbg_skipped_frames
     if not _active:
@@ -518,6 +680,18 @@ def get_overlay_frame():
 
     progress  = elapsed / _duration_s if _duration_s > 0 else 1.0
     frame_idx = int(elapsed * _fps)
+    if _frame_paths:
+        frame_idx = min(frame_idx, len(_frame_paths) - 1)
+
+    # Fade-out over the last FADE_FRAMES frames (continuous, not per-frame
+    # steps), smoothstepped so it eases in and out instead of starting and
+    # ending abruptly.
+    alpha = 1.0
+    if FADE_FRAMES > 0 and _frame_paths:
+        f = (elapsed * _fps - _fade_start_frame) / float(FADE_FRAMES)
+        if f > 0.0:
+            f = min(f, 1.0)
+            alpha = 1.0 - f * f * (3.0 - 2.0 * f)
 
     if DEBUG:
         _dbg_redraws_total += 1
@@ -540,7 +714,7 @@ def get_overlay_frame():
             _dbg_last_report_n = _dbg_redraws_total
 
     tex = _get_frame_texture(frame_idx)
-    return (tex, progress)
+    return (tex, progress, alpha)
 
 
 def _redraw_timer():
@@ -581,8 +755,9 @@ def _redraw_timer():
 def reset():
     """Called when the HUD is (re)opened — clears any stuck state left over
     from a previous session (e.g. Blender closed mid-transition)."""
-    global _active
+    global _active, _meter_t0
     _active = False
+    _meter_t0 = None
     _clear_frame_cache()
 
 
@@ -592,6 +767,7 @@ def register():
 
 
 def unregister():
-    global _active
+    global _active, _meter_t0
     _active = False
+    _meter_t0 = None
     _clear_frame_cache()

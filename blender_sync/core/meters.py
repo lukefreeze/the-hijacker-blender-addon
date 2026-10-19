@@ -127,10 +127,30 @@ def _meter_timer():
             except Exception:
                 pass
 
-        # Zero out muted channels
-        for i in range(MAX_CHANNELS):
-            if i < len(tracks) and tracks[i].mute:
-                new_rms[i] = new_peak[i] = 0.0
+        # PACK-A-PUNCH transition: while its audio cue plays, the desk meters
+        # show the music (a spectrum across the 9 channels) instead of the
+        # channels' own signal — see core/packapunch.py audio_meter_levels().
+        # It returns None the moment the cue ends, so on the next tick the
+        # meters are driven by their channels again and the normal
+        # ballistics below ease the bars down. Muted channels are not
+        # zeroed during this — the meters are a visual here, not a signal.
+        _pap_levels = None
+        try:
+            from core import packapunch as _pap_m
+            _pap_levels = _pap_m.audio_meter_levels()
+        except Exception:
+            pass
+        if _pap_levels is not None:
+            _lv_r, _lv_p = _pap_levels
+            _nb = len(_lv_r)
+            for i in range(MAX_CHANNELS):
+                new_rms[i]  = _lv_r[i % _nb]
+                new_peak[i] = _lv_p[i % _nb]
+        else:
+            # Zero out muted channels
+            for i in range(MAX_CHANNELS):
+                if i < len(tracks) and tracks[i].mute:
+                    new_rms[i] = new_peak[i] = 0.0
 
         # Apply ballistics
         decay = METER_DECAY * (2.0 if is_playing else 0.5)

@@ -380,17 +380,27 @@ def draw_callback_px(self, context) -> None:
             from core import packapunch as _pap2
             _pap_frame = _pap2.get_overlay_frame()
             if _pap_frame is not None:
-                _pap_tex, _pap_progress = _pap_frame
+                _pap_tex, _pap_progress, _pap_alpha = _pap_frame
                 if _pap_tex is not None:
-                    from ui.mixer.draw_utils import blit_texture as _bt_pap
                     # blend="ALPHA" (not "ALPHA_PREMULT") — a PNG-sequence
                     # transition exported from video/compositing software
                     # is typically straight (non-premultiplied) alpha,
                     # unlike the pre-baked premultiplied skin PNGs
                     # elsewhere in this file. Switch this if Luke's export
                     # pipeline produces premultiplied alpha instead.
-                    _bt_pap(_pap_tex, 0, 0, width, height,
-                            key="packapunch_frame", blend="ALPHA")
+                    #
+                    # _pap_alpha < 1 during the closing fade: the tinted
+                    # blit multiplies the frame (and so its alpha) by it,
+                    # dissolving the overlay to reveal the skin beneath.
+                    if _pap_alpha >= 0.999:
+                        from ui.mixer.draw_utils import blit_texture as _bt_pap
+                        _bt_pap(_pap_tex, 0, 0, width, height,
+                                key="packapunch_frame", blend="ALPHA")
+                    elif _pap_alpha > 0.0:
+                        from ui.mixer.texture_cache import blit_texture_tinted as _btt_pap
+                        _btt_pap(_pap_tex, 0, 0, width, height,
+                                 color=(1.0, 1.0, 1.0, _pap_alpha),
+                                 blend="ALPHA", key="packapunch_frame_fade")
         except Exception as _pape2:
             print(f"[PACKAPUNCH] overlay draw error: {_pape2}")
 
