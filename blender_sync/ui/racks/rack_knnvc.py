@@ -90,8 +90,31 @@ _DONE       = "DONE"
 _ERROR      = "ERROR"
 
 # Dep check — background thread only, never on draw thread
-_dep_cache         = {"ok": False, "checked": False, "checking": False}
+#   checked  : a result exists (the draw code shows the warning, not the "checking" card, while False)
+#   when     : time of the last result; a NEGATIVE result is re-checked after DEP_RECHECK_S so that a
+#              check that failed for a transient reason (cold first import of torch is slow, antivirus
+#              scanning, the user installing PyTorch meanwhile) cannot leave the warning up for good
+_dep_cache         = {"ok": False, "checked": False, "checking": False, "when": 0.0}
 _dep_check_running = False
+DEP_TIMEOUT_S      = 60.0     # `import torch, torchaudio` can take well over 4 s on a cold start
+DEP_RECHECK_S      = 15.0
+
+
+def _redraw_editors():
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type in ('NODE_EDITOR', 'SEQUENCE_EDITOR'):
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _redraw_poll():
+    """Main-thread timer: the check runs on a background thread, and Blender only reliably redraws from
+    the main thread, so poll until the check has finished and then redraw once more."""
+    _redraw_editors()
+    return 0.3 if _dep_check_running else None
 
 
 def _run_dep_check():
@@ -108,31 +131,36 @@ def _run_dep_check():
         # "ready" even though torchaudio was never installed and
         # processing would fail the moment it actually ran.
         from core.ai_python_finder import find_python_with as _fpw
-        ok = _fpw(["torch", "torchaudio"]) is not None
+        ok = _fpw(["torch", "torchaudio"], timeout=DEP_TIMEOUT_S) is not None
     except Exception as e:
         print(f"[KNNVC] dep check error: {e}")
+    import time as _time
+    changed = (not _dep_cache["checked"]) or (_dep_cache["ok"] != ok)
     _dep_cache["ok"]       = ok
+    _dep_cache["when"]     = _time.time()
     _dep_cache["checked"]  = True
     _dep_cache["checking"] = False
-    _dep_check_running             = False
-    print(f"[KNNVC] dep check complete: {'found' if ok else 'not found'}")
-    try:
-        import bpy
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type in ('NODE_EDITOR', 'SEQUENCE_EDITOR'):
-                    area.tag_redraw()
-    except Exception:
-        pass
+    _dep_check_running     = False
+    if changed:
+        print(f"[KNNVC] dep check complete: {'found' if ok else 'not found'}")
+    _redraw_editors()      # (the main-thread poll timer redraws again as soon as it sees the flag drop)
 
 def _check_deps():
     global _dep_check_running
-    if not _dep_cache["checked"] and not _dep_check_running:
+    import time as _time
+    stale_negative = (_dep_cache["checked"] and not _dep_cache["ok"]
+                      and _time.time() - _dep_cache["when"] > DEP_RECHECK_S)
+    if (not _dep_cache["checked"] or stale_negative) and not _dep_check_running:
         _dep_check_running = True
         _dep_cache["checking"] = True
         import threading
         t = threading.Thread(target=_run_dep_check, daemon=True)
         t.start()
+        try:
+            if not bpy.app.timers.is_registered(_redraw_poll):
+                bpy.app.timers.register(_redraw_poll, first_interval=0.3)
+        except Exception:
+            pass
     return _dep_cache["ok"]
 
 
@@ -312,6 +340,15 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
     # has_skin=False here so the warning card draws its own flat black body
     # chrome instead of assuming art is already sitting underneath it.
     if not _check_deps():
+        if not _dep_cache["checked"]:
+            # First check still running: say so, instead of flashing the "PYTORCH NOT FOUND" warning
+            rail_h = RACK_RAIL_H * scale
+            body_h = rh - rail_h
+            _draw_rect(rx, ry, rw, body_h, _BG)
+            fs = max(1, int(8 * scale))
+            msg = "Checking PyTorch installation..."
+            _draw_text(msg, rx + rw / 2 - _text_width(msg, fs) / 2, ry + body_h / 2 - fs / 2, fs, _TEXT_DIM)
+            return
         bx,by,bw,bh = _draw_setup_warning(rx, ry, rw, rh, scale, has_skin=False)
         try: rack['rvc_setup_btn'] = (bx,by,bw,bh)
         except Exception: pass

@@ -117,7 +117,8 @@ def find_python_with(package, timeout=4):
     try:
         from core.ai_pydeps import get_venv_python, venv_has_module
         vp = get_venv_python()
-        if vp and all(venv_has_module(p, timeout=timeout) for p in packages):
+        # one interpreter start for all packages ("import torch, torchaudio"): importing torch is the slow part
+        if vp and venv_has_module(", ".join(packages), timeout=timeout):
             return [vp]
     except Exception:
         pass
