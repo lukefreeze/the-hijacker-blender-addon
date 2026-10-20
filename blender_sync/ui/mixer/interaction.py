@@ -456,17 +456,21 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                     _active_text_field = None
                     context.area.tag_redraw()
                     # Don't return — let the click be processed normally below
-                # PACK-A-PUNCH trigger button — fixed top-right, screen-space
-                # (shares its geometry function with mixer_hud.py's draw so
-                # the clickable area can never drift from what's drawn).
+                # PACK-A-PUNCH trigger button — beside the desk. Uses the same
+                # geometry function as mixer_hud.py's draw, and only the red
+                # plate is live. Pushes the button down (see core/packapunch.py)
+                # and fires on press; RELEASE below lets it pop back up.
                 try:
-                    from ui.mixer.mixer_hud import packapunch_button_rect as _pap_rect
-                    _pbx, _pby, _pbw, _pbh = _pap_rect(region.width, region.height, UI_SCALE)
-                    if _pbx <= rx <= _pbx + _pbw and _pby <= ry <= _pby + _pbh:
+                    from ui.mixer.mixer_hud import packapunch_button_hit as _pap_hit
+                    if _pap_hit(rx, ry, region.width, region.height, UI_SCALE,
+                                SCROLL_X, SCROLL_Y):
                         from core import packapunch as _pap
-                        if not _pap.is_active():
+                        # Show the button pushed in FIRST, run the transition a
+                        # beat later — see core/packapunch.py button_click().
+                        def _pap_fire(_pap=_pap):
                             _pap.toggle()
                             _pb_push_undo("Hijacker: PACK-A-PUNCH triggered")
+                        _pap.button_click(_pap_fire)
                         context.area.tag_redraw()
                         return {"RUNNING_MODAL"}
                 except Exception as _pape:
@@ -793,6 +797,11 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                     print(f"[AI RACKS] hit test error: {_ai_e}")
 
             elif event.value == "RELEASE":
+                try:
+                    from core import packapunch as _pap_rel
+                    _pap_rel.button_release()
+                except Exception:
+                    pass
                 if _mw.handle_release():
                     _pb_push_undo("Hijacker: master fader changed")
                     context.area.tag_redraw()

@@ -177,6 +177,7 @@ _duration_s       = FALLBACK_DURATION_S
 _fade_start_frame = 0.0      # frame position where the alpha fade begins
 _meter_env        = None     # (wav_path, mtime, ndarray[n, METER_BANDS], hop_s)
 _meter_t0         = None     # perf_counter() when the audio cue was started
+_cue_handle       = None     # play_oneshot() handle of the transition audio, so going back can stop just it
 _target_skin      = TARGET_SKIN
 _redraw_timer_registered = False
 
@@ -193,6 +194,218 @@ _dbg_last_frame_idx  = -1
 _dbg_skipped_frames  = 0
 _dbg_shown_frames    = set()
 _dbg_load_times      = []   # list of (frame_idx, ms, blocking: bool)
+
+
+# ---------------------------------------------------------------------------
+# The on-desk trigger button: an image pair (normal / pressed) drawn by
+# ui/mixer/mixer_hud.py just to the left of the mixing desk. It looks pushed
+# in while the mouse is held on it, for at least BUTTON_MIN_DOWN_S after any
+# click (so even a quick tap visibly travels), and for as long as the
+# transition itself is running.
+#
+# Two art sets, chosen by the active skin:
+#   default skin   ui/assets/packapunch/packapunch_btn.png / _pressed.png
+#   packApunch     ui/assets/skins/packapunch/packapunch_btn_skin.png / _skin_pressed.png
+# (if the packApunch pair is missing, the default pair is used there too).
+# ---------------------------------------------------------------------------
+BUTTON_IMG        = os.path.join(PACKAPUNCH_DIR, "packapunch_btn.png")
+BUTTON_IMG_DOWN   = os.path.join(PACKAPUNCH_DIR, "packapunch_btn_pressed.png")
+BUTTON_IMG_SKIN      = os.path.join(ASSETS_DIR, TARGET_SKIN, "packapunch_btn_skin.png")
+BUTTON_IMG_SKIN_DOWN = os.path.join(ASSETS_DIR, TARGET_SKIN, "packapunch_btn_skin_pressed.png")
+BUTTON_MIN_DOWN_S = 0.22
+_btn_tex          = {}       # variant/state key -> GPUTexture (or None)
+_btn_held         = False
+_btn_down_t       = -1e9
+
+
+_btn_uv           = {}       # key -> (u0, v0, u1, v1) of the visible art
+_btn_px           = {}       # key -> (width, height) of the PNG
+_btn_aspect       = {"default": 676.0 / 936.0, "skin": 676.0 / 936.0}   # height / width of the visible art, per art set
+_BTN_ALPHA_MIN    = 8.0 / 255.0
+
+
+def _button_variant() -> str:
+    """"skin" while the packApunch skin is active and its own button art
+    exists, otherwise "default"."""
+    try:
+        if get_active_skin() == TARGET_SKIN and os.path.exists(BUTTON_IMG_SKIN):
+            return "skin"
+    except Exception:
+        pass
+    return "default"
+
+
+def _button_paths(variant):
+    if variant == "skin":
+        return BUTTON_IMG_SKIN, (BUTTON_IMG_SKIN_DOWN if os.path.exists(BUTTON_IMG_SKIN_DOWN) else BUTTON_IMG_SKIN)
+    return BUTTON_IMG, BUTTON_IMG_DOWN
+
+
+def _opaque_uv(img):
+    """(u0, v0, u1, v1, w_px, h_px) of the part of `img` that actually has
+    pixels (alpha above a tiny threshold), so transparent margins around the
+    art — whatever canvas size it was exported on — are never drawn or
+    counted in its proportions. Falls back to the whole image."""
+    w, h = int(img.size[0]), int(img.size[1])
+    try:
+        import numpy as np
+        buf = np.empty(w * h * 4, dtype=np.float32)
+        img.pixels.foreach_get(buf)
+        alpha = buf.reshape(h, w, 4)[..., 3]          # row 0 = BOTTOM, like uv v=0
+        cols = np.where(alpha.max(axis=0) > _BTN_ALPHA_MIN)[0]
+        rows = np.where(alpha.max(axis=1) > _BTN_ALPHA_MIN)[0]
+        if len(cols) and len(rows):
+            x0, x1 = int(cols[0]), int(cols[-1]) + 1
+            y0, y1 = int(rows[0]), int(rows[-1]) + 1
+            return (x0 / w, y0 / h, x1 / w, y1 / h, x1 - x0, y1 - y0)
+    except Exception as e:
+        print(f"[PACKAPUNCH] button art trim failed, using whole image: {e}")
+    return (0.0, 0.0, 1.0, 1.0, w, h)
+
+
+def get_button_texture(pressed: bool):
+    """GPU texture for the button art (the set that matches the active skin),
+    loaded once and cached. None if the PNG is missing (the HUD then simply
+    draws no button). The art's transparent margins are trimmed at draw time
+    via get_button_uv(), and the on-screen proportions come from the normal
+    image's visible area (get_button_aspect()), so the picture can be
+    re-exported at any canvas size without coming out squashed."""
+    variant = _button_variant()
+    state   = "pressed" if pressed else "normal"
+    key     = f"{variant}_{state}"
+    if key in _btn_tex:
+        return _btn_tex[key]
+    tex  = None
+    path = _button_paths(variant)[1 if pressed else 0]
+    nkey = f"{variant}_normal"
+    try:
+        if os.path.exists(path):
+            img = bpy.data.images.load(path, check_existing=True)
+            # Straight-alpha art: stop Blender premultiplying it on upload
+            # (the HUD draws it with plain "ALPHA" blending), so the soft
+            # shadows and anti-aliased note edges composite cleanly.
+            try:
+                img.alpha_mode = 'CHANNEL_PACKED'
+            except Exception:
+                pass
+            if bpy.app.version >= (5, 0, 0):
+                img.colorspace_settings.name = 'Non-Color'   # see _load_frame()
+            u0, v0, u1, v1, wpx, hpx = _opaque_uv(img)
+            size = (int(img.size[0]), int(img.size[1]))
+            _btn_px[key] = size
+            if pressed and _btn_px.get(nkey) == size and nkey in _btn_uv:
+                # Same canvas as the normal art: use ITS crop so the two stay
+                # perfectly registered (the pressed art's own soft shadow edge
+                # can end a pixel or two differently, which would shift it).
+                u0, v0, u1, v1 = _btn_uv[nkey]
+                wpx = max(1, int(round((u1 - u0) * size[0])))
+                hpx = max(1, int(round((v1 - v0) * size[1])))
+            _btn_uv[key] = (u0, v0, u1, v1)
+            if not pressed and wpx > 0:
+                _btn_aspect[variant] = hpx / float(wpx)
+            elif pressed and wpx > 0 and abs(hpx / float(wpx) - _btn_aspect[variant]) > 0.02:
+                print("[PACKAPUNCH] pressed button art has different proportions "
+                      "than the normal art — it will be stretched to match")
+            tex = gpu.texture.from_image(img)
+        else:
+            print(f"[PACKAPUNCH] button art not found: {path}")
+    except Exception as e:
+        print(f"[PACKAPUNCH] button art load failed: {e}")
+    _btn_tex[key] = tex
+    return tex
+
+
+def get_button_uv(pressed: bool):
+    """Sub-rectangle of the button texture holding the visible art."""
+    key = f"{_button_variant()}_{'pressed' if pressed else 'normal'}"
+    return _btn_uv.get(key, (0.0, 0.0, 1.0, 1.0))
+
+
+def get_button_aspect() -> float:
+    """Height / width of the button picture as drawn (for the active skin)."""
+    get_button_texture(False)          # make sure the normal art has been measured
+    return _btn_aspect[_button_variant()]
+
+
+def _redraw_hud_areas():
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "NODE_EDITOR":
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _button_release_redraw():
+    _redraw_hud_areas()
+    return None
+
+
+def button_press():
+    global _btn_held, _btn_down_t
+    _btn_held   = True
+    _btn_down_t = time.perf_counter()
+    # Make sure the button gets repainted both going down and, if the mouse
+    # is let go before BUTTON_MIN_DOWN_S, when it comes back up.
+    _redraw_hud_areas()
+    try:
+        bpy.app.timers.register(_button_release_redraw,
+                                first_interval=BUTTON_MIN_DOWN_S + 0.02)
+    except Exception:
+        pass
+
+
+# How long the pushed-in button is shown before the transition actually
+# starts. start() swaps the skin synchronously, which stalls the UI for a
+# moment; if that ran inside the click, the pressed picture would never get
+# painted before the black overlay (or the skin swap itself) took over the
+# screen. Waiting a few frames lets Blender draw the pressed button first.
+BUTTON_FIRE_DELAY_S = 0.15
+_btn_pending        = False
+
+
+def button_click(on_fire):
+    """The desk button was clicked: show it pressed right away, then call
+    on_fire() once after BUTTON_FIRE_DELAY_S. Ignored while a transition is
+    running or a click is already waiting to fire."""
+    global _btn_pending
+    if _active or _btn_pending:
+        return
+    button_press()
+    _btn_pending = True
+
+    def _fire():
+        global _btn_pending
+        _btn_pending = False
+        try:
+            if not _active:
+                on_fire()
+        except Exception as e:
+            print(f"[PACKAPUNCH] button action error: {e}")
+        _redraw_hud_areas()
+        return None
+
+    bpy.app.timers.register(_fire, first_interval=BUTTON_FIRE_DELAY_S)
+
+
+def button_release():
+    """Mouse let go. The button stays visibly down until BUTTON_MIN_DOWN_S
+    has passed since the press, so schedule one redraw for the moment it
+    pops back up (nothing else is guaranteed to repaint then)."""
+    global _btn_held
+    _btn_held = False
+    remaining = BUTTON_MIN_DOWN_S - (time.perf_counter() - _btn_down_t)
+    try:
+        bpy.app.timers.register(_button_release_redraw,
+                                first_interval=max(0.02, remaining + 0.02))
+    except Exception:
+        pass
+
+
+def button_is_down() -> bool:
+    return (_btn_held or _active
+            or (time.perf_counter() - _btn_down_t) < BUTTON_MIN_DOWN_S)
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +783,18 @@ def toggle():
     glitch rather than a deliberate second transition."""
     entering = get_active_skin() != TARGET_SKIN
     target   = TARGET_SKIN if entering else DEFAULT_SKIN
+    if not entering:
+        # Going back before the cue has finished: cut the music the moment
+        # the normal skin returns, and hand the desk meters back to their
+        # channels (they follow the cue while it plays).
+        global _meter_t0, _cue_handle
+        _meter_t0 = None
+        try:
+            if _cue_handle is not None:
+                _cue_handle.stop()
+            _cue_handle = None
+        except Exception as e:
+            print(f"[PACKAPUNCH] could not stop the transition audio: {e}")
     start(target, play_audio=entering, play_video=entering)
 
 
@@ -616,7 +841,7 @@ def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: b
     set_skin_dir(ASSETS_DIR, _target_skin)
     clear_cache()
 
-    global _meter_t0
+    global _meter_t0, _cue_handle
     _meter_t0 = None
     if play_audio:
         wav = _ensure_wav_audio()
@@ -626,14 +851,24 @@ def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: b
             have_env = _build_meter_envelope(wav) is not None
             if have_env:
                 _meter_t0 = time.perf_counter()
-            play_oneshot(wav)   # fire-and-forget — plays to its own full
-                                 # length, decoupled from the overlay below
+            _cue_handle = play_oneshot(wav)   # plays to its own full length,
+                                               # decoupled from the overlay below;
+                                               # kept only so going back can stop it
 
     if not play_video:
         _frame_paths = []
         _active      = False
         print(f"[PACKAPUNCH] instant switch -> skin '{_target_skin}' (no video)")
         return
+
+    # Frame the view on the mixing desk now, while nothing of it can be seen:
+    # the overlay's first frame is fully opaque, so by the time it fades out
+    # the reveal is already centred on the desk instead of the button.
+    try:
+        from ui.mixer.mixer_hud import frame_on_desk
+        frame_on_desk()
+    except Exception as e:
+        print(f"[PACKAPUNCH] could not frame the view on the desk: {e}")
 
     _frame_paths = _scan_frames()
     _fps        = VIDEO_FPS
@@ -755,9 +990,16 @@ def _redraw_timer():
 def reset():
     """Called when the HUD is (re)opened — clears any stuck state left over
     from a previous session (e.g. Blender closed mid-transition)."""
-    global _active, _meter_t0
+    global _active, _meter_t0, _btn_held, _btn_pending, _redraw_timer_registered, _cue_handle
+    _cue_handle = None
     _active = False
+    _btn_pending = False
+    _redraw_timer_registered = False   # Blender drops timers on file load; don't trust the old flag
     _meter_t0 = None
+    _btn_held = False
+    _btn_tex.clear()          # re-read the button art each time the HUD opens
+    _btn_uv.clear()
+    _btn_px.clear()
     _clear_frame_cache()
 
 

@@ -79,32 +79,129 @@ def load_ui_state() -> None:
           f"enabled={pb_ui_enabled}")
 
 
-def packapunch_button_rect(width: float, height: float, ui_scale: float):
-    """Fixed top-right PACK-A-PUNCH trigger button — screen-space, anchored
-    to the visible canvas corner rather than scrolled content, so it's
-    always reachable regardless of pan/zoom. Shared by draw_callback_px()
-    and interaction.py's click hit test so they can never drift apart."""
-    bw = 150 * ui_scale
-    bh = 30  * ui_scale
-    bx = width  - bw - 10 * ui_scale
-    by = height - bh - 8  * ui_scale
+# The PACK-A-PUNCH trigger button sits to the left of the mixing desk, at the
+# desk's mid-height, clear of the desk/board artwork, and moves with the desk
+# when you pan/zoom so it always stays beside it. Art is
+# ui/assets/packapunch/packapunch_btn(.png|_pressed.png).
+#   PAP_BTN_W       unscaled width of the whole picture (the plate itself is
+#                   only about a quarter of it — the rest is sticky notes)
+#   PAP_BTN_RIGHT_X where the picture's RIGHT edge sits, in content units
+#                   (desk starts at STRIP_LEFT_MARGIN=30). The Background.png
+#                   table art spans x=-300 .. 1590, so -330 puts the picture
+#                   just past its left edge, on its own. Lower = further left.
+PAP_BTN_W         = 900.0
+PAP_BTN_ASPECT    = 676.0 / 936.0      # fallback only: the real proportions are
+                                       # read from the art (get_button_aspect())
+PAP_BTN_RIGHT_X   = -330.0
+# Extra width compute_autofit() keeps free on the left so the whole picture
+# fits on screen (plus a little padding).
+PAP_BTN_LEFT_RESERVE = max(0.0, STRIP_LEFT_MARGIN - (PAP_BTN_RIGHT_X - PAP_BTN_W)) + 6.0
+# Only the red plate is clickable, not the sticky notes around it — as
+# fractions of the picture (x from left, y from TOP).
+PAP_BTN_HIT = (0.39, 0.655, 0.30, 0.69)    # x0, x1, y0, y1
+
+
+def packapunch_button_rect(width: float, height: float, ui_scale: float,
+                           scroll_x: float = None, scroll_y: float = None):
+    """Screen rect (x, y bottom-left, w, h) of the PACK-A-PUNCH button
+    picture. Shared by draw_callback_px() and interaction.py's click test
+    so they can never drift apart. Pass the current scroll values; they
+    default to this module's own."""
+    sx = SCROLL_X if scroll_x is None else scroll_x
+    sy = SCROLL_Y if scroll_y is None else scroll_y
+    bw = PAP_BTN_W * ui_scale
+    try:
+        from core import packapunch as _pap_a
+        bh = bw * _pap_a.get_button_aspect()      # proportions of the actual art
+    except Exception:
+        bh = bw * PAP_BTN_ASPECT
+    # Same desk height the desk background uses in draw_callback_px().
+    try:
+        from ui.mixer.channel_strip import (
+            send_section_height as _sh, SEND_MIN_SLOTS as _SMS,
+            STRIP_TOTAL_H as _STH)
+        from Racks import RACK_MARGIN_TOP as _RMT
+        desk_h = _STH * ui_scale + _sh(_SMS, ui_scale) + _RMT * ui_scale
+    except Exception:
+        desk_h = 400.0 * ui_scale
+    base_y    = height - 150 * ui_scale - sy          # top of the desk
+    bx = sx + PAP_BTN_RIGHT_X * ui_scale - bw
+    by = base_y - desk_h / 2.0 - bh / 2.0
     return bx, by, bw, bh
 
 
-MASTER_RESERVE_W = 100.0
+def packapunch_button_hit(rx, ry, width, height, ui_scale,
+                          scroll_x=None, scroll_y=None) -> bool:
+    bx, by, bw, bh = packapunch_button_rect(width, height, ui_scale,
+                                            scroll_x, scroll_y)
+    x0, x1, y0, y1 = PAP_BTN_HIT
+    return (bx + x0 * bw <= rx <= bx + x1 * bw and
+            by + (1.0 - y1) * bh <= ry <= by + (1.0 - y0) * bh)
 
 
-def compute_autofit(draw_w: float, draw_h: float):
-    """Return (UI_SCALE, SCROLL_X, SCROLL_Y) to centre the mixer in the canvas."""
-    # MASTER_RESERVE_W: unscaled width kept free at the right for the master
-    # fader/meter (ui/mixer/master_widget.py), which is pinned to the canvas edge.
-    content_w = AUTOFIT_CONTENT_W + MASTER_RESERVE_W
-    fit_x   = draw_w / content_w
+def compute_autofit(draw_w: float, draw_h: float, with_button: bool = False):
+    """Return (UI_SCALE, SCROLL_X, SCROLL_Y) to centre the mixer in the canvas.
+
+    By default (with_button=False) it frames the desk and racks alone, so
+    the PACK-A-PUNCH button sits just off-screen to the left for people to
+    find. with_button=True would make room for it in the picture."""
+    # The master widget is a FIXED-size panel (it ignores the zoom), so its
+    # width is taken off the canvas in real screen pixels before fitting.
+    # PAP_BTN_LEFT_RESERVE: room (in zoomed units) on the left for the
+    # PACK-A-PUNCH button that sits beside the desk.
+    try:
+        import ui.mixer.master_widget as _mw_fit
+        master_px = float(_mw_fit.reserve_w())
+    except Exception:
+        master_px = 100.0
+    usable_w = max(200.0, draw_w - master_px)
+    btn_reserve = PAP_BTN_LEFT_RESERVE if with_button else 0.0
+    content_w = AUTOFIT_CONTENT_W + btn_reserve
+    fit_x   = usable_w / content_w
     fit_y   = draw_h / AUTOFIT_CONTENT_H
     scale   = max(0.35, min(2.0, min(fit_x, fit_y) * AUTOFIT_PADDING))
-    scr_x   = (draw_w - content_w * scale) / 2.0 - 30.0 * scale
+    scr_x   = ((usable_w - content_w * scale) / 2.0 - 30.0 * scale
+               + btn_reserve * scale)
     scr_y   = draw_h / 2.0 - 550.0 * scale
     return scale, scr_x, scr_y
+
+
+def frame_on_desk() -> bool:
+    """Re-frame the view on the mixing desk and racks, as the first-open
+    auto-fit does but WITHOUT leaving room for the PACK-A-PUNCH button — so
+    the button sits just off-screen to the left and the desk fills the view.
+    Used by the PACK-A-PUNCH transition: it runs while the overlay is opaque,
+    so when the overlay fades out the reveal is already framed on the desk.
+    Returns False if no Node Editor to size it from was found."""
+    global UI_SCALE, SCROLL_X, SCROLL_Y
+    best, best_px = None, 0
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != 'NODE_EDITOR':
+                    continue
+                for rgn in area.regions:
+                    if rgn.type != 'WINDOW':
+                        continue
+                    px = rgn.width * rgn.height
+                    if HUD_AREA_PTR is not None and area.as_pointer() == HUD_AREA_PTR:
+                        px += 10 ** 12          # the HUD's own area always wins
+                    if px > best_px:
+                        best_px, best = px, (rgn.width, rgn.height)
+    except Exception:
+        return False
+    if best is None or best[0] < 100 or best[1] < 100:
+        return False
+    UI_SCALE, SCROLL_X, SCROLL_Y = compute_autofit(best[0], best[1], with_button=False)
+    save_ui_state()
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+    except Exception:
+        pass
+    print(f"[HUD] framed on desk: scale={UI_SCALE:.3f} canvas={best[0]}x{best[1]}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -165,28 +262,19 @@ def draw_callback_px(self, context) -> None:
                      height - 40*UI_SCALE - SCROLL_Y, 0)
         blf.draw(0, f"THE HIJACKER | Scale: {round(UI_SCALE, 2)}")
 
-        # PACK-A-PUNCH trigger button — fixed top-right, screen-space
-        # (not SCROLL_X/Y-shifted, see packapunch_button_rect's docstring).
+        # PACK-A-PUNCH trigger button — a picture just left of the desk; the
+        # pressed picture shows while it's held / the transition runs.
         try:
             from core import packapunch as _pap
-            _pbx, _pby, _pbw, _pbh = packapunch_button_rect(width, height, UI_SCALE)
-            if _pap.is_active():
-                _pap_bg, _pap_fg, _pap_lbl = (
-                    (0.35, 0.18, 0.05, 1.0), (1.0, 0.75, 0.3, 1.0), "PACK-A-PUNCHING…")
-            elif _pap.get_active_skin() == _pap.TARGET_SKIN:
-                _pap_bg, _pap_fg, _pap_lbl = (
-                    (0.10, 0.28, 0.12, 1.0), (0.55, 0.95, 0.55, 1.0), "REVERT SKIN")
-            else:
-                _pap_bg, _pap_fg, _pap_lbl = (
-                    (0.20, 0.06, 0.04, 1.0), (0.90, 0.45, 0.20, 1.0), "PACK-A-PUNCH!")
-            draw_rounded_rect(_pbx, _pby, _pbw, _pbh, 4*UI_SCALE, _pap_bg)
-            _fs_pap = max(1, int(9*UI_SCALE))
-            from ui.mixer.draw_utils import text_width as _tw_pap
-            blf.color(0, *_pap_fg)
-            blf.size(0, _fs_pap)
-            blf.position(0, _pbx + (_pbw - _tw_pap(_pap_lbl, _fs_pap))/2,
-                         _pby + _pbh/2 - _fs_pap/2, 0)
-            blf.draw(0, _pap_lbl)
+            _pbx, _pby, _pbw, _pbh = packapunch_button_rect(
+                width, height, UI_SCALE, SCROLL_X, SCROLL_Y)
+            _pap_dn      = _pap.button_is_down()
+            _pap_tex_btn = _pap.get_button_texture(_pap_dn)
+            if _pap_tex_btn is not None:
+                from ui.mixer.texture_cache import blit_texture as _bt_btn
+                _bt_btn(_pap_tex_btn, _pbx, _pby, _pbw, _pbh,
+                        key="packapunch_button", blend="ALPHA",
+                        uv=_pap.get_button_uv(_pap_dn))
         except Exception as _pape:
             print(f"[PACKAPUNCH] button draw error: {_pape}")
 
