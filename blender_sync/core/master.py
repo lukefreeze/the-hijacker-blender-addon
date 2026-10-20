@@ -1,13 +1,17 @@
 # =============================================================================
 # core/master.py
-# The Hijacker — master bus state: fader value, meter ballistics, clip latch.
+# The Hijacker — master bus state: fader value, meter ballistics, clip light.
 #
 # The engine does the actual work (a smoothed gain after the channel sum, a
-# peak accumulator and a clip latch — see HijackerEngine::set_master_gain).
+# peak accumulator — see HijackerEngine::set_master_gain).
 # This module holds the parts Python owns:
 #   - the fader position, stored per .blend file as scene.pb_master_db
 #   - converting dB <-> linear gain
 #   - the meter's visual ballistics (instant attack, smooth fall, peak hold)
+#   - the clip light: it FLASHES while the master is hitting 0 dBFS and goes
+#     out by itself once it stops (fader lowered, audio stopped) — it is not
+#     latched. The decision is made here from each poll's peak reading; the
+#     engine's own latch (get_master_clip) is no longer used.
 # It has no drawing code; ui/mixer/master_widget.py draws it.
 # =============================================================================
 
@@ -22,11 +26,13 @@ DB_MAX = 6.0             # fader top (engine caps linear gain at 2.0 == +6.02 dB
 FALL_DB_PER_S      = 30.0    # meter bar fall rate
 HOLD_TIME_S        = 1.5     # peak-hold tick stays put this long
 HOLD_FALL_DB_PER_S = 20.0    # ...then falls at this rate
+CLIP_HOLD_S        = 0.30    # keep flashing this long after the last clipped reading, so a single hit is visible
+CLIP_FLASH_HZ      = 4.0     # flash rate while clipping (the HUD redraws at ~10-20 fps)
 
 # Visual meter state (read by the widget)
 level = 0.0              # linear, smoothed bar
 hold  = 0.0              # linear, peak-hold tick
-clip  = False            # latched until the user clicks the clip light
+clip  = False            # clip light ON right now (flashes while clipping; never latched)
 
 # Loudness (ITU-R BS.1770 / EBU R128), measured by the engine on exactly what leaves it.
 # LUFS / LU / dBTP; NO_READING (-200) means nothing measured yet.
@@ -37,6 +43,8 @@ loudness = {"momentary": NO_READING, "short_term": NO_READING, "integrated": NO_
 
 _hold_t = 0.0
 _last_t = None
+_clip_start = None       # when the current run of clipping began (flash phase starts "on")
+_clip_last  = 0.0        # time of the most recent clipped reading
 
 
 def db_to_gain(db):
@@ -103,8 +111,9 @@ def set_db(db, scene=None):
 
 
 def clear_clip():
-    global clip
+    global clip, _clip_start
     clip = False
+    _clip_start = None
     hj = _hj()
     if hj is not None and hasattr(hj, "clear_master_clip"):
         try:
@@ -137,16 +146,17 @@ def format_level(v, places=1):
 
 
 def reset_meter():
-    global level, hold, clip, _hold_t, _last_t
+    global level, hold, clip, _hold_t, _last_t, _clip_start
     level = hold = 0.0
     clip = False
+    _clip_start = None
     _hold_t = 0.0
     _last_t = None
 
 
 def poll(hj):
     """Called from the meter timer: read the engine, apply ballistics."""
-    global level, hold, clip, _hold_t, _last_t
+    global level, hold, clip, _hold_t, _last_t, _clip_start, _clip_last
     now = time.perf_counter()
     dt = 0.05 if _last_t is None else max(0.0, min(0.5, now - _last_t))
     _last_t = now
@@ -161,10 +171,23 @@ def poll(hj):
     if hj is not None and hasattr(hj, "get_master_peak"):
         try:
             peak = float(hj.get_master_peak())
-            if hj.get_master_clip():
-                clip = True
         except Exception:
             peak = 0.0
+
+    # Clip light: peak is the loudest sample since the previous poll
+    # (post-fader, pre-limiter). >= 1.0 means the master is at/over 0 dBFS
+    # right now. Flash while that keeps happening, and go dark once it stops
+    # (the fader came down, or playback ended and the peak fell to 0).
+    if peak >= 1.0:
+        if _clip_start is None or (now - _clip_last) > CLIP_HOLD_S:
+            _clip_start = now
+        _clip_last = now
+    if _clip_start is not None and (now - _clip_last) <= CLIP_HOLD_S:
+        phase = int((now - _clip_start) * CLIP_FLASH_HZ * 2.0)
+        clip = (phase % 2 == 0)
+    else:
+        _clip_start = None
+        clip = False
 
     if peak >= level:
         level = peak

@@ -3,16 +3,21 @@
 # The Hijacker — the master bus fader + meter + clip light.
 #
 # Drawn in code (no artwork), pinned to the right-hand edge of the canvas in
-# screen space like the PACK-A-PUNCH button. It does not scroll with the desks,
-# so there is always exactly one master however many groups of 9 channels exist.
+# screen space. It does not scroll with the desks, so there is always exactly
+# one master however many groups of 9 channels exist, and it does NOT follow
+# the UI zoom either: it is always drawn at FIXED_SCALE, so it keeps the same
+# on-screen size as you pan and zoom the desks. The small arrow button at the
+# top right of the panel collapses it into a thin tab at the edge (click the
+# tab to bring it back); the choice is saved in the .blend.
 # Geometry lives in _layout() and is shared by draw() and the hit test, so what
 # you see is always what you click.
 #
 # Controls:
 #   drag the handle (or click the track)   set the level
 #   double-click the fader or the readout  back to 0 dB
-#   click the CLIP light                   clear the clip latch
+#   CLIP light                             flashes while the master is hitting 0 dBFS, off otherwise
 #   click the loudness readout             restart the loudness measurement (also done at every Play)
+#   click the arrow (top right)            collapse to a tab / click the tab to expand
 # =============================================================================
 
 import math
@@ -25,15 +30,21 @@ from ui.mixer.draw_utils import (
 from core import master as _m
 from core.constants import DOUBLE_CLICK_TIME
 
-# Unscaled layout (multiplied by UI_SCALE)
+# The panel ignores the UI zoom — every public function below forces this scale.
+FIXED_SCALE = 1.0
+
+# Layout in screen pixels (times FIXED_SCALE)
 PANEL_W   = 84
 PANEL_H   = 400
 LOUD_H    = 70      # loudness readout block (M / S / I / LRA / TP)
 MARGIN_R  = 14      # gap to the canvas right edge (keeps the scrollbar clear)
-TOP_OFF   = 52      # gap from the canvas top (clears the PACK-A-PUNCH button)
+TOP_OFF   = 16      # gap from the canvas top
 HANDLE_W  = 28
 HANDLE_H  = 14
 METER_W   = 12
+TAB_W     = 26      # collapsed tab
+TAB_H     = 92
+BTN_SZ    = 16      # collapse arrow button
 
 TICKS = [(6, "+6"), (0, "0"), (-6, "-6"), (-12, "-12"), (-24, "-24"), (-48, "-48")]
 
@@ -51,11 +62,59 @@ METER_SEGS = [   # (from dB, to dB, colour)
     (  0.0,   6.0, (0.95, 0.15, 0.10, 1.0)),
 ]
 
+_collapsed = None      # None = not read from the scene yet
 _drag = False
 _anchor_mouse_y = 0.0
 _anchor_p = 0.0
 _changed = False
 _last_fader_click = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Collapsed state (saved per .blend as scene.pb_master_collapsed)
+# ---------------------------------------------------------------------------
+def is_collapsed():
+    global _collapsed
+    try:
+        import bpy
+        scene = bpy.context.scene
+        if scene is not None and hasattr(scene, "pb_master_collapsed"):
+            return bool(scene.pb_master_collapsed)
+    except Exception:
+        pass
+    # property not registered yet (add-on loaded before it existed): session-only state
+    return bool(_collapsed)
+
+
+def set_collapsed(v):
+    global _collapsed, _drag
+    _collapsed = bool(v)
+    _drag = False
+    try:
+        import bpy
+        scene = bpy.context.scene
+        if scene is not None:
+            scene.pb_master_collapsed = _collapsed
+    except Exception:
+        pass
+
+
+def reserve_w():
+    """Screen pixels the canvas should keep free at its right edge for this
+    widget (used by mixer_hud.compute_autofit())."""
+    if is_collapsed():
+        return TAB_W + MARGIN_R + 6
+    return PANEL_W + MARGIN_R + 2
+
+
+def _tab_rect(width, height, s):
+    tw, th = TAB_W * s, TAB_H * s
+    return width - tw - MARGIN_R * s * 0.5, height - TOP_OFF * s - th, tw, th
+
+
+def _btn_rect(L, s):
+    b = BTN_SZ * s
+    return L["px"] + L["pw"] - b - 4 * s, L["top"] - b - 4 * s, b, b
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +164,23 @@ def _db_text(db):
 # ---------------------------------------------------------------------------
 # Drawing
 # ---------------------------------------------------------------------------
+def _draw_tab(width, height, s):
+    tx, ty, tw, th = _tab_rect(width, height, s)
+    draw_rounded_rect(tx, ty, tw, th, 6 * s, C_PANEL)
+    draw_rect_outline(tx, ty, tw, th, C_EDGE, 1.0)
+    fs = max(1, int(10 * s))
+    draw_text("<", tx + (tw - text_width("<", fs)) / 2.0, ty + th - 20 * s, fs + 2, C_TEXT)
+    draw_text("M", tx + (tw - text_width("M", fs)) / 2.0, ty + th / 2.0 - 4 * s, fs, C_DIM)
+    # a clip is still visible while collapsed
+    draw_circle(tx + tw / 2.0, ty + 14 * s, 5.0 * s,
+                (1.0, 0.1, 0.05, 1.0) if _m.clip else (0.25, 0.04, 0.03, 1.0))
+
+
 def draw(width, height, s):
+    s = FIXED_SCALE
+    if is_collapsed():
+        _draw_tab(width, height, s)
+        return
     L = _layout(width, height, s)
     db = _m.get_db()
 
@@ -114,8 +189,14 @@ def draw(width, height, s):
 
     fs = max(1, int(11 * s))
     title = "MASTER"
-    draw_text(title, L["px"] + (L["pw"] - text_width(title, fs)) / 2.0,
+    draw_text(title, L["px"] + (L["pw"] - text_width(title, fs)) / 2.0 - 6 * s,
               L["top"] - 22 * s, fs, C_TEXT)
+
+    # collapse button (arrow pointing toward the edge it folds into)
+    bx, by, bw, bh = _btn_rect(L, s)
+    draw_rounded_rect(bx, by, bw, bh, 3 * s, (0.12, 0.12, 0.14, 1.0))
+    draw_rect_outline(bx, by, bw, bh, C_EDGE, 1.0)
+    draw_text(">", bx + (bw - text_width(">", fs)) / 2.0, by + 3 * s, fs, C_TEXT)
 
     # clip light
     on = _m.clip
@@ -211,9 +292,16 @@ def _draw_loudness(L, s):
 # Hit testing + interaction (called from ui/mixer/interaction.py)
 # ---------------------------------------------------------------------------
 def hit_test(rx, ry, width, height, s):
+    s = FIXED_SCALE
+    if is_collapsed():
+        tx, ty, tw, th = _tab_rect(width, height, s)
+        return "expand" if (tx <= rx <= tx + tw and ty <= ry <= ty + th) else None
     L = _layout(width, height, s)
     if not (L["px"] <= rx <= L["px"] + L["pw"] and L["py"] <= ry <= L["py"] + L["ph"]):
         return None
+    bx, by, bw, bh = _btn_rect(L, s)
+    if bx - 2 * s <= rx <= bx + bw + 2 * s and by - 2 * s <= ry <= by + bh + 2 * s:
+        return "collapse"
     if (abs(rx - L["clip_cx"]) <= 12 * s + 28 * s and abs(ry - L["clip_cy"]) <= 10 * s):
         return "clip"
     if L["ld_x"] <= rx <= L["ld_x"] + L["ld_w"] and L["ld_y"] <= ry <= L["ld_y"] + L["ld_h"]:
@@ -233,10 +321,14 @@ def is_dragging():
 def handle_press(rx, ry, width, height, s, mouse_y):
     """Return True if the click belonged to the master widget."""
     global _drag, _anchor_mouse_y, _anchor_p, _changed, _last_fader_click
+    s = FIXED_SCALE
     kind = hit_test(rx, ry, width, height, s)
     if kind is None:
         return False
     now = time.time()
+    if kind in ("collapse", "expand"):
+        set_collapsed(kind == "collapse")
+        return True
     if kind == "clip":
         _m.clear_clip()
         return True
@@ -268,6 +360,7 @@ def handle_press(rx, ry, width, height, s, mouse_y):
 
 def handle_move(width, height, s, mouse_y):
     global _changed
+    s = FIXED_SCALE
     if not _drag:
         return False
     L = _layout(width, height, s)
