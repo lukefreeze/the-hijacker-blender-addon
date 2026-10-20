@@ -149,7 +149,9 @@ class VSE_OT_TogglePBGui(bpy.types.Operator):
             try:
                 dw = best_w if best_w > 100 else context.region.width
                 dh = best_h if best_h > 100 else context.region.height
-                scale, scr_x, scr_y = compute_autofit(dw, dh)
+                # Frame the desk only: the PACK-A-PUNCH button sits just off
+                # to the left on purpose, for people to stumble across.
+                scale, scr_x, scr_y = compute_autofit(dw, dh, with_button=False)
                 _set_hud('UI_SCALE',  scale)
                 _set_hud('SCROLL_X',  scr_x)
                 _set_hud('SCROLL_Y',  scr_y)
@@ -272,13 +274,72 @@ def on_load_post(filepath, *args):
     clear_texture_cache()
     reset_engine()
     load_ui_state()
+    global _deferred_tries
+    _deferred_tries = 0
+    # The area pointer from before the load belongs to a screen that no
+    # longer exists; clear it so nothing is blocked while we wait to find
+    # the real one in _deferred_invoke().
+    _set_hud('HUD_AREA_PTR', None)
     if _get_hud('pb_ui_enabled'):
-        bpy.app.timers.register(_deferred_invoke, first_interval=0.1)
+        if not bpy.app.timers.is_registered(_deferred_invoke):
+            bpy.app.timers.register(_deferred_invoke, first_interval=0.1)
+
+
+_deferred_tries = 0
+
+
+def _find_hud_area():
+    """(window, area, WINDOW region) of the largest Node Editor, or None —
+    the same choice the toggle button makes."""
+    best, best_px = None, 0
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != 'NODE_EDITOR':
+                    continue
+                for rgn in area.regions:
+                    if rgn.type == 'WINDOW' and rgn.width * rgn.height > best_px:
+                        best_px = rgn.width * rgn.height
+                        best = (window, area, rgn)
+    except Exception:
+        pass
+    return best
 
 
 def _deferred_invoke():
+    """Bring the HUD back to life after a .blend that was saved with it open
+    is loaded.
+
+    Loading a file cancels every modal operator and removes every
+    bpy.app.timers timer, but the scene property saying "HUD enabled" comes
+    back with the file — so the HUD drew (its draw handler survives) while
+    nothing was listening to the mouse and the meters had stopped. Two things
+    were wrong in the old version of this function:
+      * the interaction operator was started from a timer, which has no
+        window/area/region, so its modal handler never received any events —
+        it now runs inside a temp_override of the Node Editor it will serve;
+      * the meter timer's "already registered" flag was still True from the
+        previous file even though Blender had deleted the timer itself, so
+        _ensure_meter_timer() did nothing — it is now cancelled first so the
+        flag is reset before a fresh timer is made.
+    If the window/areas aren't ready yet this retries for a few seconds."""
+    global _deferred_tries
+    found = _find_hud_area()
+    if found is None:
+        _deferred_tries += 1
+        if _deferred_tries < 20:
+            return 0.25
+        print("[STATE] no Node Editor found to restore the Hijacker into")
+        _deferred_tries = 0
+        return None
+    _deferred_tries = 0
+    window, area, region = found
     try:
-        bpy.ops.vse.pb_interaction("INVOKE_DEFAULT")
+        _set_hud('HUD_AREA_PTR', area.as_pointer())
+        _pap_mod.reset()
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            bpy.ops.vse.pb_interaction("INVOKE_DEFAULT")
+        _cancel_meter_timer()      # resets the stale "registered" flag
         _ensure_meter_timer()
         _pb_engine_enable()
         # Ensure tracks are synced even on blank scenes
@@ -288,9 +349,10 @@ def _deferred_invoke():
                 _sync_tracks_to_vse(scene, reset_values=False)
         except Exception as se:
             print(f"[STATE] track sync failed: {se}")
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                area.tag_redraw()
+        for w in bpy.context.window_manager.windows:
+            for a in w.screen.areas:
+                a.tag_redraw()
+        print(f"[STATE] Hijacker restored after file load (area ptr={area.as_pointer()})")
     except Exception as e:
         print(f"[STATE] deferred invoke failed: {e}")
     return None
