@@ -11,7 +11,7 @@ A professional audio mixing and processing suite for Blender's Video Sequence Ed
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue" alt="Platform Windows">
   <img src="https://img.shields.io/badge/Python-3.11-green" alt="Python 3.11">
   <img src="https://img.shields.io/badge/Status-Alpha-red" alt="Status Alpha">
-  <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License MIT">
+  <img src="https://img.shields.io/badge/License-GPL--3.0--or--later-blue" alt="License GPL-3.0-or-later">
 </p>
 
 > **Alpha:** Core features are complete and working. UI polish is the final remaining step before release.
@@ -67,7 +67,7 @@ All AI racks run as background subprocesses — Blender stays fully responsive d
 | **Voicefixer** | Voice restoration — repairs degraded, clipped or low-quality recordings |
 | **Demucs** | Stem separation — splits a track into vocals, drums, bass, other |
 | **KNNVC** | Voice conversion — converts recorded dialogue to a different voice |
-| **Piper TTS** | Offline neural text-to-speech — no internet, no API keys |
+| **Piper TTS** | Offline neural text-to-speech — one-click engine + starter voice download, then no internet or API keys needed |
 | **Whisper** | Speech-to-text — transcribes audio and generates VSE subtitle strips |
 
 ---
@@ -113,7 +113,7 @@ blender_sync/
   ai_engines/
     demucs/                     ← Demucs runner
     knnvc/                      ← KNNVC runner + voice models
-    piper/                      ← Piper binary + espeak-ng-data + voices
+    piper/                      ← Piper runner glue (the engine and voices are downloaded, not shipped)
     booster/                    ← Booster runner
     voicefixer/                 ← Voicefixer runner
     whisper/                    ← Whisper runner
@@ -162,7 +162,7 @@ build.bat
 
 Requires MSVC, Python 3.11 headers, pybind11, and PortAudio static lib. See `build.bat` for full dependency list.
 
-Cross-platform builds (Windows / macOS / Linux) run automatically on every push to `feature/hijacker-engine` via `.github/workflows/build.yml`. Download artifacts from the [Actions](https://github.com/lukefreeze/the-hijacker-blender-addon/actions) tab.
+Cross-platform builds (Windows / macOS / Linux) run automatically on every push to `main` (and the active development branch) via `.github/workflows/build.yml`. Download artifacts from the [Actions](https://github.com/lukefreeze/the-hijacker-blender-addon/actions) tab.
 
 ---
 
@@ -173,12 +173,6 @@ Cross-platform builds (Windows / macOS / Linux) run automatically on every push 
 | Windows x64 | ✅ | ✅ |
 | macOS | ✅ | 🔜 Testing soon |
 | Linux x64 | ✅ | 🔜 Testing soon |
-
----
-
-## Development Branch
-
-Active development is on `feature/hijacker-engine`. The `main` branch contains early prototypes and is not representative of the current state.
 
 ---
 
@@ -195,6 +189,16 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan.
 
 ---
 
-## License
+## License and Credits
 
-MIT
+The Hijacker is free software, licensed under the **GNU General Public License v3.0 or later** — see [LICENSE](LICENSE).
+
+If you fork, modify or build on this project, the GPL requires you to keep it open under the same licence, and the author attribution in [NOTICE.md](NOTICE.md) must be preserved in your version's source and credits.
+
+### AI engines and models
+
+The Hijacker **does not include any AI engine, model or voice**. The AI racks (Piper TTS, Demucs, kNN-VC, VoiceFixer, Whisper) download their software and model files from their official sources when you choose to install them, and each remains under its own licence. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Voice models and voice-conversion tools carry their own usage terms — check them before publishing results, and only convert voices you have the right to use.
+
+### Thanks
+
+The PACK-A-PUNCH skin mode is a tip of the hat to *Call of Duty* for the idea; this project isn't affiliated with Activision.
