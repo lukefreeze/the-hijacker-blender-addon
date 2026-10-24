@@ -400,27 +400,6 @@ def draw_callback_px(self, context) -> None:
             pass
 
 
-        # ── Draw layer diagnostic — prints once on first draw ────────────────
-        global _draw_diag_done
-        if not _draw_diag_done:
-            _draw_diag_done = True
-            from ui.mixer.texture_cache import get_texture as _gtd
-            _layers = [
-                ("1 (bottom)", "Background.png table surface (or dark rect fallback)", True),
-                ("2",          "mixer_desk_bg PNG or grey fallback",             _gtd("mixer_desk_bg") is not None),
-                ("3",          "strip_top_bg  (HEADER+GAIN, full width)",        _gtd("strip_top_bg") is not None),
-                ("4",          "strip_send_slot_bg  (tiled rows, full width)",   _gtd("strip_send_slot_bg") is not None),
-                ("5",          "strip_bottom_bg  (EQ+PAN+FADER, full width)",    _gtd("strip_bottom_bg") is not None),
-                ("6",          "Channel strip elements (knobs/faders/buttons)",  True),
-                ("7 (top)",    "Racks",                                          True),
-            ]
-            print("[HUD] ── Draw layer order ──────────────────────────────")
-            for lvl, desc, loaded in _layers:
-                status = "PNG" if loaded and lvl not in ("1 (bottom)", "6", "7 (top)") else ("FALLBACK" if not loaded and lvl not in ("1 (bottom)", "6", "7 (top)") else "")
-                tag = f"  [{status}]" if status else ""
-                print(f"[HUD]   Layer {lvl}: {desc}{tag}")
-            print("[HUD] ─────────────────────────────────────────────────")
-
         draw_col = 0
         for i, track in enumerate(tracks):
             group_idx = i // 9

@@ -186,7 +186,7 @@ _redraw_timer_registered = False
 # Windows. These exist to answer "is it actually running at 24fps" with
 # real numbers instead of another guess: DEBUG = False makes this a no-op
 # once we've got what we need.
-DEBUG                = True
+DEBUG                = False
 _dbg_redraws_total   = 0
 _dbg_last_report_t   = 0.0
 _dbg_last_report_n   = 0

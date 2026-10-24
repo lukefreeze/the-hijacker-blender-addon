@@ -873,13 +873,11 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                 and _mxst.get('text_focus') is not None
                 and _mxst.get('text_rack', -1) >= 0
                 and event.value == "PRESS"):
-            print(f"[MIXDOWN DEBUG] keyboard event: type={event.type!r} unicode={event.unicode!r} focus={_mxst['text_focus']} buf={_mxst['text_buf']!r}")
             _buf = _mxst['text_buf']
             _commit = False
             _handled = True
             if event.type == "BACK_SPACE":
                 _mxst['text_buf'] = _buf[:-1]
-                print(f"[MIXDOWN DEBUG] BACKSPACE → buf now {_mxst['text_buf']!r}")
             elif event.type == "DEL":
                 _mxst['text_buf'] = ''
             elif event.type in {"RET", "NUMPAD_ENTER"}:
@@ -891,16 +889,13 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
             elif event.unicode and event.unicode.isdigit():
                 if len(_buf) < 6:
                     _mxst['text_buf'] = _buf + event.unicode
-                print(f"[MIXDOWN DEBUG] digit {event.unicode!r} → buf now {_mxst['text_buf']!r}")
             else:
                 _handled = False
-                print(f"[MIXDOWN DEBUG] unhandled key type={event.type!r}")
             if _commit:
                 _param = _mxst['text_focus']
                 _buf2  = _mxst['text_buf']
                 _racks = getattr(context.scene, "pb_racks", [])
                 _ri    = _mxst['text_rack']
-                print(f"[MIXDOWN DEBUG] COMMIT param={_param} buf={_buf2!r}")
                 if _buf2.isdigit() and _ri < len(_racks):
                     setattr(_racks[_ri], _param, float(max(1, int(_buf2))))
                 _mxst['text_focus'] = None
@@ -910,12 +905,6 @@ class VSE_OT_PB_Interaction(bpy.types.Operator):
                 context.area.tag_redraw()
                 return {"RUNNING_MODAL"}
 
-        # Also print if we have focus but event.value != PRESS to see what's arriving
-        if (_mxst is not None
-                and _mxst.get('text_focus') is not None
-                and event.value != "PRESS"
-                and event.type not in {"MOUSEMOVE", "INBETWEEN_MOUSEMOVE", "TIMER"}):
-            print(f"[MIXDOWN DEBUG] non-PRESS event while focused: type={event.type!r} value={event.value!r}")
 
         if event.type == "HOME" and event.value == "PRESS":
             SCROLL_X = 0.0

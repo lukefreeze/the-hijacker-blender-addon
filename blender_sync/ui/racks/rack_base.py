@@ -445,24 +445,10 @@ def _draw_spectrum(rx, ry, rw, rh, rack_idx, scale):
             print(f"[SPEC] packapunch screen sequence draw failed: {e}")
 
     if not _drew_bg:
-        try:
-            from ui.mixer.draw_utils import draw_element as _de
-            _rack_skin_key = {
-                "COMP_MULTI":  "rack_comp_multi_bg",
-                "COMP_SINGLE": "rack_comp_single_bg",
-                "EQ":          "rack_eq_bg",
-                "REVERB":      "rack_reverb_bg",
-                "NOISE_GATE":  "rack_noisegate_bg",
-                "DELAY":       "rack_delay_bg",
-                "BOOSTER":     "rack_booster_bg",
-                "MIXDOWN":     "rack_mixdown_bg",
-            }.get(getattr(rack, 'effect_type', ''), None)
-            if _rack_skin_key:
-                _de(_rack_skin_key, rx, ry, rw, rh, _draw_rect, (0.04, 0.04, 0.04, 1.0))
-            else:
-                _draw_rect(rx, ry, rw, rh, (0.04, 0.04, 0.04, 1.0))
-        except Exception:
-            _draw_rect(rx, ry, rw, rh, (0.04, 0.04, 0.04, 1.0))
+        # Plain dark backing. (A per-rack skin lookup used to live here but it
+        # referenced `rack` before assignment, always raised, and fell through
+        # to this same rectangle, so the shipped look is unchanged.)
+        _draw_rect(rx, ry, rw, rh, (0.04, 0.04, 0.04, 1.0))
     # PackAPunch: graph / curve fade out when the rack is switched off and snap
     # back on with it (see _sb_lights_power). _ga multiplies every alpha below.
     _ga = _sb_lights_power(rack_idx) if _is_packapunch else 1.0
