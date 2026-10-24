@@ -299,6 +299,100 @@ def _draw_wave(px, py, pw, ph, scale, data, rgb, label, placeholder=None, has_sk
 # ---------------------------------------------------------------------------
 # Main body draw
 # ---------------------------------------------------------------------------
+# ── Engine-missing setup screen (same pattern as the Whisper/Demucs racks) ────
+_WARN_BG     = (0.06, 0.04, 0.00, 1.0)
+_WARN_BORDER = (0.55, 0.33, 0.00, 1.0)
+_WARN_TEXT   = (0.86, 0.53, 0.00, 1.0)
+_WARN_DIM    = (0.50, 0.28, 0.00, 1.0)
+
+
+def _fill(x, y, w, h, col):
+    _draw_rect(x, y, w, h, col)
+
+
+def _outline(x, y, w, h, col):
+    sh = gpu.shader.from_builtin("UNIFORM_COLOR")
+    b = batch_for_shader(sh, "LINE_STRIP",
+                         {"pos": [(x, y), (x + w, y), (x + w, y + h), (x, y + h), (x, y)]})
+    sh.bind(); sh.uniform_float("color", col); b.draw(sh)
+
+
+def _draw_engine_warning(rx, ry, rw, rh, scale):
+    """Setup card shown while the Piper engine isn't installed. Returns the
+    (x, y, w, h) of the INSTALL / CANCEL button for hit-testing."""
+    from core import ai_piper as _ap
+    mg = 8 * scale
+    bw = rw - mg * 4
+    bh = min(rh * 0.88, 190 * scale)
+    bx = rx + (rw - bw) / 2
+    by = ry + (rh - bh) / 2
+    _fill(bx, by, bw, bh, _WARN_BG)
+    _fill(bx, by, 4 * scale, bh, _WARN_TEXT)
+    _outline(bx, by, bw, bh, _WARN_BORDER)
+
+    tx   = bx + 14 * scale
+    fs_h = max(1, int(9 * scale))
+    fs_b = max(1, int(8 * scale))
+    fs_s = max(1, int(7 * scale))
+    lh   = fs_b + 5 * scale
+    ty   = by + bh - fs_h - 8 * scale
+
+    _draw_text("PIPER ENGINE NOT INSTALLED", tx, ty, fs_h, _WARN_TEXT)
+    ty -= lh * 1.5
+    _draw_text("Manual install - download the release for your system:", tx, ty, fs_b, _WARN_DIM)
+    ty -= lh * 1.2
+    cw = bw - 28 * scale; ch = lh * 1.6 + 6 * scale; cx2 = tx; cy2 = ty - ch
+    _fill(cx2, cy2, cw, ch, (0.02, 0.01, 0.00, 1.0))
+    _outline(cx2, cy2, cw, ch, (0.44, 0.24, 0.00, 1.0))
+    _draw_text("github.com/rhasspy/piper/releases/tag/" + _ap._ENGINE_VERSION,
+               cx2 + 6 * scale, cy2 + ch / 2 - fs_b / 2, fs_b, _WARN_TEXT)
+    ty = cy2 - lh * 1.2
+    sub = _ap.engine_target()[1]
+    _draw_text("then unzip it into  ai_engines/piper/" + sub + "/", tx, ty, fs_s, _WARN_DIM)
+    ty -= lh
+    _draw_text("Or press the button: it downloads Piper and a starter voice (~80 MB).",
+               tx, ty, fs_s, _WARN_DIM)
+    ty -= lh
+    _draw_text("Works fully offline afterwards.", tx, ty, fs_s, _WARN_DIM)
+
+    lines, btn_lbl, kind = _ap.get_engine_progress_display()
+
+    dw = min(170 * scale, bw * 0.44); dh = max(16 * scale, fs_s + 8 * scale)
+    dx2 = bx + bw - dw - 12 * scale; dy2 = by + 8 * scale
+
+    if kind == "busy":
+        import time as _t
+        pct = max(0.0, min(100.0, _ap.get_engine_state()["pct"])) / 100.0
+        bar_w = bw - 28 * scale; bar_h = max(3 * scale, 3)
+        bar_y = dy2 + dh + 5 * scale
+        _fill(tx, bar_y, bar_w, bar_h, (0.10, 0.07, 0.0, 1.0))
+        _fill(tx, bar_y, bar_w * pct, bar_h, _WARN_TEXT)
+        if lines:
+            _draw_text(lines[0], tx, dy2 + dh / 2 - fs_s / 2, fs_s, _WARN_TEXT)
+        d_bg, d_edge = (0.06, 0.04, 0.00, 1.0), _WARN_DIM
+    elif kind == "error":
+        if lines:
+            _draw_text(lines[0][:60], tx, dy2 + dh / 2 - fs_s / 2, fs_s, (1.0, 0.45, 0.4, 1.0))
+        d_bg, d_edge = (0.10, 0.02, 0.02, 1.0), (1.0, 0.35, 0.3, 1.0)
+    else:
+        d_bg, d_edge = (0.10, 0.06, 0.00, 1.0), _WARN_BORDER
+
+    _fill(dx2, dy2, dw, dh, d_bg)
+    _outline(dx2, dy2, dw, dh, d_edge)
+    tw_d = _text_width(btn_lbl, fs_s)
+    _draw_text(btn_lbl, dx2 + dw / 2 - tw_d / 2, dy2 + dh / 2 - fs_s / 2, fs_s, _WARN_TEXT)
+    return dx2, dy2, dw, dh
+
+
+def _start_piper_engine_install():
+    """Button handler: install, or cancel if an install is already running."""
+    from core import ai_piper as _ap
+    if _ap.is_engine_installing():
+        _ap.cancel_engine_install()
+    else:
+        _ap.start_engine_install()
+
+
 def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
     """Draw the Piper TTS rack body below the rail."""
 
@@ -321,6 +415,25 @@ def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
         _has_skin = _gtc_pp("rack_piper_bg") is not None
     except Exception:
         _has_skin = False
+
+    # Engine not installed (the add-on ships without Piper): show the setup
+    # card with the manual instructions + auto-install button instead of the UI.
+    try:
+        from core import ai_piper as _ap_chk
+        _engine_ok = _ap_chk.piper_engine_present()
+    except Exception:
+        _engine_ok = True
+    if not _engine_ok:
+        _draw_rect(rx, body_bot, rw, body_h, _BG)
+        bv0 = [(rx,body_bot),(rx+rw,body_bot),(rx+rw,body_top),(rx,body_top),(rx,body_bot)]
+        sh0 = gpu.shader.from_builtin("UNIFORM_COLOR")
+        b0  = batch_for_shader(sh0, "LINE_STRIP", {"pos": bv0})
+        sh0.bind(); sh0.uniform_float("color", _BORDER); b0.draw(sh0)
+        try:
+            rack['piper_setup_btn'] = _draw_engine_warning(rx, body_bot, rw, body_h, scale)
+        except Exception as _e_w:
+            print(f"[PIPER] setup card error: {_e_w}")
+        return
 
     sbar_h   = max(16*scale, body_h * 0.065)
     sbar_y   = body_bot

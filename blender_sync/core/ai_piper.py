@@ -16,6 +16,7 @@
 
 import os
 import platform
+import shutil
 import subprocess
 import threading
 import tempfile
@@ -332,6 +333,248 @@ def download_voice(voice_key):
             print(f"[PIPER] voice download failed ({voice_key}): {e}")
 
     threading.Thread(target=_worker, name=f"PiperVoiceDL_{voice_key}", daemon=True).start()
+    _ensure_redraw_timer()
+
+
+# ---------------------------------------------------------------------------
+# Piper ENGINE download — the repo and add-on zip do not ship Piper itself.
+# One click on the rack's setup screen downloads the official release for this
+# OS from github.com/rhasspy/piper, unpacks it into ai_engines/piper/<platform>/
+# and then fetches a starter voice so the rack works straight away.
+# ---------------------------------------------------------------------------
+_ENGINE_VERSION    = "2023.11.14-2"
+_ENGINE_RELEASE    = "https://github.com/rhasspy/piper/releases/tag/" + _ENGINE_VERSION
+_ENGINE_BASE_URL   = "https://github.com/rhasspy/piper/releases/download/" + _ENGINE_VERSION + "/"
+# Path of the starter voice inside the rhasspy/piper-voices repo (no extension).
+STARTER_VOICE_PATH = "en/en_US/lessac/medium/en_US-lessac-medium"
+
+_engine_state  = {"status": "IDLE", "pct": 0.0, "msg": "", "error": ""}
+_engine_cancel = False
+_present_cache = {"t": 0.0, "v": False}
+
+
+def engine_target():
+    """(archive_name, platform_subfolder, exe_name) for this machine."""
+    system  = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "windows":
+        return "piper_windows_amd64.zip", "win_64", "piper.exe"
+    if system == "darwin":
+        if "arm" in machine:
+            return "piper_macos_aarch64.tar.gz", "macos_arm", "piper"
+        return "piper_macos_x64.tar.gz", "macos_x64", "piper"
+    if "aarch64" in machine or "arm64" in machine:
+        return "piper_linux_aarch64.tar.gz", "linux_arm64", "piper"
+    return "piper_linux_x86_64.tar.gz", "linux_x64", "piper"
+
+
+def engine_install_dir():
+    return os.path.join(_PIPER_DIR, engine_target()[1])
+
+
+def piper_engine_present(max_age=1.0):
+    """Quiet, cached 'is there a piper executable?' check — safe to call
+    every frame from draw code (the noisy _get_piper_exe() is not)."""
+    import time as _t
+    now = _t.time()
+    if now - _present_cache["t"] < max_age:
+        return _present_cache["v"]
+    exe_name = engine_target()[2]
+    found = False
+    try:
+        cands = [os.path.join(_PIPER_DIR, exe_name)]
+        if os.path.isdir(_PIPER_DIR):
+            for entry in os.listdir(_PIPER_DIR):
+                cands.append(os.path.join(_PIPER_DIR, entry, exe_name))
+        found = any(os.path.isfile(c) for c in cands)
+    except Exception:
+        found = False
+    _present_cache["t"] = now
+    _present_cache["v"] = found
+    return found
+
+
+def get_engine_state():
+    return dict(_engine_state)
+
+
+def is_engine_installing():
+    return _engine_state["status"] in ("DOWNLOADING", "EXTRACTING", "VOICE")
+
+
+def get_engine_progress_display():
+    """(lines, button_label, kind) — same shape as ai_pydeps.get_progress_display."""
+    st = _engine_state["status"]
+    if st == "ERROR":
+        return ([_engine_state["error"][:70]], "RETRY  >", "error")
+    if st in ("DOWNLOADING", "EXTRACTING", "VOICE"):
+        pct = int(_engine_state["pct"])
+        return ([f'{_engine_state["msg"]}  {pct}%'], "CANCEL", "busy")
+    return ([], "DOWNLOAD & INSTALL  >", "idle")
+
+
+def cancel_engine_install():
+    global _engine_cancel
+    if is_engine_installing():
+        _engine_cancel = True
+
+
+class _EngineCancelled(Exception):
+    pass
+
+
+def _engine_download(url, dest, pct_lo, pct_hi, msg):
+    import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": _HTTP_USER_AGENT})
+    tmp = dest + ".part"
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        total = int(resp.headers.get("Content-Length", 0)) or 0
+        done = 0
+        with open(tmp, "wb") as f:
+            while True:
+                if _engine_cancel:
+                    raise _EngineCancelled()
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                frac = min(1.0, done / total) if total else 0.0
+                _engine_state.update(pct=pct_lo + frac * (pct_hi - pct_lo), msg=msg)
+    os.replace(tmp, dest)
+
+
+def _safe_join(base, *parts):
+    dest = os.path.normpath(os.path.join(base, *parts))
+    if os.path.commonpath([os.path.abspath(base), os.path.abspath(dest)]) != os.path.abspath(base):
+        raise ValueError("unsafe path in archive: " + "/".join(parts))
+    return dest
+
+
+def _extract_engine(archive, dest_dir):
+    """Unpack a Piper release into dest_dir, dropping the archive's leading
+    'piper/' folder. Rejects any entry that would land outside dest_dir."""
+    os.makedirs(dest_dir, exist_ok=True)
+
+    def _parts(name):
+        p = [x for x in name.replace("\\", "/").split("/") if x not in ("", ".")]
+        if p and p[0] == "piper":
+            p = p[1:]
+        return p
+
+    if archive.endswith(".zip"):
+        import zipfile
+        with zipfile.ZipFile(archive) as z:
+            members = z.infolist()
+            for i, m in enumerate(members):
+                if _engine_cancel:
+                    raise _EngineCancelled()
+                parts = _parts(m.filename)
+                if not parts:
+                    continue
+                target = _safe_join(dest_dir, *parts)
+                if m.is_dir():
+                    os.makedirs(target, exist_ok=True)
+                else:
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with z.open(m) as src, open(target, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                _engine_state.update(pct=60 + 10.0 * (i + 1) / max(1, len(members)))
+    else:
+        import tarfile
+        with tarfile.open(archive, "r:*") as t:
+            members = t.getmembers()
+            for i, m in enumerate(members):
+                if _engine_cancel:
+                    raise _EngineCancelled()
+                parts = _parts(m.name)
+                if not parts:
+                    continue
+                target = _safe_join(dest_dir, *parts)
+                if m.isdir():
+                    os.makedirs(target, exist_ok=True)
+                elif m.issym():
+                    link = m.linkname
+                    # only plain sibling links (libfoo.dylib -> libfoo.1.dylib)
+                    if os.path.isabs(link) or ".." in link.replace("\\", "/").split("/"):
+                        continue
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    if os.path.lexists(target):
+                        os.remove(target)
+                    os.symlink(link, target)
+                elif m.isfile():
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with t.extractfile(m) as src, open(target, "wb") as out:
+                        shutil.copyfileobj(src, out)
+                _engine_state.update(pct=60 + 10.0 * (i + 1) / max(1, len(members)))
+
+
+def start_engine_install():
+    """Download + install the Piper engine and a starter voice, in the
+    background. Poll get_engine_progress_display() for UI state."""
+    global _engine_cancel
+    if is_engine_installing():
+        return
+    if not is_online_access_allowed():
+        _engine_state.update(status="ERROR", pct=0.0, msg="",
+                             error="Online access is disabled in Blender preferences")
+        return
+    _engine_cancel = False
+    _engine_state.update(status="DOWNLOADING", pct=0.0, msg="Downloading Piper", error="")
+
+    archive_name, sub, exe_name = engine_target()
+    dest_dir = os.path.join(_PIPER_DIR, sub)
+
+    def _worker():
+        tmp_dir = tempfile.mkdtemp(prefix="hijacker_piper_")
+        try:
+            archive = os.path.join(tmp_dir, archive_name)
+            _engine_download(_ENGINE_BASE_URL + archive_name, archive, 0, 60, "Downloading Piper")
+            _engine_state.update(status="EXTRACTING", pct=60.0, msg="Unpacking")
+            _extract_engine(archive, dest_dir)
+
+            if platform.system().lower() != "windows":
+                import stat as _stat
+                for n in (exe_name, "espeak-ng", "piper_phonemize"):
+                    p = os.path.join(dest_dir, n)
+                    if os.path.isfile(p):
+                        os.chmod(p, os.stat(p).st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+            if not os.path.isfile(os.path.join(dest_dir, exe_name)):
+                raise RuntimeError("download unpacked but " + exe_name + " was not found")
+            _present_cache["t"] = 0.0
+
+            # Starter voice so the rack can speak immediately (skipped if the
+            # user already has any voice installed).
+            if not _discover_voices():
+                _engine_state.update(status="VOICE", pct=70.0, msg="Downloading starter voice")
+                try:
+                    os.makedirs(_VOICES_DIR, exist_ok=True)
+                    base = os.path.basename(STARTER_VOICE_PATH)
+                    onnx = os.path.join(_VOICES_DIR, base + ".onnx")
+                    _engine_download(_VOICE_FILES_BASE + STARTER_VOICE_PATH + ".onnx", onnx, 70, 98,
+                                     "Downloading starter voice")
+                    _engine_download(_VOICE_FILES_BASE + STARTER_VOICE_PATH + ".onnx.json",
+                                     onnx + ".json", 98, 100, "Downloading starter voice")
+                except _EngineCancelled:
+                    raise
+                except Exception as ve:
+                    print(f"[PIPER] starter voice download failed (engine is installed): {ve}")
+            _engine_state.update(status="DONE", pct=100.0, msg="Installed", error="")
+            print("[PIPER] engine installed")
+        except _EngineCancelled:
+            _engine_state.update(status="IDLE", pct=0.0, msg="", error="")
+            print("[PIPER] engine install cancelled")
+        except Exception as e:
+            _engine_state.update(status="ERROR", pct=0.0, msg="", error=str(e) or type(e).__name__)
+            print(f"[PIPER] engine install failed: {e}")
+        finally:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+            _present_cache["t"] = 0.0
+
+    threading.Thread(target=_worker, name="PiperEngineInstall", daemon=True).start()
     _ensure_redraw_timer()
 
 
@@ -703,6 +946,7 @@ def _redraw_timer():
     any_active = (any(t.is_alive() for t in _active_jobs.values()) or
                   bool(_pending_finish) or
                   _catalog_status == "LOADING" or
+                  is_engine_installing() or
                   any(s.get("status") == "DOWNLOADING" for s in _download_state.values()))
     return 0.25 if any_active else None
 

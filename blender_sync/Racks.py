@@ -5315,6 +5315,17 @@ def _draw_ai_rack_expanded(rx, ry, rw, rh, rack, ai_idx, scale):
         except Exception:
             pass
 
+    # Piper: the engine is downloaded on demand, so until it's installed show
+    # the flat setup card (rack_piper._draw_engine_warning) instead of the
+    # finished rack art - same reasoning as the Whisper/Demucs gating above.
+    if rack.ai_type == "PIPER_TTS" and _ai_bg_tex is not None:
+        try:
+            from core.ai_piper import piper_engine_present as _pp_engine_ready
+            if not _pp_engine_ready():
+                _ai_bg_tex = None
+        except Exception:
+            pass
+
     if _ai_bg_tex is not None:
         from ui.mixer.texture_cache import blit_texture as _blt_aibg
         _blt_aibg(_ai_bg_tex, rx, ry, rw, rh, key=_ai_bg_key)
@@ -6027,8 +6038,25 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             except Exception as _e_knh:
                 print(f"[AI RACKS] kNN-VC packApunch hit-test error: {_e_knh}")
 
-        # Piper on the packApunch skin: art-coordinate click zones (rack_piper.piper_pp_hit)
+        # Piper engine not installed: the rack shows the setup card instead of
+        # its UI, so only the card's INSTALL/CANCEL button is live (the rail's
+        # collapse / delete / on-off still work via the generic code below).
+        _piper_missing = False
         if rack.ai_type == "PIPER_TTS" and not rack.collapsed:
+            try:
+                from core.ai_piper import piper_engine_present as _pi_eng_ok
+                _piper_missing = not _pi_eng_ok()
+                if _piper_missing:
+                    _pgeom = rack.get('piper_setup_btn')
+                    if _pgeom:
+                        _px, _py, _pw, _ph = _pgeom
+                        if _px <= mouse_x <= _px + _pw and _py <= mouse_y <= _py + _ph:
+                            return {'zone': 'ai_piper_install', 'ai_idx': ai_idx}
+            except Exception as _e_pieng:
+                print(f"[AI RACKS] Piper engine hit-test error: {_e_pieng}")
+
+        # Piper on the packApunch skin: art-coordinate click zones (rack_piper.piper_pp_hit)
+        if rack.ai_type == "PIPER_TTS" and not rack.collapsed and not _piper_missing:
             try:
                 from ui.racks.rack_piper import piper_pp_active as _pi_pp_on2, piper_pp_hit as _pi_pp_hit
                 if _pi_pp_on2():
@@ -6117,7 +6145,7 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             return {'zone': 'ai_on_off', 'ai_idx': ai_idx}
 
         # Piper TTS: CLEAR button, voice cards, and knob hit testing
-        if rack.ai_type == "PIPER_TTS" and not rack.collapsed:
+        if rack.ai_type == "PIPER_TTS" and not rack.collapsed and not _piper_missing:
             _r_h_p   = RACK_RAIL_H * scale
             _bb_p    = rack_y
             _bt_p    = rack_y + rack_h - _r_h_p
@@ -7990,6 +8018,15 @@ def handle_ai_rack_click(hit, context):
             bpy.ops.vse.whisper_browse_srt('INVOKE_DEFAULT', ai_idx=i)
         except Exception as e:
             print(f"[WHISPER] SRT browse error: {e}")
+        return True
+
+    # Piper — download the engine + a starter voice (or cancel a running install)
+    if zone == 'ai_piper_install':
+        try:
+            from ui.racks.rack_piper import _start_piper_engine_install
+            _start_piper_engine_install()
+        except Exception as e:
+            print(f"[PIPER] engine install trigger failed: {e}")
         return True
 
     # Whisper — install faster-whisper into the addon's managed venv
