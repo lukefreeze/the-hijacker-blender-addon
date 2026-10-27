@@ -1,0 +1,40 @@
+name: Engine tests
+
+# Runs the audio engine test suite (tests/engine) against a fake PortAudio.
+# No sound hardware is needed.
+
+on:
+  push:
+    branches: [ feature/hijacker-engine, feature/audio-engine-hardening ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python packages
+        # scipy: loudness reference. bpy: Blender as a Python module, for the keyframed-volume test
+        # (that test is skipped where bpy is not installed).
+        run: pip install numpy pybind11 scipy bpy==4.5.14
+      - name: Engine tests, stress and sanitizers
+        run: python tests/engine/run_tests.py --sanitize --pybind
+
+  macos:
+    runs-on: macos-latest
+    # Informational: the functional tests only (the sanitizer runtimes differ on macOS).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python packages
+        run: pip install numpy pybind11 scipy
+      - name: Engine tests
+        run: python tests/engine/run_tests.py --pybind

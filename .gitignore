@@ -23,7 +23,63 @@ out/
 *.pdb
 *.sln
 *.vcxproj
+*.pyd
+*.exp
 
 # --- OS Junk ---
 .DS_Store
 Thumbs.db
+
+# --- Project specific ---
+DAW_Research/DeepFilterNet/
+deps/
+include/blender-4.5/
+blender_sync/Loader_working.py
+
+# --- Large audio / output files ---
+blender_sync/ai_engines/knnvc/voices/*.wav
+blender_sync/voicefixer_output/
+blender_sync/bridge/
+blender_sync/ui/assets/skins/working/
+
+blender_sync/ui/assets/skins/working/
+
+blender_sync/ui/assets/skins/working/
+blender_sync/ui/PackAPunch.mp3
+
+TheHijacker-beta.zip
+_zip_staging/
+
+# --- Working backups / scratch (never commit) ---
+*.bak
+*.bak_*
+*.bak.*
+_to_delete/
+_tmp_trench/
+_zip_staging/
+Claude outputs/
+
+# --- Generated PACK-A-PUNCH transition frames (~300MB; keep out of git) ---
+blender_sync/ui/assets/packapunch/frames/*.png
+
+# Engine test build output
+tests/engine/_build/
+
+# --- Third-party engines / models: never committed (downloaded on demand) ---
+DAW_Research/
+blender_sync/ai_engines/piper/win_64/
+blender_sync/ai_engines/piper/macos_arm/
+blender_sync/ai_engines/piper/macos_x64/
+blender_sync/ai_engines/piper/linux_x64/
+blender_sync/ai_engines/piper/voices/
+*.onnx
+*.onnx.json
+*.ort
+*.dylib
+Morgan Freeman.wav
+
+# Release zips
+TheHijacker-*.zip
+
+# Full-size source transition frames (kept locally, never committed)
+_source_frames_full/

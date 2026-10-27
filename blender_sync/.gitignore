@@ -1,0 +1,10 @@
+﻿# Build artefacts
+ai_engines/piper/voices/
+
+# Bundled library (installed separately)
+lib/
+wheels/
+
+# Temp audio exports
+pb_wsp_*.wav
+pb_piper_*.wav

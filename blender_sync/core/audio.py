@@ -1,0 +1,1636 @@
+# =============================================================================
+# core/audio.py
+# All audio processing: fader logic, effect chain, channel sound building,
+# playback handlers, timeline building, and engine enable/disable.
+# =============================================================================
+
+import os
+import sys
+import math
+import atexit
+import tempfile
+import time as _time
+
+import bpy
+
+from core.engine import get_engine
+from core import vse_compat as _vse
+from core import strip_volume as _sv
+
+
+# ---------------------------------------------------------------------------
+# These timelines are read by Racks.py for waveform display.
+# They are module-level so Racks can import them directly.
+# ---------------------------------------------------------------------------
+_fft_timeline          = {}
+_fft_timeline_full     = {}
+_gr_timeline           = {}
+_gr_timeline_full      = {}
+_gate_timeline         = {}
+_gate_timeline_full    = {}
+_fft_timeline_eq_input = {}
+
+# ---------------------------------------------------------------------------
+# Audio engine state
+# ---------------------------------------------------------------------------
+_pb_original_device = 'OpenAL'  # restored on HUD close
+_pb_channels      = {}
+_pb_start_wall    = 0.0
+_pb_start_frame   = 0
+_pb_engine_active   = False
+_pb_eq_pending      = {}        # channel_idx -> scheduled rebuild time
+_pb_eq_debounce     = 0.25      # seconds to wait after last knob move before rebuilding
+_pb_last_frame      = -1        # last known frame, for loop jump detection
+_pb_last_loop_time  = 0.0       # wall time of last loop restart (cooldown)
+_pb_proc_wav_cache  = {}        # channel_idx -> last processed wav path (for instant loop restart)
+_pb_full_wav_cache  = {}        # channel_idx -> full-track wav from frame_start (clean loop replay)
+
+
+def apply_fader_to_channel(channel_idx, old_fader, new_fader):
+    """Apply fader change — multiplies each strip's volume by the new/old ratio.
+    Both fader and gain have a minimum of 0.001 so the ratio never reaches
+    zero and the user's own strip volume is always recoverable. The strip
+    value is deliberately NOT clamped: a clamp would overwrite quiet or
+    zero values the user set. If the strip's volume is keyframed, the
+    keyframes are scaled as well (see core/strip_volume.py)."""
+    scene = bpy.context.scene
+    if not scene or not scene.sequence_editor: return
+    if abs(new_fader - old_fader) < 1e-6: return
+    old_fader = max(old_fader, 0.001)
+    ratio = new_fader / old_fader
+    for strip in _vse.get_all_strips(scene.sequence_editor):
+        if strip.type != "SOUND": continue
+        if (strip.channel - 1) != channel_idx: continue
+        _sv.scale_volume(strip, ratio)
+    _pb_engine_update_volume(channel_idx)
+
+
+def apply_gain_to_channel(channel_idx, old_gain, new_gain):
+    """Apply gain change — multiplies each strip's volume (and keyframes) by the new/old ratio."""
+    scene = bpy.context.scene
+    if not scene or not scene.sequence_editor: return
+    if abs(new_gain - old_gain) < 1e-6: return
+    old_gain = max(old_gain, 0.001)
+    ratio = new_gain / old_gain
+    for strip in _vse.get_all_strips(scene.sequence_editor):
+        if strip.type != "SOUND": continue
+        if (strip.channel - 1) != channel_idx: continue
+        _sv.scale_volume(strip, ratio)
+    _pb_engine_update_volume(channel_idx)
+
+
+# ---------------------------------------------------------------------------
+# One-shot preview playback — plays a WAV file without touching aud.Device()
+# or the Hijacker engine.  Uses platform-native playback in a subprocess so
+# there is zero risk of conflicting with WASAPI.
+# Returns a handle object with a .stop() method and .status property so
+# callers (rack previews, watchdog timers) work the same as before.
+# ---------------------------------------------------------------------------
+
+class _OneshotHandle:
+    """Thin wrapper around a subprocess so callers get stop()/status."""
+    def __init__(self, proc):
+        self._proc = proc
+
+    @property
+    def status(self):
+        """True while audio is still playing."""
+        return self._proc is not None and self._proc.poll() is None
+
+    def stop(self):
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+
+class _WinsoundHandle:
+    """Same stop()/status interface as _OneshotHandle, for the winsound
+    path below. winsound has no subprocess to poll, so status is a
+    duration estimate from the WAV's own header — accurate in practice
+    since WinMM playback timing doesn't drift the way a busy Python
+    process might. stop() calls SND_PURGE, which stops every sound this
+    process started via winsound — fine here since nothing else in the
+    addon plays audio through winsound, only through play_oneshot()."""
+    def __init__(self, duration_s):
+        self._start    = _time.perf_counter()
+        self._duration = duration_s
+        self._stopped  = False
+
+    @property
+    def status(self):
+        if self._stopped:
+            return False
+        if self._duration is None:
+            return True  # unknown length — assume playing until stop() is called
+        return (_time.perf_counter() - self._start) < self._duration
+
+    def stop(self):
+        self._stopped = True
+        try:
+            import winsound
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        except Exception:
+            pass
+
+
+def _probe_wav_duration(path):
+    """Length of a WAV file in seconds, or None if it can't be read —
+    used only to drive _WinsoundHandle.status's estimate above."""
+    try:
+        import wave
+        with wave.open(path, 'rb') as wf:
+            frames = wf.getnframes()
+            rate   = wf.getframerate()
+            return (frames / float(rate)) if rate else None
+    except Exception:
+        return None
+
+
+_oneshot_handles = []  # keep references alive
+
+
+def play_oneshot(filepath):
+    """Play a WAV file without touching aud.Device or the Hijacker engine.
+    Returns a handle with stop() and .status.
+    Safe to call at any time — no WASAPI conflict possible.
+
+    On Windows this plays via winsound (a thin wrapper over the WinMM
+    PlaySound API) instead of spawning a PowerShell subprocess to host a
+    .NET Media.SoundPlayer. Same isolation guarantee as before — winsound
+    never touches aud.Device() or the Hijacker engine either — but without
+    the ~100-300ms it takes just to start a new PowerShell process before
+    anything is audible. That startup latency was small enough to ignore
+    while other things in this feature were badly desynced, but once
+    those got fixed it became the visible "audio starts a beat after the
+    video" gap. winsound.PlaySound(..., SND_ASYNC) returns almost
+    immediately and the OS starts playback itself, so there's no process
+    launch sitting between calling this and hearing something.
+    """
+    global _oneshot_handles
+    # Trim dead handles
+    _oneshot_handles = [h for h in _oneshot_handles if h.status]
+    try:
+        import sys, subprocess
+        if sys.platform == 'win32':
+            import winsound
+            duration = _probe_wav_duration(filepath)
+            winsound.PlaySound(filepath, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            handle = _WinsoundHandle(duration)
+        else:
+            if sys.platform == 'darwin':
+                cmd = ['afplay', filepath]
+            else:
+                cmd = ['aplay', filepath]
+            proc   = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+            handle = _OneshotHandle(proc)
+        _oneshot_handles.append(handle)
+        print(f"[AUDIO] play_oneshot: {filepath}")
+        return handle
+    except Exception as e:
+        print(f"[AUDIO] play_oneshot error: {e}")
+        return _OneshotHandle(None)
+
+
+def stop_all_oneshots():
+    """Stop any currently playing one-shot previews."""
+    global _oneshot_handles
+    for h in _oneshot_handles:
+        h.stop()
+    _oneshot_handles = []
+
+
+# play_oneshot() spawns a genuinely separate OS process (PowerShell/afplay/
+# aplay) to play the file — that process has no inherent link to Blender's
+# own lifetime, so it happily keeps running (and keeps playing) even after
+# Blender's window closes, unless something explicitly kills it first.
+# unregister() covers the addon being disabled while Blender keeps running;
+# this atexit hook covers the far more common case of Blender itself
+# quitting — CPython's atexit callbacks still run during a normal
+# interpreter shutdown even though Blender doesn't call each addon's own
+# unregister() at that point. (A hard kill / crash bypasses this — nothing
+# running in-process can catch that — but that's not what was happening
+# here: this fixes the normal "closed Blender, sound kept playing" case.)
+atexit.register(stop_all_oneshots)
+
+
+# ---------------------------------------------------------------------------
+# Biquad EQ coefficient calculation
+# Based on Audio EQ Cookbook by Robert Bristow-Johnson.
+# sample_rate: Hz   gain_db: dB boost/cut   freq: Hz   Q: resonance (0.7 default)
+# ---------------------------------------------------------------------------
+
+def _biquad_low_shelf(gain_db, freq, sample_rate, Q=0.7):
+    """Low shelf filter coefficients (b, a) for aud.Sound.filter()."""
+    import math
+    A  = 10 ** (gain_db / 40.0)
+    w0 = 2 * math.pi * freq / sample_rate
+    cw = math.cos(w0)
+    sw = math.sin(w0)
+    alpha = sw / (2 * Q)
+    sq    = 2 * math.sqrt(A) * alpha
+    b0 =  A * ((A+1) - (A-1)*cw + sq)
+    b1 =  2*A*((A-1) - (A+1)*cw)
+    b2 =  A * ((A+1) - (A-1)*cw - sq)
+    a0 =       (A+1) + (A-1)*cw + sq
+    a1 = -2  * ((A-1) + (A+1)*cw)
+    a2 =       (A+1) + (A-1)*cw - sq
+    return ([b0/a0, b1/a0, b2/a0], [1.0, a1/a0, a2/a0])
+
+def _biquad_high_shelf(gain_db, freq, sample_rate, Q=0.7):
+    """High shelf filter coefficients."""
+    import math
+    A  = 10 ** (gain_db / 40.0)
+    w0 = 2 * math.pi * freq / sample_rate
+    cw = math.cos(w0)
+    sw = math.sin(w0)
+    alpha = sw / (2 * Q)
+    sq    = 2 * math.sqrt(A) * alpha
+    b0 =  A * ((A+1) + (A-1)*cw + sq)
+    b1 = -2*A*((A-1) + (A+1)*cw)
+    b2 =  A * ((A+1) + (A-1)*cw - sq)
+    a0 =       (A+1) - (A-1)*cw + sq
+    a1 =  2  * ((A-1) - (A+1)*cw)
+    a2 =       (A+1) - (A-1)*cw - sq
+    return ([b0/a0, b1/a0, b2/a0], [1.0, a1/a0, a2/a0])
+
+def _biquad_peak(gain_db, freq, sample_rate, Q=1.0):
+    """Peaking EQ filter coefficients."""
+    import math
+    A     = 10 ** (gain_db / 40.0)
+    w0    = 2 * math.pi * freq / sample_rate
+    alpha = math.sin(w0) / (2 * Q)
+    cw    = math.cos(w0)
+    b0 = 1 + alpha * A
+    b1 = -2 * cw
+    b2 = 1 - alpha * A
+    a0 = 1 + alpha / A
+    a1 = -2 * cw
+    a2 = 1 - alpha / A
+    return ([b0/a0, b1/a0, b2/a0], [1.0, a1/a0, a2/a0])
+
+
+def _apply_effect_chain(samples, channel_idx, sr):
+    """Apply all racks assigned to channel_idx IN UI ORDER via the C++ engine.
+
+    Builds the engine's effect_chain slot table from scene.pb_racks in list
+    order, then makes a single process_buffer() call. The C++ engine runs
+    every enabled slot in slot order, so rack order is exactly respected.
+
+    Also captures the signal at the EQ input position (pre-EQ, post-compressor)
+    and stores it as _fft_timeline_eq_input[channel_idx] so the EQ spectrum
+    display reflects what is actually arriving at the EQ rack.
+
+    Returns (processed_np, pre_comp_np).
+    """
+    import numpy as _np
+
+    engine = get_engine()
+    scene  = bpy.context.scene
+    if not scene or not engine:
+        return samples, samples
+
+    try:
+        from Racks import get_rack_channels as _grc
+    except Exception:
+        return samples, samples
+
+    racks = getattr(scene, "pb_racks", [])
+    state = engine.get_state()
+
+    # Clear all effect slots for this channel
+    for slot in range(8):
+        try:
+            fx = state.get_effect_slot(channel_idx, slot)
+            fx.enabled = False
+            fx.type    = 0   # FX_NONE
+        except Exception:
+            pass
+
+    slot_idx      = 0
+    chain_log     = []
+    pre_comp      = samples.copy()
+    hit_comp      = False
+    eq_slot_start = None   # slot index where EQ first appears
+
+    for rack in racks:
+        if not rack.enabled:
+            continue
+        if channel_idx not in _grc(rack):
+            continue
+        if slot_idx >= 8:
+            break
+
+        etype = rack.effect_type
+
+        try:
+            fx = state.get_effect_slot(channel_idx, slot_idx)
+
+            if etype == "COMP_SINGLE":
+                if not hit_comp:
+                    hit_comp = True
+                fx.type    = engine.FX_COMP_SINGLE
+                fx.enabled = True
+                fx.params  = [rack.p0, rack.p1, rack.p2, rack.p3,
+                              rack.p4, rack.p5,
+                              0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                              0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                              0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                chain_log.append("COMP_SINGLE")
+                slot_idx += 1
+
+            elif etype == "COMP_MULTI":
+                if not hit_comp:
+                    hit_comp = True
+                fx.type    = engine.FX_COMP_MULTI
+                fx.enabled = True
+                fx.params  = [rack.p0,  rack.p1,  rack.p2,  rack.p3,
+                              rack.p4,  rack.p5,  rack.p6,  rack.p7,
+                              rack.p8,  rack.p9,  rack.p10, rack.p11,
+                              rack.p12, rack.p13, rack.p14, rack.p15,
+                              rack.p16, rack.p17, rack.p18, rack.p19,
+                              rack.p20, rack.p21, rack.p22, rack.p23]
+                chain_log.append("COMP_MULTI")
+                slot_idx += 1
+
+            elif etype == "EQ":
+                if eq_slot_start is None:
+                    eq_slot_start = slot_idx   # remember where EQ starts
+                fx.type    = engine.FX_EQ_PARAM
+                fx.enabled = True
+                fx.params  = ([getattr(rack, f'p{i}', 0.5 if i < 7 else 0.0)
+                               for i in range(21)] + [0.0, 0.0, 0.0])
+                chain_log.append("EQ7")
+                slot_idx += 1
+
+            elif etype == "REVERB":
+                fx.type    = engine.FX_REVERB_PARAM
+                fx.enabled = True
+                # p0=room, p1=damp, p2=wet, p3=pre_delay, p4=width
+                fx.params  = ([getattr(rack, f'p{i}', 0.0)
+                               for i in range(5)] + [0.0]*19)
+                chain_log.append("REVERB")
+                slot_idx += 1
+
+            elif etype == "NOISE_GATE":
+                fx.type    = engine.FX_GATE_PARAM
+                fx.enabled = True
+                # p0=threshold, p1=attack, p2=hold, p3=release, p4=range
+                fx.params  = ([getattr(rack, f'p{i}', 0.0)
+                               for i in range(5)] + [0.0]*19)
+                chain_log.append("GATE")
+                slot_idx += 1
+
+            elif etype == "DELAY":
+                fx.type    = engine.FX_DELAY_PARAM
+                fx.enabled = True
+                # p0=time, p1=feedback, p2=mix, p3=spread, p4=filter
+                fx.params  = ([getattr(rack, f'p{i}', 0.0)
+                               for i in range(5)] + [0.0]*19)
+                chain_log.append("DELAY")
+                slot_idx += 1
+
+        except Exception as _se:
+            print(f"[CHAIN] ch{channel_idx+1} slot{slot_idx} error: {_se}")
+
+    if not chain_log:
+        print(f"[CHAIN] ch{channel_idx+1} no active racks — audio unchanged")
+        return samples, samples
+
+    # --- Capture the signal at the EQ input ---
+    # If there are effects before the EQ, run just those slots first to get
+    # the intermediate signal, store it for the EQ spectrum display.
+    if eq_slot_start is not None and eq_slot_start > 0:
+        try:
+            # Temporarily disable all slots at and after the EQ
+            for s in range(eq_slot_start, 8):
+                try:
+                    state.get_effect_slot(channel_idx, s).enabled = False
+                except Exception:
+                    pass
+            # Run just the pre-EQ slots to get the EQ input signal
+            pre_eq_buf = _np.ascontiguousarray(samples, dtype=_np.float32)
+            pre_eq_sig = _np.asarray(
+                engine.process_buffer(channel_idx, pre_eq_buf, sr),
+                dtype=_np.float32)
+            # Store for the EQ spectrum display
+            _fft_timeline_eq_input[channel_idx] = pre_eq_sig
+            # Re-enable the EQ slots
+            for s in range(eq_slot_start, slot_idx):
+                try:
+                    state.get_effect_slot(channel_idx, s).enabled = True
+                except Exception:
+                    pass
+        except Exception as _ee:
+            # Non-fatal — EQ display falls back to full timeline
+            _fft_timeline_eq_input.pop(channel_idx, None)
+    else:
+        # No effects before EQ — EQ input IS the raw signal
+        _fft_timeline_eq_input[channel_idx] = samples
+
+    # --- Single process_buffer call — C++ runs all slots in order ---
+    try:
+        buf       = _np.ascontiguousarray(samples, dtype=_np.float32)
+        processed = _np.asarray(
+            engine.process_buffer(channel_idx, buf, sr),
+            dtype=_np.float32)
+        print(f"[CHAIN] ch{channel_idx+1}: {' → '.join(chain_log)}")
+
+        # Apply stereo pan post-effects (constant power law)
+        # pan=0.5 → centre, pan=0 → hard left, pan=1 → hard right
+        try:
+            import math as _mpan
+            tracks_pan = getattr(scene, 'pb_sync_tracks', [])
+            if channel_idx < len(tracks_pan):
+                pan = getattr(tracks_pan[channel_idx], 'pan', 0.5)
+                if abs(pan - 0.5) > 0.01 and processed.ndim == 2 and processed.shape[1] >= 2:
+                    angle   = pan * (_mpan.pi / 2.0)
+                    gain_l  = _mpan.cos(angle)
+                    gain_r  = _mpan.sin(angle)
+                    processed = processed.copy()
+                    processed[:, 0] *= gain_l
+                    processed[:, 1] *= gain_r
+        except Exception:
+            pass  # pan is non-critical — never block audio
+
+        return processed, pre_comp
+    except Exception as _pe:
+        print(f"[CHAIN] ch{channel_idx+1} process_buffer error: {_pe}")
+        return samples, samples
+
+
+def _pb_channel_volume(channel_idx):
+    """Return the channel fader volume for hj.set_volume().
+
+    strip.volume = original_strip_vol × fader × gain (all baked together).
+    seg.volume already carries the per-strip original volume (strip.volume / fader).
+    So hj.set_volume() only needs the fader — otherwise it would be double-applied.
+
+    Mute/solo short-circuit to 0.0 as before.
+    """
+    scene  = bpy.context.scene
+    tracks = getattr(scene, "pb_sync_tracks", []) if scene else []
+
+    if channel_idx < len(tracks) and tracks[channel_idx].mute:
+        return 0.0
+
+    soloed = {i for i, t in enumerate(tracks) if t.solo}
+    if soloed and channel_idx not in soloed:
+        return 0.0
+
+    if channel_idx < len(tracks):
+        # Multiply fader by gain so real-time gain knob changes
+        # take effect immediately without needing a playback restart.
+        return tracks[channel_idx].volume * tracks[channel_idx].gain
+    return 1.0
+
+
+def _pb_wire_rack_to_engine(channel_idx):
+    """Write rack compressor params into the C++ effect chain for a channel.
+    Called at play-start so the real-time DSP uses current knob values.
+    """
+    engine = get_engine()
+    if not engine:
+        return
+
+    scene = bpy.context.scene
+    if not scene:
+        return
+
+    racks  = getattr(scene, "pb_racks", [])
+    state  = engine.get_state()
+
+    # Clear all effect slots for this channel first
+    for slot in range(8):
+        try:
+            fx = state.get_effect_slot(channel_idx, slot)
+            fx.enabled = False
+            fx.type    = 0  # FX_NONE
+        except Exception:
+            pass
+
+    slot_idx = 0
+
+    print(f"[WIRE] ch{channel_idx+1} checking {len(racks)} racks")
+    for rack in racks:
+        if not rack.enabled:
+            continue
+
+        try:
+            from Racks import get_rack_channels
+            assigned = get_rack_channels(rack)
+        except Exception:
+            assigned = []
+
+        print(f"[WIRE]   rack type={rack.effect_type} assigned={assigned}")
+        if channel_idx not in assigned:
+            continue
+
+        etype = rack.effect_type
+
+        if etype == "COMP_SINGLE":
+            try:
+                fx         = state.get_effect_slot(channel_idx, slot_idx)
+                fx.type    = engine.FX_COMP_SINGLE
+                fx.enabled = True
+                fx.params  = [rack.p0, rack.p1, rack.p2, rack.p3,
+                              rack.p4, rack.p5,
+                              0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                              0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                              0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                slot_idx  += 1
+                print(f"[WIRE] ch{channel_idx+1} slot{slot_idx-1} "
+                      f"COMP_SINGLE thr={rack.p0:.2f} ratio={rack.p1:.2f} "
+                      f"knee={rack.p5:.2f}")
+            except Exception as e:
+                print(f"[WIRE] COMP_SINGLE failed: {e}")
+
+        elif etype == "COMP_MULTI":
+            try:
+                fx         = state.get_effect_slot(channel_idx, slot_idx)
+                fx.type    = engine.FX_COMP_MULTI
+                fx.enabled = True
+                fx.params  = [rack.p0,  rack.p1,  rack.p2,  rack.p3,
+                              rack.p4,  rack.p5,  rack.p6,  rack.p7,
+                              rack.p8,  rack.p9,  rack.p10, rack.p11,
+                              rack.p12, rack.p13, rack.p14, rack.p15,
+                              rack.p16, rack.p17, rack.p18, rack.p19,
+                              rack.p20, rack.p21, rack.p22, rack.p23]
+                slot_idx  += 1
+                print(f"[WIRE] ch{channel_idx+1} slot{slot_idx-1} "
+                      f"COMP_MULTI band0 thr={rack.p0:.2f} ratio={rack.p4:.2f}")
+            except Exception as e:
+                print(f"[WIRE] COMP_MULTI failed: {e}")
+
+        elif etype == "EQ":
+            # EQ now runs in C++ via FX_EQ_PARAM.
+            # Wire params into the slot so the GR metering chunk-loop
+            # also applies EQ correctly when it re-runs process_buffer.
+            try:
+                fx         = state.get_effect_slot(channel_idx, slot_idx)
+                fx.type    = engine.FX_EQ_PARAM
+                fx.enabled = True
+                fx.params  = ([getattr(rack, f'p{i}', 0.5 if i < 7 else 0.0)
+                               for i in range(21)] + [0.0, 0.0, 0.0])
+                slot_idx  += 1
+                print(f"[WIRE] ch{channel_idx+1} slot{slot_idx-1} EQ7 — C++ biquad")
+            except Exception as e:
+                print(f"[WIRE] EQ wiring failed: {e}")
+
+        elif etype == "REVERB":
+            try:
+                fx         = state.get_effect_slot(channel_idx, slot_idx)
+                fx.type    = engine.FX_REVERB_PARAM
+                fx.enabled = True
+                fx.params  = ([getattr(rack, f'p{i}', 0.0)
+                               for i in range(5)] + [0.0]*19)
+                slot_idx  += 1
+                print(f"[WIRE] ch{channel_idx+1} slot{slot_idx-1} REVERB "
+                      f"room={rack.p0:.2f} damp={rack.p1:.2f} wet={rack.p2:.2f}")
+            except Exception as e:
+                print(f"[WIRE] REVERB wiring failed: {e}")
+
+        elif etype == "NOISE_GATE":
+            try:
+                fx         = state.get_effect_slot(channel_idx, slot_idx)
+                fx.type    = engine.FX_GATE_PARAM
+                fx.enabled = True
+                fx.params  = ([getattr(rack, f'p{i}', 0.0)
+                               for i in range(5)] + [0.0]*19)
+                slot_idx  += 1
+                print(f"[WIRE] ch{channel_idx+1} slot{slot_idx-1} GATE "
+                      f"thr={rack.p0:.2f} atk={rack.p1:.2f} rel={rack.p3:.2f}")
+            except Exception as e:
+                print(f"[WIRE] GATE wiring failed: {e}")
+
+        elif etype == "DELAY":
+            try:
+                fx         = state.get_effect_slot(channel_idx, slot_idx)
+                fx.type    = engine.FX_DELAY_PARAM
+                fx.enabled = True
+                # p0=time, p1=feedback, p2=mix, p3=spread, p4=filter
+                fx.params  = ([getattr(rack, f'p{i}', 0.0)
+                               for i in range(5)] + [0.0]*19)
+                slot_idx  += 1
+                delay_ms = 1.0 + rack.p0 * 1999.0
+                print(f"[WIRE] ch{channel_idx+1} slot{slot_idx-1} DELAY "
+                      f"t={delay_ms:.0f}ms fb={rack.p1:.2f} mix={rack.p2:.2f} "
+                      f"ping={'Y' if rack.p3 > 0.5 else 'N'}")
+            except Exception as e:
+                print(f"[WIRE] DELAY wiring failed: {e}")
+
+        elif etype == "BOOSTER":
+            # BOOSTER is an offline export/reimport processor — no real-time DSP slot.
+            # Acknowledge it so the wire loop doesn't print "no rack assigned".
+            print(f"[WIRE] ch{channel_idx+1} BOOSTER — offline only, no DSP slot")
+
+        if slot_idx >= 8:
+            break
+
+    if slot_idx > 0:
+        print(f"[WIRE] ch{channel_idx+1} wired {slot_idx} effects — DSP ACTIVE")
+    else:
+        print(f"[WIRE] ch{channel_idx+1} no rack assigned")
+
+
+
+
+
+
+
+# =============================================================================
+# TRANSPORT — The Hijacker engine
+# =============================================================================
+# All playback is now handled by hijacker_engine (C++ PortAudio).
+# Python's role:
+#   1. At play-start: build segment playlists from VSE strips, send to engine
+#   2. Wire rack DSP params into engine effect slots
+#   3. Handle seek by calling engine.seek()
+#   4. Handle stop by calling engine.stop()
+#   5. Mute/solo/volume: call engine.set_volume/mute/solo() — instant, no restart
+#   6. EQ/rack changes: call engine.set_effect_slot() — heard next buffer (~5ms)
+# =============================================================================
+
+
+def _hj_build_segment_playlist(channel_idx, scene):
+    """
+    Build a list of HijackerSegment objects for one VSE channel.
+    Pre-decodes any non-WAV strips to temp WAV so the engine
+    only ever sees raw PCM files.
+    Returns list of segment dicts ready to convert to engine.Segment objects.
+    """
+    import aud, os, tempfile, wave as _wave
+
+    if not scene or not scene.sequence_editor:
+        return []
+
+    fps       = scene.render.fps / scene.render.fps_base
+    seq_start = scene.frame_start / fps
+    # Add one full frame to seq_end so the last frame plays completely.
+    # scene.frame_end is the last frame NUMBER — audio clamped to exactly
+    # frame_end/fps cuts off the final frame before it finishes playing.
+    seq_end   = (scene.frame_end + 1) / fps
+
+    strips = sorted(
+        [s for s in _vse.get_all_strips(scene.sequence_editor)
+         if s.type == "SOUND" and s.sound
+         and (s.channel - 1) == channel_idx],
+        key=lambda s: s.frame_final_start
+    )
+    if not strips:
+        return []
+
+    segments = []
+    for strip in strips:
+        actual_start_frame = strip.frame_final_end - strip.frame_final_duration
+        timeline_pos_s     = actual_start_frame / fps
+        duration_s         = strip.frame_final_duration / fps
+        file_offset_s      = getattr(strip, 'frame_offset_start', 0) / fps
+
+        # Skip entirely outside sequence
+        if timeline_pos_s + duration_s <= seq_start: continue
+        if timeline_pos_s >= seq_end:                continue
+
+        # Clamp to sequence
+        if timeline_pos_s < seq_start:
+            file_offset_s += (seq_start - timeline_pos_s)
+            duration_s    -= (seq_start - timeline_pos_s)
+            timeline_pos_s = seq_start
+        if timeline_pos_s + duration_s > seq_end:
+            duration_s = seq_end - timeline_pos_s
+
+        if duration_s <= 0.001:
+            continue
+
+        filepath = bpy.path.abspath(strip.sound.filepath)
+        if not os.path.exists(filepath):
+            print(f"[HIJACKER] ch{channel_idx+1} missing file: {filepath}")
+            continue
+
+        # Ensure it's a WAV — decode if needed
+        wav_path = filepath
+        if not filepath.lower().endswith('.wav'):
+            cache_key = f"hj_decoded_{channel_idx}_{os.path.basename(filepath)}.wav"
+            wav_path  = os.path.join(tempfile.gettempdir(), cache_key)
+            if not os.path.exists(wav_path):
+                try:
+                    snd  = aud.Sound.file(filepath)
+                    spec = snd.specs
+                    sr   = int(spec[0])
+                    nch  = int(spec[1])
+                    data = snd.data()
+                    import numpy as np, struct
+                    if data is not None and data.size > 0:
+                        i16 = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+                        with _wave.open(wav_path, 'wb') as wf:
+                            wf.setnchannels(nch)
+                            wf.setsampwidth(2)
+                            wf.setframerate(sr)
+                            wf.writeframes(i16.tobytes())
+                        print(f"[HIJACKER] decoded {os.path.basename(filepath)} → WAV")
+                    else:
+                        wav_path = None
+                except Exception as e:
+                    print(f"[HIJACKER] decode failed {filepath}: {e}")
+                    wav_path = None
+
+        if not wav_path or not os.path.exists(wav_path):
+            continue
+
+        # Per-segment volume = strip.volume / fader_volume
+        # strip.volume is the combined product of: original VSE strip volume ×
+        # all fader moves × all gain moves. The fader is tracked separately in
+        # pb_sync_tracks[ch].volume and applied channel-wide via hj.set_volume().
+        # Dividing out the fader here means seg.volume carries only the per-strip
+        # original difference — so two strips at vol=1 and vol=3 on the same
+        # channel will genuinely play at different levels, while the fader still
+        # scales both uniformly via hj.set_volume without being double-applied.
+        scene2    = bpy.context.scene
+        tracks2   = getattr(scene2, "pb_sync_tracks", []) if scene2 else []
+        fader_vol = tracks2[channel_idx].volume if channel_idx < len(tracks2) else 1.0
+        gain_val  = tracks2[channel_idx].gain   if channel_idx < len(tracks2) else 1.0
+        fader_vol = max(fader_vol, 0.001)
+        gain_val  = max(gain_val,  0.001)
+        # Divide out both fader AND gain — engine applies both via set_volume()
+        # so seg_vol carries only the original per-strip volume difference.
+        denom     = fader_vol * gain_val
+
+        # Volume automation: if the strip's volume is keyframed, follow the curve.
+        # It becomes a chain of straight-line gain pieces (the engine ramps the gain
+        # inside each piece and joins them without a fade).
+        poly = None
+        try:
+            poly = _sv.volume_polyline(strip, timeline_pos_s * fps,
+                                       (timeline_pos_s + duration_s) * fps)
+        except Exception as e:
+            print(f"[HIJACKER] ch{channel_idx+1} volume animation unreadable ({e}) - using the static volume")
+
+        if poly is not None and len(poly) >= 2 and any(abs(v - poly[0][1]) > 1e-6 for _, v in poly):
+            end_s = timeline_pos_s + duration_s
+            for i in range(len(poly) - 1):
+                (fa, va), (fb, vb) = poly[i], poly[i + 1]
+                ta = timeline_pos_s if i == 0 else fa / fps
+                tb = end_s if i == len(poly) - 2 else fb / fps
+                if tb - ta <= 1e-6:
+                    continue
+                segments.append({
+                    'filepath':       wav_path,
+                    'file_offset_s':  file_offset_s + (ta - timeline_pos_s),
+                    'duration_s':     tb - ta,
+                    'timeline_pos_s': ta,
+                    'volume':         va / denom,
+                    'volume_end':     vb / denom,
+                })
+            continue
+
+        seg_vol = (poly[0][1] if poly else float(strip.volume)) / denom
+
+        segments.append({
+            'filepath':       wav_path,
+            'file_offset_s':  file_offset_s,
+            'duration_s':     duration_s,
+            'timeline_pos_s': timeline_pos_s,
+            'volume':         seg_vol,
+        })
+
+    return segments
+
+
+_warned_no_ramps = False
+
+
+def _make_engine_segments(engine, segs):
+    """Convert segment dicts (from _hj_build_segment_playlist) to engine.Segment objects."""
+    global _warned_no_ramps
+    out = []
+    for seg in segs:
+        s = engine.Segment()
+        s.filepath       = seg['filepath']
+        s.file_offset_s  = seg['file_offset_s']
+        s.duration_s     = seg['duration_s']
+        s.timeline_pos_s = seg['timeline_pos_s']
+        v0 = seg.get('volume', 1.0)
+        v1 = seg.get('volume_end', -1.0)
+        s.volume = v0
+        if v1 >= 0.0:
+            try:
+                s.volume_end = v1
+            except AttributeError:
+                # The compiled engine is older than this script: it cannot ramp the gain.
+                s.volume = 0.5 * (v0 + v1)
+                if not _warned_no_ramps:
+                    _warned_no_ramps = True
+                    print("[HIJACKER] volume keyframes need the newer audio engine - "
+                          "run build.bat / build_py313.bat again and restart Blender")
+        out.append(s)
+    return out
+
+
+def _hj_wire_effects(channel_idx, scene):
+    """
+    Write current rack parameters into the engine's effect slots for a channel.
+    These take effect on the next audio buffer (~5ms) — no restart needed.
+    """
+    engine = get_engine()
+    if not engine: return
+
+    hj = engine.get_engine()
+    if not hj: return
+
+    # Clear all slots first
+    for slot in range(8):
+        hj.clear_effect_slot(channel_idx, slot)
+
+    racks = getattr(scene, "pb_racks", []) if scene else []
+    slot_idx = 0
+
+    try:
+        from Racks import get_rack_channels
+    except Exception:
+        return
+
+    for rack in racks:
+        if not rack.enabled: continue
+        try:
+            assigned = get_rack_channels(rack)
+        except Exception:
+            continue
+        if channel_idx not in assigned: continue
+
+        etype = rack.effect_type
+        params = [0.0] * 24
+
+        if etype == "COMP_SINGLE":
+            params[:6] = [rack.p0, rack.p1, rack.p2, rack.p3, rack.p4, rack.p5]
+            hj.set_effect_slot(channel_idx, slot_idx, engine.FX_COMP_SINGLE, params)
+            slot_idx += 1
+        elif etype == "COMP_MULTI":
+            params = [rack.p0, rack.p1, rack.p2, rack.p3,
+                      rack.p4, rack.p5, rack.p6, rack.p7,
+                      rack.p8, rack.p9, rack.p10, rack.p11,
+                      rack.p12, rack.p13, rack.p14, rack.p15,
+                      rack.p16, rack.p17, rack.p18, rack.p19,
+                      rack.p20, rack.p21, rack.p22, rack.p23]
+            hj.set_effect_slot(channel_idx, slot_idx, engine.FX_COMP_MULTI, params)
+            slot_idx += 1
+        elif etype == "EQ":
+            for bi in range(7):
+                p = getattr(rack, f'p{bi}', 0.5)
+                params[bi]      = p
+                params[bi + 7]  = getattr(rack, f'p{bi+7}',  0.5)
+                params[bi + 14] = getattr(rack, f'p{bi+14}', 0.5)
+            hj.set_effect_slot(channel_idx, slot_idx, engine.FX_EQ_PARAM, params)
+            slot_idx += 1
+        elif etype == "REVERB":
+            params[:5] = [rack.p0, rack.p1, rack.p2, rack.p3, rack.p4]
+            hj.set_effect_slot(channel_idx, slot_idx, engine.FX_REVERB_PARAM, params)
+            slot_idx += 1
+        elif etype == "NOISE_GATE":
+            params[:5] = [rack.p0, rack.p1, rack.p2, rack.p3, rack.p4]
+            hj.set_effect_slot(channel_idx, slot_idx, engine.FX_GATE_PARAM, params)
+            slot_idx += 1
+        elif etype == "DELAY":
+            params[:5] = [rack.p0, rack.p1, rack.p2, rack.p3, rack.p4]
+            hj.set_effect_slot(channel_idx, slot_idx, engine.FX_DELAY_PARAM, params)
+            slot_idx += 1
+        elif etype == "MIXDOWN":
+            pass   # no live DSP — renders offline via rack_mixdown._start_render
+
+        if slot_idx >= 8:
+            break
+
+
+def _hj_load_all_channels(scene):
+    """
+    Build segment playlists for all active VSE channels and load them
+    into the engine. Also wires effect slots for each channel.
+    Called at play-start and after seeks.
+    """
+    engine = get_engine()
+    if not engine: return
+
+    hj = engine.get_engine()
+    if not hj: return
+
+    if not scene or not scene.sequence_editor: return
+
+    # Clear ALL channels first — this is critical.
+    # Without this, deleting a strip from the VSE leaves the engine playing
+    # the old cached playlist for that channel on the next play-start,
+    # because _hj_build_segment_playlist only iterates channels that still
+    # have strips and never explicitly clears channels that no longer do.
+    hj.clear_all_channels()
+
+    channels = set()
+    for s in _vse.get_all_strips(scene.sequence_editor):
+        if s.type == "SOUND" and s.sound:
+            channels.add(s.channel - 1)
+
+    tracks = getattr(scene, "pb_sync_tracks", [])
+
+    for ch in sorted(channels):
+        segs = _hj_build_segment_playlist(ch, scene)
+        if not segs:
+            hj.clear_channel(ch)
+            continue
+
+        # Convert to engine.Segment objects
+        seg_objects = _make_engine_segments(engine, segs)
+
+        hj.set_channel_playlist(ch, seg_objects)
+
+        # Volume / mute / solo
+        vol    = _pb_channel_volume(ch)
+        muted  = tracks[ch].mute if ch < len(tracks) else False
+        soloed = tracks[ch].solo if ch < len(tracks) else False
+        hj.set_volume(ch, vol)
+        hj.set_mute(ch, muted)
+        hj.set_solo(ch, soloed)
+        pan = getattr(tracks[ch], 'pan', 0.5) if ch < len(tracks) else 0.5
+        hj.set_pan(ch, pan)
+
+        # Wire DSP effects — includes both rack effects and channel strip EQ
+        _pb_rebuild_eq(ch)
+
+        print(f"[HIJACKER] ch{ch+1} loaded {len(seg_objects)} segments")
+
+
+# ---------------------------------------------------------------------------
+# Transport functions — called by Blender handlers and Python UI
+# ---------------------------------------------------------------------------
+
+def _pb_start_all(scene):
+    _pb_start_all_from_frame(scene, int(scene.frame_current))
+
+
+def _pb_start_all_from_frame(scene, frame):
+    """Load all channels into the Hijacker engine and start playback."""
+    global _pb_start_frame, _pb_last_frame
+
+    engine = get_engine()
+    if not engine:
+        print("[HIJACKER] engine not available — cannot play")
+        return
+
+    hj = engine.get_engine()
+    if not hj:
+        print("[HIJACKER] engine instance not initialised")
+        return
+
+    # Clamp frame to sequence bounds — handle both before-start and after-end
+    effective_start = int(scene.frame_preview_start if scene.use_preview_range
+                          else scene.frame_start)
+    effective_end   = int(scene.frame_preview_end   if scene.use_preview_range
+                          else scene.frame_end)
+
+    if frame < effective_start or frame > effective_end:
+        frame = effective_start
+        print(f"[HIJACKER] cursor outside sequence, snapping to frame {frame}")
+        try: scene.frame_set(frame)
+        except Exception: pass
+
+    _pb_last_frame  = frame
+    _pb_start_frame = frame
+
+    fps        = scene.render.fps / scene.render.fps_base
+    timeline_s = max(0.0, frame / fps)   # never negative
+
+    # Load playlists
+    _hj_load_all_channels(scene)
+
+    # A new play starts a fresh loudness measurement (integrated loudness, range, peaks)
+    try:
+        from core import master as _master
+        _master.reset_loudness()
+    except Exception:
+        pass
+
+    # Start the engine — all channels begin from same sample atomically
+    hj.play(timeline_s)
+    print(f"[HIJACKER] all channels started from frame {frame}")
+
+
+def _pb_stop_all(scene):
+    """Stop the Hijacker engine."""
+    engine = get_engine()
+    if not engine: return
+    hj = engine.get_engine()
+    if not hj: return
+    hj.stop()
+    print(f"[HIJACKER] stopped")
+
+
+def _pb_rebuild_eq(channel_idx):
+    """
+    Called when a rack parameter OR channel strip EQ/gain/pan changes.
+    Pushes all current params to the engine — heard next buffer (~5ms).
+    """
+    scene = bpy.context.scene
+    if not scene: return
+    engine = get_engine()
+    if not engine: return
+    hj = engine.get_engine()
+    if not hj: return
+
+    # Push rack effects (parametric EQ, compressor, reverb etc.)
+    _hj_wire_effects(channel_idx, scene)
+
+    # Push channel strip 3-band EQ into a dedicated effect slot (slot 7)
+    # Uses FX_EQ_PARAM with simplified 3-band mapping:
+    #   Band 0 (low shelf)  ← eq_low
+    #   Band 3 (mid peak)   ← eq_mid
+    #   Band 6 (high shelf) ← eq_high
+    tracks = getattr(scene, "pb_sync_tracks", [])
+    if channel_idx < len(tracks):
+        t = tracks[channel_idx]
+        eq_h = getattr(t, 'eq_high', 0.0)
+        eq_m = getattr(t, 'eq_mid',  0.0)
+        eq_l = getattr(t, 'eq_low',  0.0)
+        # Only add strip EQ slot if any band is non-zero
+        if abs(eq_h) > 0.01 or abs(eq_m) > 0.01 or abs(eq_l) > 0.01:
+            params = [0.5] * 24   # 0.5 = 0dB for all bands
+            # Normalise: gain is stored as dB (-24..+24), engine wants 0..1
+            params[0] = (eq_l + 24.0) / 48.0   # band 0 = low shelf
+            params[3] = (eq_m + 24.0) / 48.0   # band 3 = mid peak
+            params[6] = (eq_h + 24.0) / 48.0   # band 6 = high shelf
+            # Frequencies — low=200Hz, mid=1kHz, high=8kHz (log-normalised)
+            import math
+            params[7]  = math.log10(200  / 20) / math.log10(20000 / 20)
+            params[10] = math.log10(1000 / 20) / math.log10(20000 / 20)
+            params[13] = math.log10(8000 / 20) / math.log10(20000 / 20)
+            # Q — moderate for all bands
+            params[14] = params[17] = params[20] = 0.3
+            hj.set_effect_slot(channel_idx, 7, engine.FX_EQ_PARAM, params)
+        else:
+            hj.clear_effect_slot(channel_idx, 7)
+
+
+def _pb_do_eq_rebuild(channel_idx):
+    """Alias for _pb_rebuild_eq — kept for compatibility."""
+    _pb_rebuild_eq(channel_idx)
+
+
+# ---------------------------------------------------------------------------
+# Transport handlers — Blender animation_playback_pre / post
+# ---------------------------------------------------------------------------
+
+@bpy.app.handlers.persistent
+def _pb_on_play_start(scene, depsgraph=None):
+    if not _pb_engine_active: return
+    try:
+        print(f"[HIJACKER] play start at frame {scene.frame_current}")
+        _pb_start_all(scene)
+    except Exception as e:
+        print(f"[HIJACKER] play start error: {e}")
+        import traceback; traceback.print_exc()
+
+
+@bpy.app.handlers.persistent
+def _pb_on_play_stop(scene, depsgraph=None):
+    if not _pb_engine_active: return
+    try:
+        print(f"[HIJACKER] play stop at frame {scene.frame_current}")
+        _pb_stop_all(scene)
+    except Exception as e:
+        print(f"[HIJACKER] play stop error: {e}")
+
+
+@bpy.app.handlers.persistent
+def _pb_loop_detect(scene, depsgraph=None):
+    """
+    Watches frame_change_post for genuine loop-backs and user seeks.
+    Does NOT try to keep the cursor in sync — that's the meter timer's job.
+    Does NOT act on large positive frame deltas — those are just Blender
+    running slow under draw load, not real seeks.
+    """
+    global _pb_last_frame, _pb_last_loop_time, _pb_start_frame
+
+    if not _pb_engine_active:
+        _pb_last_frame = scene.frame_current
+        return
+
+    current = scene.frame_current
+
+    try:
+        is_playing = bpy.context.screen.is_animation_playing
+    except Exception:
+        is_playing = False
+
+    if not is_playing:
+        _pb_last_frame = current
+        return
+
+    frame_delta = current - _pb_last_frame
+
+    effective_start = int(scene.frame_preview_start if scene.use_preview_range
+                          else scene.frame_start)
+    effective_end   = int(scene.frame_preview_end   if scene.use_preview_range
+                          else scene.frame_end)
+
+    fps = scene.render.fps / scene.render.fps_base
+
+    # Forward jump threshold — deltas above this are treated as user seeks,
+    # not normal playback frame skipping under draw load.
+    # At 24fps even severe load rarely skips more than 20-25 frames at once.
+    # A user clicking forward on the timeline will produce 50+ frame jumps.
+    _SEEK_THRESHOLD = 30
+
+    # Small positive delta — normal playback or draw-load skip, do nothing.
+    if 0 <= frame_delta < _SEEK_THRESHOLD and current <= effective_end:
+        _pb_last_frame = current
+        return
+
+    already_there   = (abs(current - _pb_start_frame) <= 3)
+    time_since_last = _time.time() - _pb_last_loop_time
+
+    if already_there and time_since_last < 0.5:
+        _pb_last_frame = current
+        return
+
+    # Clamp seek target to valid range
+    seek_frame = max(effective_start, min(effective_end - 1, current))
+
+    if frame_delta < 0 and abs(current - effective_start) <= 2:
+        # Genuine loop back to start (Blender looped the animation)
+        print(f"[HIJACKER] loop: {_pb_last_frame}→{current}")
+        _pb_last_loop_time = _time.time()
+        _pb_start_frame    = effective_start
+        engine = get_engine()
+        if engine:
+            hj = engine.get_engine()
+            if hj:
+                hj.seek(max(0.0, effective_start / fps))
+    elif frame_delta < 0 or frame_delta >= _SEEK_THRESHOLD:
+        # User seeked — either backwards or a large jump forwards
+        print(f"[HIJACKER] seek: {_pb_last_frame}→{current} (delta={frame_delta})")
+        _pb_last_loop_time = _time.time()
+        _pb_start_frame    = seek_frame
+        engine = get_engine()
+        if engine:
+            hj = engine.get_engine()
+            if hj:
+                hj.seek(max(0.0, seek_frame / fps))
+    # Normal playback reaching effective_end is handled by the meter timer.
+
+    _pb_last_frame = current
+
+    _pb_last_frame = current
+
+
+# ---------------------------------------------------------------------------
+# EQ debounce timer
+# With Hijacker engine, "EQ rebuild" just updates effect slot params.
+# No need for the heavy rebuild logic — but we keep the debounce so
+# rapid knob drags don't spam set_effect_slot calls.
+# ---------------------------------------------------------------------------
+
+def _pb_eq_timer():
+    if not _pb_engine_active:
+        return 0.033
+    try:
+        now     = _time.time()
+        pending = {ch: t for ch, t in list(_pb_eq_pending.items())
+                   if now - t >= _pb_eq_debounce}
+        for ch in pending:
+            del _pb_eq_pending[ch]
+            _pb_do_eq_rebuild(ch)
+
+        # Run spectrum analysis here (Python timer thread, not audio thread).
+        # 512-sample window costs ~65K muls/channel — cheap enough for 30Hz.
+        try:
+            engine = get_engine()
+            if engine and hasattr(engine, 'compute_spec_bins_all'):
+                hj = engine.get_engine()
+                if hj and hj.is_running():
+                    engine.compute_spec_bins_all(48000.0)
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[HIJACKER] EQ timer error: {e}")
+    return 0.033
+
+
+_pb_eq_timer_registered = False
+
+
+# ---------------------------------------------------------------------------
+# Engine enable / disable
+# ---------------------------------------------------------------------------
+
+def _pb_guess_audio_device():
+    """Best-effort guess at the platform's real audio backend.
+
+    Only used when Blender's audio_device is already 'None' at enable-time
+    (e.g. recovering from a previous crash) and we have no recorded value to
+    restore. Prefers asking Blender directly for the backends actually
+    available on this build/platform — more robust than a hardcoded guess,
+    and stays correct if Blender adds or reorders backends. Falls back to a
+    per-OS guess only if that introspection itself fails.
+    """
+    import sys as _sys
+
+    preferred_by_platform = {
+        'win32':  'WASAPI',
+        'darwin': 'CoreAudio',
+    }
+    preferred = preferred_by_platform.get(_sys.platform, 'PulseAudio')
+
+    try:
+        prop = bpy.context.preferences.system.bl_rna.properties['audio_device']
+        available = [item.identifier for item in prop.enum_items
+                     if item.identifier != 'None']
+        if available:
+            if preferred in available:
+                return preferred
+            # Blender lists backends in preference order for this platform —
+            # take its top choice over our own guess.
+            return available[0]
+    except Exception as e:
+        print(f"[HIJACKER] audio_device enum introspection failed: {e}")
+
+    return preferred
+
+
+def _pb_deferred_save_userpref():
+    """One-shot timer callback: save preferences a moment after registration.
+
+    register() can run with bpy.context as a _RestrictContext (notably at
+    Blender startup), and operators like wm.save_userpref need a full
+    context (view_layer, window, etc.) to run — calling it synchronously
+    from register() raises. Deferring via bpy.app.timers runs this on the
+    next event-loop tick, by which point context is no longer restricted.
+    """
+    try:
+        bpy.ops.wm.save_userpref()
+        print("[HIJACKER] preferences saved after audio device recovery")
+    except Exception as e:
+        print(f"[HIJACKER] could not save preferences after recovery: {e}")
+    return None  # don't repeat
+
+
+def _pb_recover_stuck_audio():
+    """Startup self-heal: if the audio device is already 'None' before we've
+    enabled the engine ourselves this session, it's almost certainly left
+    over from Blender crashing or being force-closed while Hijacker was
+    active last time — _pb_engine_disable() never got the chance to restore
+    it. Left alone, Blender would stay silent by default on every future
+    launch. Fix it immediately and save so it doesn't stick around.
+    """
+    if _pb_engine_active:
+        return  # we're actively using it right now — leave it alone
+
+    try:
+        current = bpy.context.preferences.system.audio_device
+    except Exception as e:
+        print(f"[HIJACKER] could not read audio_device during startup check: {e}")
+        return
+
+    if current != 'None':
+        return  # nothing to recover
+
+    restored = _pb_guess_audio_device()
+    try:
+        bpy.context.preferences.system.audio_device = restored
+        print(f"[HIJACKER] recovered a stuck 'None' audio device (likely a "
+              f"previous crash while Hijacker was active) — restored to "
+              f"'{restored}'")
+    except Exception as e:
+        print(f"[HIJACKER] failed to recover stuck audio device: {e}")
+        return
+
+    # Defer the actual save — see _pb_deferred_save_userpref's docstring.
+    try:
+        bpy.app.timers.register(_pb_deferred_save_userpref, first_interval=0.2)
+    except Exception as e:
+        print(f"[HIJACKER] could not schedule preferences save after recovery: {e}")
+
+
+_pb_watchdog_registered = False
+_pb_watchdog_failures   = 0
+
+
+def _pb_device_watchdog():
+    """Every couple of seconds, check the audio stream is still alive.
+
+    If the output device disappears (headphones unplugged, USB interface
+    removed, driver reset) PortAudio stops the stream and the Hijacker would
+    stay silent until restarted. Here we notice, restart the engine on
+    whichever device is now available (the preferences fall back to the
+    system default if the chosen one is gone) and carry on. Playlists are
+    reloaded from the timeline on the next Play, so nothing else is needed.
+    Backs off if restarts keep failing.
+    """
+    global _pb_watchdog_failures, _pb_watchdog_registered
+    if not _pb_engine_active:
+        _pb_watchdog_registered = False
+        return None
+    try:
+        engine = get_engine()
+        hj = engine.get_engine() if engine else None
+        if hj is None or not hasattr(hj, "is_running") or hj.is_running():
+            _pb_watchdog_failures = 0
+            return 2.0
+    except Exception:
+        return 5.0
+
+    print("[HIJACKER] audio device stopped — restarting the audio engine")
+    try:
+        if bpy.context.screen.is_animation_playing:
+            bpy.ops.screen.animation_cancel(restore_frame=False)
+    except Exception:
+        pass
+    try:
+        _pb_engine_disable()
+        _pb_engine_enable()
+    except Exception as e:
+        print(f"[HIJACKER] audio restart failed: {e}")
+
+    if _pb_engine_active:
+        _pb_watchdog_failures = 0
+        print("[HIJACKER] audio engine recovered")
+        return None   # a fresh watchdog was registered by _pb_engine_enable
+    _pb_watchdog_failures += 1
+    # Engine is now disabled and Blender's own audio is restored; stop trying.
+    _pb_watchdog_registered = False
+    print("[HIJACKER] could not recover the audio device. Reopen the Hijacker "
+          "after reconnecting it.")
+    return None
+
+
+def _pb_engine_enable():
+    """Start Hijacker engine, take over Blender's audio, register handlers.
+
+    Order matters: we only disable Blender's own audio device *after*
+    confirming the Hijacker engine actually loaded and initialized. Previously
+    this disabled Blender's native audio unconditionally up front, so on a
+    machine where hijacker_engine fails to load (missing/incompatible build,
+    a missing native dependency, etc.) the user was left with no audio at
+    all instead of falling back to Blender's own device.
+    """
+    global _pb_engine_active, _pb_original_device, _pb_eq_timer_registered
+
+    if _pb_engine_active: return
+
+    # Init Hijacker PortAudio engine first — don't touch Blender's own audio
+    # device until we know the replacement actually works.
+    engine = get_engine()
+    ok = False
+    if engine:
+        try:
+            sample_rate = 44100
+            scene = bpy.context.scene
+            if scene and scene.sequence_editor:
+                for strip in _vse.get_all_strips(scene.sequence_editor):
+                    if strip.type == "SOUND" and strip.sound:
+                        try:
+                            import aud as _aud_sr
+                            sr = int(_aud_sr.Sound.file(
+                                bpy.path.abspath(strip.sound.filepath)
+                            ).specs[0])
+                            if sr in (44100, 48000, 96000):
+                                sample_rate = sr
+                            break
+                        except Exception:
+                            pass
+            # Output device + buffer size come from the add-on preferences.
+            # An older compiled engine doesn't take them, so fall back to the
+            # plain call rather than failing to start.
+            try:
+                import core.prefs as _prefs
+                dev_name, buf_frames = _prefs.audio_settings()
+            except Exception as _pe:
+                print(f"[HIJACKER] could not read audio preferences: {_pe}")
+                dev_name, buf_frames = "", 0
+            try:
+                ok = engine.engine_init(sample_rate, dev_name, buf_frames)
+            except TypeError:
+                print("[HIJACKER] engine is older than the preferences page; "
+                      "rebuild it to use device / buffer selection")
+                ok = engine.engine_init(sample_rate)
+            if ok:
+                try:
+                    hj_now = engine.get_engine()
+                    _prefs.apply_latency(hj_now)
+                    try:
+                        from core import master as _master
+                        _master.reset_meter()
+                        _master.push_to_engine()
+                    except Exception as _me:
+                        print(f"[HIJACKER] master bus setup failed: {_me}")
+                    shown = hj_now.get_output_device_name() if hasattr(
+                        hj_now, "get_output_device_name") else ""
+                    bf = hj_now.get_buffer_frames() if hasattr(
+                        hj_now, "get_buffer_frames") else 0
+                    print(f"[HIJACKER] audio engine active @ {sample_rate}Hz, "
+                          f"device '{shown or 'default'}', buffer "
+                          f"{bf if bf else 'auto'}")
+                except Exception:
+                    print(f"[HIJACKER] audio engine active @ {sample_rate}Hz")
+            else:
+                print("[HIJACKER] WARNING: engine_init failed — no audio output. "
+                      "Falling back to Blender's native audio.")
+        except Exception as e:
+            print(f"[HIJACKER] engine_init error: {e}. "
+                  f"Falling back to Blender's native audio.")
+    else:
+        print("[HIJACKER] WARNING: hijacker_engine not found — compile with "
+              "build.bat (Windows) or build the .so (macOS/Linux). "
+              "Falling back to Blender's native audio.")
+
+    if not ok:
+        # Hijacker engine isn't available/working on this machine — leave
+        # Blender's own audio device untouched so the user still has sound.
+        return
+
+    # Disable Blender's audio device now that Hijacker is confirmed working
+    try:
+        current_device = bpy.context.preferences.system.audio_device
+        if current_device and current_device != 'None':
+            _pb_original_device = current_device
+        else:
+            _pb_original_device = _pb_guess_audio_device()
+        bpy.context.preferences.system.audio_device = 'None'
+        print(f"[HIJACKER] Blender audio disabled (was '{current_device}', "
+              f"will restore to '{_pb_original_device}')")
+    except Exception as e:
+        print(f"[HIJACKER] could not disable Blender audio: {e}")
+
+    # Register Blender transport handlers
+    if _pb_on_play_start not in bpy.app.handlers.animation_playback_pre:
+        bpy.app.handlers.animation_playback_pre.append(_pb_on_play_start)
+    if _pb_on_play_stop not in bpy.app.handlers.animation_playback_post:
+        bpy.app.handlers.animation_playback_post.append(_pb_on_play_stop)
+    if _pb_loop_detect not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_pb_loop_detect)
+
+    if not _pb_eq_timer_registered:
+        bpy.app.timers.register(_pb_eq_timer, first_interval=0.033)
+        _pb_eq_timer_registered = True
+
+    global _pb_watchdog_registered
+    if not _pb_watchdog_registered:
+        bpy.app.timers.register(_pb_device_watchdog, first_interval=2.0)
+        _pb_watchdog_registered = True
+
+    _pb_engine_active = True
+    print("[HIJACKER] audio engine enabled")
+
+
+def _pb_engine_disable():
+    """Stop Hijacker engine, restore Blender's audio."""
+    global _pb_engine_active, _pb_eq_timer_registered
+
+    if not _pb_engine_active: return
+
+    # Stop engine
+    engine = get_engine()
+    if engine:
+        try:
+            hj = engine.get_engine()
+            if hj: hj.stop()
+            engine.engine_shutdown()
+        except Exception as e:
+            print(f"[HIJACKER] engine shutdown error: {e}")
+
+    # Restore strip mute states
+    try:
+        scene = bpy.context.scene
+        if scene and scene.sequence_editor:
+            tracks = getattr(scene, "pb_sync_tracks", [])
+            for strip in _vse.get_all_strips(scene.sequence_editor):
+                if strip.type == "SOUND":
+                    idx = strip.channel - 1
+                    strip.mute = tracks[idx].mute if idx < len(tracks) else False
+    except Exception: pass
+
+    # Remove handlers
+    if _pb_on_play_start in bpy.app.handlers.animation_playback_pre:
+        bpy.app.handlers.animation_playback_pre.remove(_pb_on_play_start)
+    if _pb_on_play_stop in bpy.app.handlers.animation_playback_post:
+        bpy.app.handlers.animation_playback_post.remove(_pb_on_play_stop)
+    if _pb_loop_detect in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_pb_loop_detect)
+
+    if _pb_eq_timer_registered:
+        try: bpy.app.timers.unregister(_pb_eq_timer)
+        except Exception: pass
+        _pb_eq_timer_registered = False
+
+    global _pb_watchdog_registered
+    if _pb_watchdog_registered:
+        try: bpy.app.timers.unregister(_pb_device_watchdog)
+        except Exception: pass
+        _pb_watchdog_registered = False
+
+    # Restore Blender audio
+    try:
+        bpy.context.preferences.system.audio_device = _pb_original_device
+        print(f"[HIJACKER] Blender audio restored to '{_pb_original_device}'")
+    except Exception as e:
+        print(f"[HIJACKER] could not restore Blender audio: {e}")
+
+    _pb_engine_active = False
+    print("[HIJACKER] audio engine disabled")
+
+
+# ---------------------------------------------------------------------------
+# Volume update — called by fader changes
+# ---------------------------------------------------------------------------
+
+def _pb_engine_update_volume(channel_idx):
+    """Real-time volume update — takes effect next audio buffer."""
+    engine = get_engine()
+    if not engine: return
+    hj = engine.get_engine()
+    if not hj: return
+    vol = _pb_channel_volume(channel_idx)
+    hj.set_volume(channel_idx, vol)
+
+
+def _pb_reprocess_channel(channel_idx):
+    """
+    Called when a rack is assigned or a major change happens.
+    Reloads the channel playlist and rewires effects.
+    If playing, seeks to current position to restart with new settings.
+    """
+    scene = bpy.context.scene
+    if not scene: return
+
+    engine = get_engine()
+    if not engine: return
+    hj = engine.get_engine()
+    if not hj: return
+
+    segs = _hj_build_segment_playlist(channel_idx, scene)
+    if segs:
+        seg_objects = _make_engine_segments(get_engine(), segs)
+        hj.set_channel_playlist(channel_idx, seg_objects)
+
+    # Wire effects — use _pb_rebuild_eq to include channel strip EQ slot
+    _pb_rebuild_eq(channel_idx)
+
+    # If currently playing, seek to refresh this channel
+    is_playing = bool(bpy.context.screen and
+                      bpy.context.screen.is_animation_playing)
+    if is_playing:
+        fps = scene.render.fps / scene.render.fps_base
+        hj.seek(scene.frame_current / fps)
+
+    print(f"[HIJACKER] ch{channel_idx+1} reprocessed")
+
+
+# ---------------------------------------------------------------------------
+# Mute / Solo — write to strip.mute for correct VSE appearance
+# AND update handle volumes so our engine reflects the change instantly
+# ---------------------------------------------------------------------------
+
+def sync_vse_mute(channel_idx, state):
+    """Mute: update strip.mute (VSE appearance) and engine mute instantly."""
+    scene = bpy.context.scene
+    if not scene or not scene.sequence_editor: return
+    for strip in _vse.get_all_strips(scene.sequence_editor):
+        if strip.type == "SOUND" and (strip.channel - 1) == channel_idx:
+            strip.mute = state
+    # Update engine — takes effect next audio buffer (~5ms)
+    engine = get_engine()
+    if engine:
+        hj = engine.get_engine()
+        if hj:
+            hj.set_mute(channel_idx, state)
+            hj.set_volume(channel_idx, _pb_channel_volume(channel_idx))
+
+
+def sync_vse_solo(channel_idx, solo_state):
+    """Solo: update strip.mute on all channels, update engine mute/solo instantly."""
+    scene = bpy.context.scene
+    if not scene or not scene.sequence_editor: return
+    tracks   = getattr(scene, "pb_sync_tracks", [])
+    soloed   = {i for i, t in enumerate(tracks) if t.solo}
+    any_solo = len(soloed) > 0
+
+    for strip in _vse.get_all_strips(scene.sequence_editor):
+        if strip.type != "SOUND": continue
+        idx        = strip.channel - 1
+        strip.mute = (idx not in soloed) if any_solo else (
+            tracks[idx].mute if idx < len(tracks) else False)
+
+    # Update engine for all active channels — takes effect next buffer
+    engine = get_engine()
+    if engine:
+        hj = engine.get_engine()
+        if hj:
+            active_chs = set()
+            for strip in _vse.get_all_strips(scene.sequence_editor):
+                if strip.type == "SOUND" and strip.sound:
+                    active_chs.add(strip.channel - 1)
+            for idx in active_chs:
+                muted  = tracks[idx].mute  if idx < len(tracks) else False
+                soloed_ch = tracks[idx].solo if idx < len(tracks) else False
+                # When any channel is soloed, non-soloed channels are muted
+                effective_mute = (idx not in soloed) if any_solo else muted
+                hj.set_mute(idx, effective_mute)
+                hj.set_solo(idx, soloed_ch)
+                hj.set_volume(idx, _pb_channel_volume(idx))

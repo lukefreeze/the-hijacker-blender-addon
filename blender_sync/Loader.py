@@ -1,0 +1,546 @@
+"""
+Loader.py — slim orchestrator for The Hijacker addon.
+
+Responsibilities:
+  - sys.path bootstrap (adds blender_sync/ and subpackages)
+  - Imports and wires together core/* and ui/mixer/*
+  - Blender registration (classes, scene props, draw handler, app handlers)
+  - VSE_OT_TogglePBGui — the launch button operator
+
+Everything else lives in:
+  core/constants.py    — every layout number
+  core/engine.py       — native engine import (hijacker_native/)
+  core/audio.py        — DSP, playback handlers, effect chain
+  core/meters.py       — VU meter timer, envelope cache
+  core/properties.py   — PB_TrackSettings, scene props
+  ui/mixer/draw_utils.py    — GPU primitives + PNG bridge
+  ui/mixer/texture_cache.py — PNG → gpu.texture loader
+  ui/mixer/channel_strip.py — one fader strip
+  ui/mixer/mixer_hud.py     — draw_callback_px, scrollbars, UI state
+  ui/mixer/interaction.py   — modal operator, hit testing
+  ui/racks/                 — one file per rack type
+  Racks.py                  — rack data + public draw API
+"""
+
+import sys
+import os
+
+# bpy.utils.previews isn't always pulled in by a bare "import bpy" — needed
+# to load a custom PNG as a usable icon_value for UI buttons (native
+# layout.operator()/layout.label() icons only accept Blender's own built-in
+# icon enum via icon=, or a loaded custom image via icon_value=).
+import bpy.utils.previews
+
+# ---------------------------------------------------------------------------
+# Path bootstrap — must happen before any other import
+# Only add blender_sync/ itself to sys.path, NOT subdirectories.
+# Sub-packages (core/, ui/) use relative imports and must be loaded as packages,
+# not as top-level modules — adding their directories breaks relative imports.
+# ---------------------------------------------------------------------------
+_ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ADDON_DIR not in sys.path:
+    sys.path.insert(0, _ADDON_DIR)
+
+# ---------------------------------------------------------------------------
+# Core imports
+# ---------------------------------------------------------------------------
+from core.engine import get_engine, reset_engine, HIJACKER_AVAILABLE
+from core.properties import register_properties, unregister_properties
+import core.perf_monitor as _perf_mod
+import core.packapunch as _pap_mod
+import core.rack_screen_sequence as _rackseq_mod
+import core.prefs as _prefs_mod
+
+# Re-export constants that Racks.py imports from Loader
+from core.constants import FADER_TRACK_BOTTOM, NUMBOX_H, NUMBOX_Y_OFFSET
+# _send_section_height is used by Racks.py
+from ui.mixer.channel_strip import send_section_height as _send_section_height
+
+# ---------------------------------------------------------------------------
+# Audio engine imports — keep them lazy where possible to avoid
+# circular imports at module load time
+# ---------------------------------------------------------------------------
+from core.audio import (
+    _pb_engine_enable, _pb_engine_disable, _pb_recover_stuck_audio,
+    _fft_timeline, _fft_timeline_full, _gr_timeline,
+    stop_all_oneshots,
+)
+
+from core.meters import (
+    _meter_timer, _ensure_meter_timer, _cancel_meter_timer,
+    _engine_levels, _peak_hold, _peak_hold_timer,
+)
+
+# ---------------------------------------------------------------------------
+# UI imports
+# ---------------------------------------------------------------------------
+from ui.mixer.mixer_hud import (
+    draw_callback_px,
+    UI_SCALE, SCROLL_X, SCROLL_Y,
+    pb_ui_enabled, HUD_AREA_PTR,
+    save_ui_state, load_ui_state, compute_autofit,
+)
+import ui.mixer.mixer_hud as _hud
+
+from ui.mixer.interaction import (
+    VSE_OT_SetFaderValue,
+    VSE_OT_PB_Interaction,
+    _sync_tracks_to_vse,
+    _get_active_channel_count,
+)
+from ui.mixer.texture_cache import set_skin_dir, clear_cache as clear_texture_cache
+
+# Racks public API — stubs only at module level; real import happens in register()
+def draw_racks(*a, **kw): pass
+def register_racks(): pass
+def unregister_racks(): pass
+def racks_handle_click(*a, **kw): return False
+def racks_hit_test(*a, **kw): return None
+def update_led_states(*a, **kw): pass
+def rack_knob_hit_test(*a, **kw): return None
+
+import bpy
+
+# ---------------------------------------------------------------------------
+# Helper: set global in mixer_hud module (avoids re-importing everywhere)
+# ---------------------------------------------------------------------------
+def _set_hud(key, value):
+    setattr(_hud, key, value)
+
+def _get_hud(key):
+    return getattr(_hud, key)
+
+
+# ---------------------------------------------------------------------------
+# VSE_OT_TogglePBGui — the launch button
+# ---------------------------------------------------------------------------
+class VSE_OT_TogglePBGui(bpy.types.Operator):
+    bl_idname = "vse.toggle_pb_gui"
+    bl_label  = "Toggle The Hijacker"
+
+    def execute(self, context):
+        global pb_ui_enabled
+        load_ui_state()
+        new_state = not _get_hud('pb_ui_enabled')
+        _set_hud('pb_ui_enabled', new_state)
+        print(f"[TOGGLE] pb_ui_enabled={new_state}")
+
+        if new_state:
+            # Pick the largest Node Editor WINDOW as the HUD canvas
+            best_ptr = context.area.as_pointer()
+            best_w   = 0
+            best_h   = 0
+            for area in context.screen.areas:
+                if area.type == 'NODE_EDITOR':
+                    for rgn in area.regions:
+                        if rgn.type == 'WINDOW':
+                            if rgn.width * rgn.height > best_w * best_h:
+                                best_w   = rgn.width
+                                best_h   = rgn.height
+                                best_ptr = area.as_pointer()
+
+            _set_hud('HUD_AREA_PTR', best_ptr)
+            print(f"[TOGGLE] HUD area ptr={best_ptr} "
+                  f"NODE_EDITOR WINDOW={best_w}x{best_h}")
+            _perf_mod.reset()
+            _pap_mod.reset()
+
+            # Auto-fit: scale + centre
+            try:
+                dw = best_w if best_w > 100 else context.region.width
+                dh = best_h if best_h > 100 else context.region.height
+                # Frame the desk only: the PACK-A-PUNCH button sits just off
+                # to the left on purpose, for people to stumble across.
+                scale, scr_x, scr_y = compute_autofit(dw, dh, with_button=False)
+                _set_hud('UI_SCALE',  scale)
+                _set_hud('SCROLL_X',  scr_x)
+                _set_hud('SCROLL_Y',  scr_y)
+                print(f"[TOGGLE] auto-fit UI_SCALE={scale:.3f} "
+                      f"canvas={dw}x{dh} "
+                      f"scroll=({scr_x:.1f},{scr_y:.1f})")
+            except Exception as fe:
+                _set_hud('UI_SCALE', 1.0)
+                _set_hud('SCROLL_X', 0.0)
+                _set_hud('SCROLL_Y', 0.0)
+                print(f"[TOGGLE] auto-fit failed: {fe}")
+
+            save_ui_state()
+            bpy.ops.vse.pb_interaction("INVOKE_DEFAULT")
+            _ensure_meter_timer()
+            _pb_engine_enable()
+            # Ensure tracks exist even on blank scenes
+            try:
+                _sync_tracks_to_vse(context.scene, reset_values=False)
+            except Exception as _se:
+                print(f"[TOGGLE] track sync failed: {_se}")
+        else:
+            _set_hud('HUD_AREA_PTR', None)
+            save_ui_state()
+            _cancel_meter_timer()
+            _pb_engine_disable()
+            # Turning the HUD off is "closing the tool" from Luke's side —
+            # Blender keeps running and the file doesn't change, so neither
+            # the addon's unregister() nor on_load_post() fires. Without
+            # this, a still-playing one-shot cue (e.g. PACK-A-PUNCH's audio)
+            # had nothing telling it to stop, even though the HUD (and the
+            # skin it swapped) had just gone away.
+            stop_all_oneshots()
+            _pap_mod.reset()
+
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# VSE_OT_RefreshPBTracks
+# ---------------------------------------------------------------------------
+class VSE_OT_RefreshPBTracks(bpy.types.Operator):
+    bl_idname     = "vse.refresh_pb_tracks"
+    bl_label      = "Refresh Tracks"
+    bl_description = "Sync fader strips with current VSE channels"
+
+    def execute(self, context):
+        _sync_tracks_to_vse(context.scene, reset_values=False)
+        for area in context.screen.areas:
+            area.tag_redraw()
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Panel
+# ---------------------------------------------------------------------------
+class VSE_PT_Hijacker_Panel(bpy.types.Panel):
+    bl_label       = "The Hijacker"
+    bl_space_type  = "SEQUENCE_EDITOR"
+    bl_region_type = "UI"
+    bl_category    = "Hijacker"
+
+    def draw(self, context):
+        self.layout.operator("vse.refresh_pb_tracks")
+        icon_id = _get_hijacker_icon_id()
+        if icon_id:
+            self.layout.operator("vse.toggle_pb_gui", icon_value=icon_id)
+        else:
+            self.layout.operator("vse.toggle_pb_gui")
+
+
+def _get_hijacker_icon_id():
+    """Best-effort lookup of the loaded header-logo icon's id.
+    Never raises — a bad/missing icon should fall back to text-only
+    buttons, not break the header draw every frame."""
+    try:
+        if _icons and "hijacker_logo" in _icons:
+            return _icons["hijacker_logo"].icon_id
+    except Exception as e:
+        print(f"[HIJACKER] header icon lookup failed: {e}")
+    return 0
+
+
+def draw_header_buttons(self, context):
+    icon_id = _get_hijacker_icon_id()
+    if icon_id:
+        self.layout.operator("vse.toggle_pb_gui", text="The Hijacker", icon_value=icon_id)
+    else:
+        # Icon failed to load (e.g. missing file) — fall back to text-only
+        # so the button is never silently lost.
+        self.layout.operator("vse.toggle_pb_gui", text="The Hijacker")
+    # Speaker button: opens the sidebar with the audio settings (Tool tab)
+    try:
+        self.layout.operator("hijacker.open_audio_settings", text="", icon='SPEAKER')
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Load handler
+# ---------------------------------------------------------------------------
+@bpy.app.handlers.persistent
+def on_load_post(filepath, *args):
+    from core.engine import reset_engine
+    from core.audio  import _pb_engine_disable as _disable
+    from core.audio  import _pb_recover_stuck_audio as _recover
+    _disable()
+    _recover()
+    # Switching files (or File > New) doesn't call the addon's own
+    # unregister() — only quitting Blender or disabling the addon does —
+    # so a still-playing one-shot cue (e.g. PACK-A-PUNCH's audio) had
+    # nothing telling it to stop when Luke just changed files. This is
+    # the same orphaned-subprocess issue stop_all_oneshots() already
+    # solves for addon-disable and Blender-quit; load_post is the missing
+    # third case.
+    stop_all_oneshots()
+    _pap_mod.reset()
+    clear_texture_cache()
+    reset_engine()
+    load_ui_state()
+    global _deferred_tries
+    _deferred_tries = 0
+    # The area pointer from before the load belongs to a screen that no
+    # longer exists; clear it so nothing is blocked while we wait to find
+    # the real one in _deferred_invoke().
+    _set_hud('HUD_AREA_PTR', None)
+    if _get_hud('pb_ui_enabled'):
+        if not bpy.app.timers.is_registered(_deferred_invoke):
+            bpy.app.timers.register(_deferred_invoke, first_interval=0.1)
+
+
+_deferred_tries = 0
+
+
+def _find_hud_area():
+    """(window, area, WINDOW region) of the largest Node Editor, or None —
+    the same choice the toggle button makes."""
+    best, best_px = None, 0
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != 'NODE_EDITOR':
+                    continue
+                for rgn in area.regions:
+                    if rgn.type == 'WINDOW' and rgn.width * rgn.height > best_px:
+                        best_px = rgn.width * rgn.height
+                        best = (window, area, rgn)
+    except Exception:
+        pass
+    return best
+
+
+def _deferred_invoke():
+    """Bring the HUD back to life after a .blend that was saved with it open
+    is loaded.
+
+    Loading a file cancels every modal operator and removes every
+    bpy.app.timers timer, but the scene property saying "HUD enabled" comes
+    back with the file — so the HUD drew (its draw handler survives) while
+    nothing was listening to the mouse and the meters had stopped. Two things
+    were wrong in the old version of this function:
+      * the interaction operator was started from a timer, which has no
+        window/area/region, so its modal handler never received any events —
+        it now runs inside a temp_override of the Node Editor it will serve;
+      * the meter timer's "already registered" flag was still True from the
+        previous file even though Blender had deleted the timer itself, so
+        _ensure_meter_timer() did nothing — it is now cancelled first so the
+        flag is reset before a fresh timer is made.
+    If the window/areas aren't ready yet this retries for a few seconds."""
+    global _deferred_tries
+    found = _find_hud_area()
+    if found is None:
+        _deferred_tries += 1
+        if _deferred_tries < 20:
+            return 0.25
+        print("[STATE] no Node Editor found to restore the Hijacker into")
+        _deferred_tries = 0
+        return None
+    _deferred_tries = 0
+    window, area, region = found
+    try:
+        _set_hud('HUD_AREA_PTR', area.as_pointer())
+        _pap_mod.reset()
+        with bpy.context.temp_override(window=window, area=area, region=region):
+            bpy.ops.vse.pb_interaction("INVOKE_DEFAULT")
+        _cancel_meter_timer()      # resets the stale "registered" flag
+        _ensure_meter_timer()
+        _pb_engine_enable()
+        # Ensure tracks are synced even on blank scenes
+        try:
+            scene = bpy.context.scene
+            if scene:
+                _sync_tracks_to_vse(scene, reset_values=False)
+        except Exception as se:
+            print(f"[STATE] track sync failed: {se}")
+        for w in bpy.context.window_manager.windows:
+            for a in w.screen.areas:
+                a.tag_redraw()
+        print(f"[STATE] Hijacker restored after file load (area ptr={area.as_pointer()})")
+    except Exception as e:
+        print(f"[STATE] deferred invoke failed: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+from core.properties import PB_TrackSettings
+
+classes = (
+    VSE_OT_SetFaderValue,
+    VSE_OT_TogglePBGui,
+    VSE_OT_RefreshPBTracks,
+    VSE_OT_PB_Interaction,
+    VSE_PT_Hijacker_Panel,
+)
+
+_handle = None
+_icons  = None  # bpy.utils.previews.ImagePreviewCollection holding the header-button logo
+
+
+def register():
+    global _handle, _icons
+    import importlib, sys
+
+    # Load the header-button logo as a custom icon. This is separate from
+    # the PNG->gpu.texture skin system in ui/mixer/texture_cache.py — that
+    # system is for textures drawn by hand inside the GPU HUD, while a
+    # native layout.operator() button icon has to be registered through
+    # bpy.utils.previews and referenced by icon_value instead.
+    try:
+        _icons = bpy.utils.previews.new()
+        _icon_path = os.path.join(_ADDON_DIR, "ui", "assets", "icons", "hijacker_icon.png")
+        _icons.load("hijacker_logo", _icon_path, 'IMAGE')
+    except Exception as _ie:
+        print(f"[HIJACKER] could not load header icon: {_ie}")
+        _icons = None
+
+    # Startup self-heal: if a previous Blender crash left the system audio
+    # device stuck disabled (see _pb_recover_stuck_audio's docstring), fix it
+    # now, before anything else, so this session isn't silent by default.
+    _pb_recover_stuck_audio()
+
+    # Force Python to re-read all addon modules from disk on every register.
+    # Without this, editing .py files has no effect until Blender fully restarts
+    # because Python caches compiled .pyc bytecode in memory.
+    _addon_modules = [
+        "ui.mixer.channel_strip",
+        "ui.mixer.draw_utils",
+        "ui.mixer.master_widget",
+        "ui.mixer.mixer_hud",
+        "ui.mixer.texture_cache",
+        "ui.mixer.interaction",
+        "core.master",
+        "core.wav_writer",
+        "core.strip_volume",
+        "core.audio",
+        "core.meters",
+        "core.constants",
+        "core.properties",
+        "core.perf_monitor",
+        "core.packapunch",
+        "core.rack_screen_sequence",
+        "core.prefs",
+        "Racks",
+        "ui.racks.rack_base",
+        "ui.racks.rack_comp",
+        "ui.racks.rack_delay",
+        "ui.racks.rack_mixdown",
+        "ui.racks.rack_eq",
+    ]
+    importlib.invalidate_caches()
+    # Force Racks.py to reload by removing it from sys.modules first
+    # This bypasses any stale .pyc cache
+    for _force_mod in ("Racks",):
+        if _force_mod in sys.modules:
+            del sys.modules[_force_mod]
+
+    # Re-import Racks and rebind all public API functions
+    global draw_racks, register_racks, unregister_racks
+    global racks_handle_click, racks_hit_test, update_led_states, rack_knob_hit_test
+    try:
+        import Racks as _racks_fresh
+        draw_racks          = _racks_fresh.draw_racks
+        register_racks      = _racks_fresh.register_racks
+        unregister_racks    = _racks_fresh.unregister_racks
+        racks_handle_click  = _racks_fresh.handle_click
+        racks_hit_test      = _racks_fresh.hit_test
+        update_led_states   = _racks_fresh.update_led_states
+        rack_knob_hit_test  = _racks_fresh.rack_knob_hit_test
+        print("[RACKS] Racks.py rebound in register()")
+        # Reset mixer_hud's cached draw_racks function so it picks up the new module
+        import ui.mixer.mixer_hud as _mhud
+        _mhud._draw_racks_fn = None
+    except Exception as _re:
+        print(f"[RACKS] WARNING: could not rebind Racks.py: {_re}")
+    for mod_name in _addon_modules:
+        if mod_name in sys.modules:
+            try:
+                importlib.reload(sys.modules[mod_name])
+            except Exception as _re:
+                print(f"[RELOAD] {mod_name}: {_re}")
+        else:
+            try:
+                importlib.import_module(mod_name)
+            except Exception as _re:
+                print(f"[IMPORT] {mod_name}: {_re}")
+    from core.constants import ASSETS_DIR
+    set_skin_dir(ASSETS_DIR, "default")
+
+    register_properties()
+    register_racks()
+    _perf_mod.register()
+    _pap_mod.register()
+    for cls in classes:
+        # Safely unregister first in case of hot-reload or double-registration
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+        bpy.utils.register_class(cls)
+
+    # Audio settings (output device, buffer size, latency compensation).
+    # Always shown in Sequence Editor > Sidebar > Hijacker > Audio Settings.
+    # When installed as a real add-on (__package__ is its package name) they
+    # also appear on the Edit > Preferences > Add-ons page. When Loader.py is
+    # run directly as a dev script __package__ is empty, and Blender doesn't
+    # treat it as an add-on, so only the sidebar panel is available.
+    try:
+        _prefs_mod.register(__package__ or "")
+    except Exception as _pe:
+        print(f"[HIJACKER] could not register audio settings: {_pe}")
+        import traceback; traceback.print_exc()
+
+    bpy.types.NODE_HT_header.append(draw_header_buttons)
+    _handle = bpy.types.SpaceNodeEditor.draw_handler_add(
+        draw_callback_px, (None, None), "WINDOW", "POST_PIXEL")
+
+    if on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(on_load_post)
+
+    print("[REGISTER] The Hijacker registered")
+
+
+def unregister():
+    global _handle, _icons
+    _cancel_meter_timer()
+    _pb_engine_disable()
+    # Kill any still-running one-shot audio subprocess (e.g. a PackAPunch
+    # cue) — see core/audio.py's atexit registration for why this is also
+    # needed here, not just at Blender quit.
+    stop_all_oneshots()
+    unregister_racks()
+    _perf_mod.unregister()
+    _pap_mod.unregister()
+    _rackseq_mod.clear_all()
+
+    if on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(on_load_post)
+
+    if _handle:
+        bpy.types.SpaceNodeEditor.draw_handler_remove(_handle, "WINDOW")
+
+    bpy.types.NODE_HT_header.remove(draw_header_buttons)
+
+    if _icons:
+        try:
+            bpy.utils.previews.remove(_icons)
+        except Exception as e:
+            print(f"[HIJACKER] could not free header icon: {e}")
+        _icons = None
+
+    # The settings sub-panel is a child of VSE_PT_Hijacker_Panel, so it goes first
+    try:
+        _prefs_mod.unregister()
+    except Exception as _pe:
+        print(f"[HIJACKER] could not unregister audio settings: {_pe}")
+
+    for cls in reversed(classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+
+    unregister_properties()
+    print("[UNREGISTER] The Hijacker unregistered")
+
+
+if __name__ == "__main__":
+    register()

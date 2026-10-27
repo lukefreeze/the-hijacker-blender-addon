@@ -1,0 +1,5 @@
+# The effect-slot seqlock deliberately reads fields that a writer may be modifying
+# and retries if the sequence counter changed.
+race:hj_snapshot_slot
+race:HijackerEngine::set_effect_slot
+race:HijackerEngine::clear_effect_slot
