@@ -99,31 +99,44 @@ FRAMES_DIR   = os.path.join(PACKAPUNCH_DIR, "frames")
 # read works — it gets decoded to WAV once regardless, see
 # _ensure_wav_audio() below).
 AUDIO_SRC    = os.path.join(PACKAPUNCH_DIR, "PackAPunch.mp3")
+if not os.path.isfile(AUDIO_SRC):
+    # The file is committed as "packApunch.mp3"; case-sensitive filesystems
+    # (Linux, macOS) won't match the name above, so pick it up case-insensitively.
+    try:
+        for _n in os.listdir(PACKAPUNCH_DIR):
+            if _n.lower() == "packapunch.mp3":
+                AUDIO_SRC = os.path.join(PACKAPUNCH_DIR, _n)
+                break
+    except OSError:
+        pass
 _WAV_CACHE   = os.path.join(tempfile.gettempdir(), "hijacker_packapunch_cache.wav")
 
 TARGET_SKIN  = "packapunch"
 DEFAULT_SKIN = "default"
 
-# The frame rate the PNG sequence in frames/ was actually exported at.
-# This is the ONLY thing that determines how long the visual overlay
-# plays for (frame_count / VIDEO_FPS) — deliberately decoupled from the
-# audio cue's length, see the module docstring above. Update this if a
-# future re-export changes frame rate.
-VIDEO_FPS            = 24.0
+# The frame rate the PNG sequence in frames/ plays at. The original 24fps
+# export was thinned to every 2nd frame to halve the download size, so it
+# plays at 12fps for the same on-screen speed. Together with HOLD_LAST_S
+# below this is the ONLY thing that determines how long the visual overlay
+# plays for — deliberately decoupled from the audio cue's length, see the
+# module docstring above. Update both if a future re-export changes them.
+VIDEO_FPS            = 12.0
+# After the last frame (pure black) the overlay simply stays on it for this
+# many seconds before the fade starts, instead of shipping a hundred-odd
+# identical black frames. Original total on-screen time was 14.75s.
+HOLD_LAST_S          = 5.83
 # Used only when there's no frame sequence at all yet, so an audio-only
 # transition still has a sensible on-screen duration before the button
 # re-arms (the audio itself is unaffected by this — it always plays to
 # its own full length regardless).
 FALLBACK_DURATION_S  = 3.0
 
-# The exported sequence ends on a hold of fully opaque BLACK frames, then a
-# few fully transparent ones. Rather than cutting from black straight to the
-# new skin, the overlay's own alpha is faded 1 -> 0 over the LAST
-# FADE_FRAMES frames of the (trimmed) sequence, at VIDEO_FPS — 24 frames is
-# one second. The fade is computed from wall-clock time like everything
-# else here, so it stays smooth even if redraws are skipped. Set to 0 to
-# restore the old hard cut.
-FADE_FRAMES          = 24
+# The sequence ends on pure BLACK (held for HOLD_LAST_S). Rather than cutting
+# from black straight to the new skin, the overlay's own alpha is faded
+# 1 -> 0 over the LAST FADE_S seconds of the transition. The fade is computed
+# from wall-clock time like everything else here, so it stays smooth even if
+# redraws are skipped. Set to 0 to restore the old hard cut.
+FADE_S               = 1.0
 
 # While the transition audio plays, the mixing desk's channel meters follow
 # the MUSIC instead of the channels' own signal (see audio_meter_levels()
@@ -174,7 +187,7 @@ _frame_tex_cache  = {}       # frame index -> gpu.types.GPUTexture, rolling wind
 _frame_img_cache  = {}       # frame index -> bpy.types.Image, freed alongside the texture
 _fps              = VIDEO_FPS
 _duration_s       = FALLBACK_DURATION_S
-_fade_start_frame = 0.0      # frame position where the alpha fade begins
+_fade_start_s     = 0.0      # time (s) at which the alpha fade begins
 _meter_env        = None     # (wav_path, mtime, ndarray[n, METER_BANDS], hop_s)
 _meter_t0         = None     # perf_counter() when the audio cue was started
 _cue_handle       = None     # play_oneshot() handle of the transition audio, so going back can stop just it
@@ -448,32 +461,7 @@ def _scan_frames():
         if key not in seen:
             seen.add(key)
             paths.append(p)
-    return _trim_trailing_clear_frames(sorted(paths))
-
-
-def _trim_trailing_clear_frames(paths):
-    """Drop the fully transparent frames the export leaves after the black
-    hold, so the alpha fade (see FADE_FRAMES) lands on the end of the video
-    instead of partly on frames that draw nothing.
-
-    Detected without decoding any image: a uniform frame compresses to the
-    same byte count every time, so trailing files whose size equals the
-    LAST file's size are the same blank frame. This only ever trims when an
-    earlier frame has a different size, and always keeps at least one frame,
-    so a differently-exported sequence is left alone rather than damaged
-    (worst case: the fade just runs over the trailing frames as they are)."""
-    if len(paths) < 2:
-        return paths
-    try:
-        last_size = os.path.getsize(paths[-1])
-        keep = len(paths)
-        while keep > 1 and os.path.getsize(paths[keep - 1]) == last_size:
-            keep -= 1
-    except OSError:
-        return paths
-    if keep == len(paths):
-        return paths
-    return paths[:keep]
+    return sorted(paths)
 
 
 def _load_frame(idx, blocking):
@@ -823,7 +811,7 @@ def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: b
     the way back out there's nothing to reveal, so there's no reason to
     play the sequence (or wait through it) at all."""
     global _active, _start_wall, _frame_paths, _fps, \
-           _duration_s, _fade_start_frame, _target_skin, _redraw_timer_registered
+           _duration_s, _fade_start_s, _target_skin, _redraw_timer_registered
 
     if _active:
         return
@@ -872,8 +860,8 @@ def start(target_skin: str = TARGET_SKIN, play_audio: bool = True, play_video: b
 
     _frame_paths = _scan_frames()
     _fps        = VIDEO_FPS
-    _duration_s = (len(_frame_paths) / _fps) if _frame_paths else FALLBACK_DURATION_S
-    _fade_start_frame = max(0.0, float(len(_frame_paths) - FADE_FRAMES))
+    _duration_s = ((len(_frame_paths) / _fps) + HOLD_LAST_S) if _frame_paths else FALLBACK_DURATION_S
+    _fade_start_s = max(0.0, _duration_s - FADE_S)
 
     _start_wall = time.perf_counter()
     _active     = True
@@ -895,7 +883,7 @@ def get_overlay_frame():
     finished (or was never active). texture_or_None is None whenever no
     frame art exists yet for this index — the caller should just skip
     drawing the overlay that tick, the skin swap underneath already
-    happened at start(). alpha is 1.0 until the final FADE_FRAMES frames,
+    happened at start(). alpha is 1.0 until the final FADE_S seconds,
     then eases down to 0 so the overlay dissolves to reveal the skin; the
     caller multiplies it into the frame's own alpha."""
     global _active, _dbg_redraws_total, _dbg_last_report_t, \
@@ -918,12 +906,12 @@ def get_overlay_frame():
     if _frame_paths:
         frame_idx = min(frame_idx, len(_frame_paths) - 1)
 
-    # Fade-out over the last FADE_FRAMES frames (continuous, not per-frame
+    # Fade-out over the last FADE_S seconds (continuous, not per-frame
     # steps), smoothstepped so it eases in and out instead of starting and
     # ending abruptly.
     alpha = 1.0
-    if FADE_FRAMES > 0 and _frame_paths:
-        f = (elapsed * _fps - _fade_start_frame) / float(FADE_FRAMES)
+    if FADE_S > 0 and _frame_paths:
+        f = (elapsed - _fade_start_s) / FADE_S
         if f > 0.0:
             f = min(f, 1.0)
             alpha = 1.0 - f * f * (3.0 - 2.0 * f)
