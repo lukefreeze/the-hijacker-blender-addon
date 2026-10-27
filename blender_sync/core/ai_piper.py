@@ -31,7 +31,31 @@ from core import vse_compat as _vse
 # ---------------------------------------------------------------------------
 _ADDON_DIR    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PIPER_DIR    = os.path.join(_ADDON_DIR, "ai_engines", "piper")
-_VOICES_DIR   = os.path.join(_PIPER_DIR, "voices")
+_VOICES_DIR   = os.path.join(_PIPER_DIR, "voices")   # legacy/dev location inside the add-on folder
+
+
+def _user_piper_dir():
+    """Per-user folder for the downloaded Piper engine + voices. Lives OUTSIDE
+    the add-on folder (next to the AI virtual environment) so removing,
+    updating or reinstalling the add-on doesn't delete several hundred MB
+    of downloads. Created on demand."""
+    try:
+        return bpy.utils.user_resource('SCRIPTS', path="hijacker_piper", create=True)
+    except Exception:
+        return _PIPER_DIR
+
+
+def _piper_roots():
+    """Folders searched for the engine and voices: the per-user download
+    folder first, then the add-on's own folder (dev checkouts / manual installs)."""
+    roots = [_user_piper_dir()]
+    if _PIPER_DIR not in roots:
+        roots.append(_PIPER_DIR)
+    return roots
+
+
+def _user_voices_dir():
+    return os.path.join(_user_piper_dir(), "voices")
 
 
 def _ensure_executable(path):
@@ -98,30 +122,29 @@ def _get_piper_exe():
         preferred_sub = "linux_x64"
         exe_name      = "piper"
 
-    # 1. Preferred platform subfolder
-    path = os.path.join(_PIPER_DIR, preferred_sub, exe_name)
-    if os.path.exists(path):
-        return _ensure_executable(path)
+    for root in _piper_roots():
+        # 1. Preferred platform subfolder
+        path = os.path.join(root, preferred_sub, exe_name)
+        if os.path.exists(path):
+            return _ensure_executable(path)
 
-    # 2. Scan all subfolders for the exe (handles any naming convention)
-    if os.path.isdir(_PIPER_DIR):
-        for entry in os.listdir(_PIPER_DIR):
-            sub_path = os.path.join(_PIPER_DIR, entry)
-            if os.path.isdir(sub_path):
-                candidate = os.path.join(sub_path, exe_name)
-                if os.path.exists(candidate):
-                    print(f"[PIPER] found exe in non-standard folder: {entry}/")
-                    return _ensure_executable(candidate)
+        # 2. Scan all subfolders for the exe (handles any naming convention)
+        if os.path.isdir(root):
+            for entry in os.listdir(root):
+                sub_path = os.path.join(root, entry)
+                if os.path.isdir(sub_path):
+                    candidate = os.path.join(sub_path, exe_name)
+                    if os.path.exists(candidate):
+                        print(f"[PIPER] found exe in folder: {entry}/")
+                        return _ensure_executable(candidate)
 
-    # 3. Exe placed directly in piper/ folder
-    flat = os.path.join(_PIPER_DIR, exe_name)
-    if os.path.exists(flat):
-        print(f"[PIPER] found exe in piper/ root")
-        return _ensure_executable(flat)
+        # 3. Exe placed directly in the root folder
+        flat = os.path.join(root, exe_name)
+        if os.path.exists(flat):
+            print(f"[PIPER] found exe in {root}")
+            return _ensure_executable(flat)
 
-    print(f"[PIPER] searched: {_PIPER_DIR}")
-    if os.path.isdir(_PIPER_DIR):
-        print(f"[PIPER] contents: {os.listdir(_PIPER_DIR)}")
+    print(f"[PIPER] searched: {_piper_roots()}")
     return None
 
 
@@ -131,7 +154,9 @@ def _discover_voices():
     """
     voices  = []
     found   = set()
-    search_dirs = [_VOICES_DIR, _PIPER_DIR]
+    search_dirs = []
+    for _r in _piper_roots():
+        search_dirs += [os.path.join(_r, "voices"), _r]
     for search_dir in search_dirs:
         if not os.path.isdir(search_dir):
             continue
@@ -321,8 +346,8 @@ def download_voice(voice_key):
 
     def _worker():
         try:
-            os.makedirs(_VOICES_DIR, exist_ok=True)
-            onnx_dest = os.path.join(_VOICES_DIR, os.path.basename(entry["onnx_path"]))
+            os.makedirs(_user_voices_dir(), exist_ok=True)
+            onnx_dest = os.path.join(_user_voices_dir(), os.path.basename(entry["onnx_path"]))
             json_dest = onnx_dest + ".json"
             _dl_one(_VOICE_FILES_BASE + entry["onnx_path"], onnx_dest, 0, 90)
             _dl_one(_VOICE_FILES_BASE + entry["json_path"], json_dest, 90, 100)
@@ -369,7 +394,7 @@ def engine_target():
 
 
 def engine_install_dir():
-    return os.path.join(_PIPER_DIR, engine_target()[1])
+    return os.path.join(_user_piper_dir(), engine_target()[1])
 
 
 def piper_engine_present(max_age=1.0):
@@ -382,10 +407,12 @@ def piper_engine_present(max_age=1.0):
     exe_name = engine_target()[2]
     found = False
     try:
-        cands = [os.path.join(_PIPER_DIR, exe_name)]
-        if os.path.isdir(_PIPER_DIR):
-            for entry in os.listdir(_PIPER_DIR):
-                cands.append(os.path.join(_PIPER_DIR, entry, exe_name))
+        cands = []
+        for root in _piper_roots():
+            cands.append(os.path.join(root, exe_name))
+            if os.path.isdir(root):
+                for entry in os.listdir(root):
+                    cands.append(os.path.join(root, entry, exe_name))
         found = any(os.path.isfile(c) for c in cands)
     except Exception:
         found = False
@@ -423,24 +450,90 @@ class _EngineCancelled(Exception):
     pass
 
 
-def _engine_download(url, dest, pct_lo, pct_hi, msg):
-    import urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": _HTTP_USER_AGENT})
+def _engine_download(url, dest, pct_lo, pct_hi, msg, magic=None):
+    """Download url -> dest with progress, RESUMING after dropped connections.
+
+    Some servers/networks close the connection part-way through a large file
+    (seen in the wild: GitHub's CDN cutting a 22 MB zip at 17 MB). When the
+    stream ends early or errors, this re-requests only the missing bytes with
+    an HTTP Range header and carries on, giving up only after repeated
+    attempts that make no progress at all. The finished file's size is checked
+    against the server's Content-Length and, when `magic` (tuple of allowed
+    leading bytes) is given, its first bytes are checked too - so an error
+    page saved under a .zip name fails with a clear message."""
+    import urllib.request, time as _t
     tmp = dest + ".part"
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        total = int(resp.headers.get("Content-Length", 0)) or 0
-        done = 0
-        with open(tmp, "wb") as f:
-            while True:
-                if _engine_cancel:
-                    raise _EngineCancelled()
-                chunk = resp.read(1 << 16)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                frac = min(1.0, done / total) if total else 0.0
-                _engine_state.update(pct=pct_lo + frac * (pct_hi - pct_lo), msg=msg)
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    done = 0
+    total = 0
+    head = b""
+    ctype = ""
+    last_err = None
+    stalls = 0
+    attempts = 0
+    while True:
+        if _engine_cancel:
+            raise _EngineCancelled()
+        if total and done >= total:
+            break
+        if stalls >= 6 or attempts >= 80:
+            raise RuntimeError(
+                f"download kept stopping at {done} of {total or '?'} bytes "
+                f"({last_err or 'connection closed'}) - check your internet/firewall and try again")
+        attempts += 1
+        headers = {"User-Agent": _HTTP_USER_AGENT}
+        if done:
+            headers["Range"] = f"bytes={done}-"
+        progressed = False
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = getattr(resp, "status", 200)
+                ctype = resp.headers.get("Content-Type", ctype)
+                if done and status != 206:
+                    done = 0                      # server ignored Range: start over
+                    head = b""
+                cr = resp.headers.get("Content-Range", "")
+                if cr and "/" in cr and cr.rsplit("/", 1)[1].strip().isdigit():
+                    total = int(cr.rsplit("/", 1)[1])
+                elif not done:
+                    total = int(resp.headers.get("Content-Length", 0) or 0)
+                with open(tmp, "ab" if done else "wb") as f:
+                    while True:
+                        if _engine_cancel:
+                            raise _EngineCancelled()
+                        chunk = resp.read(1 << 16)
+                        if not chunk:
+                            break
+                        if len(head) < 16:
+                            head += chunk[:16 - len(head)]
+                        f.write(chunk)
+                        done += len(chunk)
+                        progressed = True
+                        frac = min(1.0, done / total) if total else 0.0
+                        _engine_state.update(pct=pct_lo + frac * (pct_hi - pct_lo), msg=msg)
+        except _EngineCancelled:
+            raise
+        except Exception as e:
+            last_err = e
+            print(f"[PIPER] download interrupted at {done} of {total or '?'} bytes: {e}")
+        if progressed:
+            stalls = 0
+        else:
+            stalls += 1
+            _t.sleep(min(2.0 * stalls, 8.0))
+        if not total:
+            break          # server didn't say how big it is: accept what we got
+        if done < total:
+            print(f"[PIPER] resuming download from byte {done} of {total}")
+    print(f"[PIPER] downloaded {url} -> {done} bytes, type '{ctype}', starts {head[:8]!r}")
+    if total and done != total:
+        raise RuntimeError(f"download incomplete ({done} of {total} bytes) - try again")
+    if magic and not head.startswith(tuple(magic)):
+        raise RuntimeError(
+            f"server did not send the expected file (type '{ctype or 'unknown'}', "
+            f"{done} bytes) - check your internet/firewall")
     os.replace(tmp, dest)
 
 
@@ -523,13 +616,14 @@ def start_engine_install():
     _engine_state.update(status="DOWNLOADING", pct=0.0, msg="Downloading Piper", error="")
 
     archive_name, sub, exe_name = engine_target()
-    dest_dir = os.path.join(_PIPER_DIR, sub)
+    dest_dir = os.path.join(_user_piper_dir(), sub)
 
     def _worker():
         tmp_dir = tempfile.mkdtemp(prefix="hijacker_piper_")
         try:
             archive = os.path.join(tmp_dir, archive_name)
-            _engine_download(_ENGINE_BASE_URL + archive_name, archive, 0, 60, "Downloading Piper")
+            _engine_download(_ENGINE_BASE_URL + archive_name, archive, 0, 60, "Downloading Piper",
+                             magic=((b"PK\x03\x04",) if archive_name.endswith(".zip") else (b"\x1f\x8b",)))
             _engine_state.update(status="EXTRACTING", pct=60.0, msg="Unpacking")
             _extract_engine(archive, dest_dir)
 
@@ -548,9 +642,9 @@ def start_engine_install():
             if not _discover_voices():
                 _engine_state.update(status="VOICE", pct=70.0, msg="Downloading starter voice")
                 try:
-                    os.makedirs(_VOICES_DIR, exist_ok=True)
+                    os.makedirs(_user_voices_dir(), exist_ok=True)
                     base = os.path.basename(STARTER_VOICE_PATH)
-                    onnx = os.path.join(_VOICES_DIR, base + ".onnx")
+                    onnx = os.path.join(_user_voices_dir(), base + ".onnx")
                     _engine_download(_VOICE_FILES_BASE + STARTER_VOICE_PATH + ".onnx", onnx, 70, 98,
                                      "Downloading starter voice")
                     _engine_download(_VOICE_FILES_BASE + STARTER_VOICE_PATH + ".onnx.json",
@@ -700,7 +794,7 @@ def generate_piper(ai_idx, context, preview_only=False):
         rack.ai_status    = "ERROR"
         rack.ai_error_msg = "piper executable not found for this platform"
         print(f"[PIPER] ERROR: piper executable not found")
-        print(f"[PIPER] Expected at: {os.path.join(_PIPER_DIR, '<platform>', 'piper[.exe]')}")
+        print(f"[PIPER] Expected at: {os.path.join(_user_piper_dir(), '<platform>', 'piper[.exe]')}")
         return
 
     text = (getattr(rack, 'ai_text', '') or '').strip()
@@ -714,8 +808,8 @@ def generate_piper(ai_idx, context, preview_only=False):
     voices = _discover_voices()
     if not voices:
         rack.ai_status    = "ERROR"
-        rack.ai_error_msg = "no voice models found — add .onnx voices to ai_engines/piper/voices/"
-        print(f"[PIPER] ERROR: no voice models found in {_VOICES_DIR}")
+        rack.ai_error_msg = "no voice models found — click + ADD VOICE in the rack"
+        print(f"[PIPER] ERROR: no voice models found in {_piper_roots()}")
         return
 
     # p4 stores the voice index (float), separate from preset_idx (knob preset)

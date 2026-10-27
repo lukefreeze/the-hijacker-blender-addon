@@ -348,7 +348,7 @@ def _draw_engine_warning(rx, ry, rw, rh, scale):
                cx2 + 6 * scale, cy2 + ch / 2 - fs_b / 2, fs_b, _WARN_TEXT)
     ty = cy2 - lh * 1.2
     sub = _ap.engine_target()[1]
-    _draw_text("then unzip it into  ai_engines/piper/" + sub + "/", tx, ty, fs_s, _WARN_DIM)
+    _draw_text("then unzip it into  Blender user scripts/hijacker_piper/" + sub + "/", tx, ty, fs_s, _WARN_DIM)
     ty -= lh
     _draw_text("Or press the button: it downloads Piper and a starter voice (~80 MB).",
                tx, ty, fs_s, _WARN_DIM)
@@ -948,7 +948,7 @@ def _draw_piper_body(rx, ry, rw, rh, rack, ai_idx, scale):
                        pg_fs, _TEXT_DIM)
     else:
         _draw_text("No voices found in", vp_x+6*scale, vp_y+vp_h*0.6, no_fs, _TEXT_DIM)
-        _draw_text("ai_engines/piper/voices/", vp_x+6*scale, vp_y+vp_h*0.45, no_fs, _TEXT_DIM)
+        _draw_text("the Piper voices folder.", vp_x+6*scale, vp_y+vp_h*0.45, no_fs, _TEXT_DIM)
         _draw_text("Click + ADD VOICE above.", vp_x+6*scale, vp_y+vp_h*0.35, no_fs, _TEXT_DIM)
 
     # ── OUTPUT WAVEFORM ───────────────────────────────────────────────────────
@@ -1743,7 +1743,7 @@ def piper_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
             _arrows(scroll > 0, scroll + PP_CARD_ROWS < len(voices), lbl)
         else:
             c0 = R(g.card(0))
-            _pp_text("No voices found in ai_engines/piper/voices/", c0[0] + 14 * g.s, g.Y(140), PP_FS_CARD, g, PP_TXT_DIM, lv)
+            _pp_text("No voices found - use + ADD VOICE", c0[0] + 14 * g.s, g.Y(140), PP_FS_CARD, g, PP_TXT_DIM, lv)
             _pp_text("Click + ADD VOICE above.", c0[0] + 14 * g.s, g.Y(166), PP_FS_CARD, g, PP_TXT_DIM, lv)
 
     # ── output read-out ──────────────────────────────────────────────────────────────────────────────
