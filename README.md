@@ -195,6 +195,10 @@ The Hijacker is free software, licensed under the **GNU General Public License v
 
 If you fork, modify or build on this project, the GPL requires you to keep it open under the same licence, and the author attribution in [NOTICE.md](NOTICE.md) must be preserved in your version's source and credits.
 
+### About this project
+
+The Hijacker was created by Luke Bridger, an animator, with AI assistance (Claude by Anthropic). I designed the tool and its look, directed the work, and tested it by hand throughout. Much of the code was written by AI under that direction, and AI tools were also used in making some of the artwork. It's released as open source so people can use it, learn from it and improve it.
+
 ### AI engines and models
 
 The Hijacker **does not include any AI engine, model or voice**. The AI racks (Piper TTS, Demucs, kNN-VC, VoiceFixer, Whisper) download their software and model files from their official sources when you choose to install them, and each remains under its own licence. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Voice models and voice-conversion tools carry their own usage terms — check them before publishing results, and only convert voices you have the right to use.

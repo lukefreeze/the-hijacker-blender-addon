@@ -77,3 +77,9 @@ blender_sync/ai_engines/piper/voices/
 *.ort
 *.dylib
 Morgan Freeman.wav
+
+# Release zips
+TheHijacker-*.zip
+
+# Full-size source transition frames (kept locally, never committed)
+_source_frames_full/

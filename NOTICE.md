@@ -1,7 +1,7 @@
 # The Hijacker — Copyright and Attribution Notice
 
 The Hijacker — Blender Audio Addon
-Copyright (C) 2025-2026 Luke Freeze
+Copyright (C) 2025-2026 Luke Bridger
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -17,7 +17,7 @@ author attribution must be preserved in any modified version, fork, branch or
 adaptation of this work, in source and in any user-visible credits, About or
 README text that the derivative provides:
 
-> Based on "The Hijacker" by Luke Freeze —
+> Based on "The Hijacker" by Luke Bridger —
 > https://github.com/lukefreeze/the-hijacker-blender-addon
 
 Existing copyright notices and this NOTICE file must also be kept intact.
