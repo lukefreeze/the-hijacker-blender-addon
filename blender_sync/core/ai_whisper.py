@@ -64,6 +64,20 @@ LANGUAGES = [
 
 _POSITION_Y = {0: 0.90, 1: 0.50, 2: 0.05}
 
+# Latest PROGRESS/STATUS from the running runner, per rack index, for the
+# rack's status bar (plain dict: written by the worker thread, read by draw code).
+_progress_text = {}
+
+
+def get_progress_text(ai_idx):
+    """e.g. '15% - Downloading model 310 of ~1530 MB (first use only)', or ''."""
+    d = _progress_text.get(ai_idx)
+    if not d:
+        return ""
+    pct, msg = d.get("pct", ""), d.get("msg", "")
+    return (f"{pct}% - {msg}" if pct and msg else (f"{pct}%" if pct else msg))
+
+
 
 def _find_system_python():
     global _PYTHON_CMD
@@ -340,6 +354,7 @@ def transcribe_whisper(ai_idx, context):
 
     rack.ai_status        = "PROCESSING"
     _cancel_flags[ai_idx] = False
+    _progress_text.pop(ai_idx, None)
 
     def _worker():
         try:
@@ -352,15 +367,23 @@ def transcribe_whisper(ai_idx, context):
                 python_cmd + [runner_path, "--args", args_file],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", env=run_env)
+            from core.proc_util import StderrDrain
+            _drain = StderrDrain(proc)
 
             result_segs = []
             for line in proc.stdout:
                 line = line.strip()
                 if line.startswith("PROGRESS:"):
                     try:
-                        print(f"[WHISPER] rack {ai_idx}: {line.split(':',1)[1].strip()}%")
+                        _pct = line.split(':',1)[1].strip()
+                        _progress_text.setdefault(ai_idx, {})["pct"] = _pct
+                        print(f"[WHISPER] rack {ai_idx}: {_pct}%")
                     except Exception:
                         pass
+                elif line.startswith("STATUS:"):
+                    _msg = line.split(':',1)[1].strip()
+                    _progress_text.setdefault(ai_idx, {})["msg"] = _msg
+                    print(f"[WHISPER] rack {ai_idx}: {_msg}")
                 elif line.startswith("RESULT:"):
                     try:
                         result_segs = json.loads(line.split(":", 1)[1].strip())
@@ -378,7 +401,7 @@ def transcribe_whisper(ai_idx, context):
             proc.wait()
             if proc.returncode != 0 and ai_idx not in _pending_finish:
                 print(f"[WHISPER] runner failed rc={proc.returncode}: "
-                      f"{proc.stderr.read()[-400:]}")
+                      f"{_drain.text()[-400:]}")
                 _pending_finish[ai_idx] = {
                     "status": "ERROR", "segments": [],
                     "scene_name": scene_name,

@@ -399,6 +399,8 @@ def separate_demucs(ai_idx, context):
                 python_cmd + [runner_path, "--args", args_path],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", env=run_env)
+            from core.proc_util import StderrDrain
+            _drain = StderrDrain(proc)
 
             for line in proc.stdout:
                 line = line.strip()
@@ -425,7 +427,7 @@ def separate_demucs(ai_idx, context):
                     return
 
             proc.wait()
-            stderr_txt = proc.stderr.read()
+            stderr_txt = _drain.text()
             if stderr_txt.strip():
                 print(f"[DEMUCS] stderr: {stderr_txt[:400]}")
 

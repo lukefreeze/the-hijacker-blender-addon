@@ -164,23 +164,21 @@ def _check_deps():
     return _dep_cache["ok"]
 
 
-def _get_voices_dir():
-    addon_dir = os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))))
-    return os.path.join(addon_dir, "ai_engines", "knnvc", "voices")
-
-
 def _discover_ref_voices(ai_idx):
-    """Return list of (display_name, wav_path) from ai_engines/knnvc/voices/."""
+    """Return list of (display_name, wav_path): WAVs in the per-user voices
+    folder first, then the add-on's own ai_engines/knnvc/voices/."""
     try:
-        voices_dir = _get_voices_dir()
-        if not os.path.isdir(voices_dir):
-            return []
+        from core.ai_knnvc import get_voices_dirs
         voices = []
-        for f in sorted(os.listdir(voices_dir)):
-            if f.lower().endswith(".wav"):
-                name = os.path.splitext(f)[0].replace("_", " ").title()
-                voices.append((name, os.path.join(voices_dir, f)))
+        seen = set()
+        for voices_dir in get_voices_dirs():
+            if not os.path.isdir(voices_dir):
+                continue
+            for f in sorted(os.listdir(voices_dir)):
+                if f.lower().endswith(".wav") and f.lower() not in seen:
+                    seen.add(f.lower())
+                    name = os.path.splitext(f)[0].replace("_", " ").title()
+                    voices.append((name, os.path.join(voices_dir, f)))
         return voices
     except Exception:
         return []
@@ -310,7 +308,7 @@ def _start_knnvc_install():
 
     _pydeps.start_install(
         "knnvc",
-        pip_specs=["torch", "torchaudio"],
+        pip_specs=["torch", "torchaudio", "soundfile"],   # soundfile: fallback audio reader/writer when torchaudio can't decode
         check_module=["torch", "torchaudio"],
         on_done=_on_done,
     )
@@ -507,6 +505,13 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
     add_busy  = rack.get('add_voice_busy', False)
     add_col   = _AMBER if not add_busy else (0.60,0.35,0.00,1.0)
     add_lbl   = "ADDING..." if add_busy else "ADD TO VOICES >"
+    try:
+        from core.ai_knnvc import get_add_result as _gar
+        _ar = "" if add_busy else _gar(ai_idx)
+        if _ar:
+            add_lbl = _ar
+    except Exception:
+        pass
     # Button chrome suppressed once skinned — baked into the art; only the
     # state-dependent label (ADD TO VOICES/ADDING...) below still draws live.
     if not _has_skin:
@@ -654,7 +659,7 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
                    add_sep_y + cards_h*0.6, fs_sm, _TEXT_DIM)
         _draw_text("Use ADD FROM TIMELINE", lx+5*scale,
                    add_sep_y + cards_h*0.4, max(1,int(6*scale)), _TEXT_LABEL)
-        _draw_text("or drop WAVs into voices/", lx+5*scale,
+        _draw_text("or drop WAVs into the voices folder", lx+5*scale,
                    add_sep_y + cards_h*0.25, max(1,int(6*scale)), _TEXT_LABEL)
 
     # ── CENTRE PANEL: state display + convert/preview + output ch ─────────────
@@ -1345,7 +1350,7 @@ def knnvc_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
         rr = R(g.voice_row(0))
         _kn_text("No reference voices yet", rr[0] + 14 * g.s, (rr[1] + rr[3]) / 2, KN_FS_LABEL, g, KN_TEXT_DIM, lv)
         rr2 = R(g.voice_row(1))
-        _kn_text("Use ADD TO VOICES, or drop WAVs into voices/", rr2[0] + 14 * g.s, (rr2[1] + rr2[3]) / 2,
+        _kn_text("Use ADD TO VOICES (bottom left)", rr2[0] + 14 * g.s, (rr2[1] + rr2[3]) / 2,
                  KN_FS_MED, g, KN_TEXT_DIM, lv, glow=0.5)
 
     # ── screen: state read-out under the eyes ─────────────────────────────────
@@ -1468,7 +1473,15 @@ def knnvc_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     # ── ADD TO VOICES ─────────────────────────────────────────────────────────
     ar_ = R(KN_ADD)
     add_busy = rack.get('add_voice_busy', False)
-    _kn_text("ADDING..." if add_busy else "ADD TO VOICES >", (ar_[0] + ar_[2]) / 2, (ar_[1] + ar_[3]) / 2,
+    _add_msg = "ADDING..." if add_busy else "ADD TO VOICES >"
+    try:
+        from core.ai_knnvc import get_add_result as _gar2
+        _ar2 = "" if add_busy else _gar2(ai_idx)
+        if _ar2:
+            _add_msg = _ar2
+    except Exception:
+        pass
+    _kn_text(_add_msg, (ar_[0] + ar_[2]) / 2, (ar_[1] + ar_[3]) / 2,
              KN_FS_LABEL, g, KN_TEXT_DIM if add_busy else KN_TEXT, 1.0, "c")   # painted on metal: stays lit
 
     # ── knobs ─────────────────────────────────────────────────────────────────

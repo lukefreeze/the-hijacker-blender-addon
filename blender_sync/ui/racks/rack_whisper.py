@@ -233,7 +233,19 @@ _dep_running = False
 def _dep_worker():
     global _dep_running
     ok = False
+    # The rack's INSTALL button installs into the add-on's managed venv, so
+    # check that first (the system-Python scan below is only for people who
+    # already installed faster-whisper the old way). Without this the rack
+    # went straight back to "not installed" after a successful install.
     try:
+        from core import ai_pydeps as _pydeps
+        if _pydeps.venv_has_pip_package("faster-whisper", timeout=20):
+            ok = True
+    except Exception as e:
+        print(f"[WHISPER] venv dep check error: {e}")
+    try:
+        if ok:
+            raise StopIteration
         import subprocess, platform
         from core.ai_python_finder import (
             _win_python_paths, _mac_python_paths, _linux_python_paths)
@@ -251,6 +263,8 @@ def _dep_worker():
                     break
             except Exception:
                 continue
+    except StopIteration:
+        pass
     except Exception as e:
         print(f"[WHISPER] dep check error: {e}")
     _dep_cache["ok"]       = ok
@@ -440,6 +454,36 @@ def _start_whisper_install():
     )
 
 
+
+# ── TRANSCRIBE button geometry ────────────────────────────────────────────────
+# The button is baked into the skin art (ui/assets/skins/default/rack_whisper_bg.png,
+# 1895x446). WSP_TBTN_ART is its border in that art's pixel coordinates
+# (x0, y0, x1, y1; y measured from the top). With the skin loaded the click
+# zone follows the art exactly; without it, the flat fallback button below.
+WSP_ART_W, WSP_ART_H = 1895.0, 446.0
+WSP_TBTN_ART = (1662.0, 405.0, 1882.0, 441.0)
+
+
+def transcribe_btn_rect(rx, ry, rw, rh, scale):
+    """(x, y, w, h) of the TRANSCRIBE button for a rack drawn at rx,ry with
+    size rw x rh (the FULL rack, rail included). Shared by draw and hit-test."""
+    try:
+        from ui.mixer.texture_cache import get_texture as _gt
+        skinned = _gt("rack_whisper_bg") is not None
+    except Exception:
+        skinned = False
+    if skinned:
+        x0, y0, x1, y1 = WSP_TBTN_ART
+        return (rx + rw * x0 / WSP_ART_W,
+                ry + rh * (1.0 - y1 / WSP_ART_H),
+                rw * (x1 - x0) / WSP_ART_W,
+                rh * (y1 - y0) / WSP_ART_H)
+    body_h = rh - RACK_RAIL_H * scale
+    mg     = 8 * scale
+    sbar_h = max(22 * scale, body_h * 0.07)
+    w = min(rw * 0.22, 150 * scale)
+    return (rx + rw - w - mg, ry + 2 * scale, w, sbar_h - 4 * scale)
+
 # ── Main draw ──────────────────────────────────────────────────────────────────
 def _draw_whisper_body(rx, ry, rw, rh, rack, ai_idx, scale):
     # Full-rack photoreal skin — when present, Racks.py's _draw_ai_rack_expanded
@@ -532,18 +576,23 @@ def _draw_whisper_body(rx, ry, rw, rh, rack, ai_idx, scale):
         _r(rx, sbar_y, rw, sbar_h, (0.01, 0.03, 0.02, 1.0))
         _box(rx, sbar_y, rw, sbar_h, _BORDER)
 
-    sbar_txt = (f"STATUS: {status}  |  MODEL: {_MODEL_LABELS[model_idx]}  |  "
+    _prog_txt = ""
+    if status == _PROCESSING:
+        try:
+            from core.ai_whisper import get_progress_text as _gpt
+            _prog_txt = _gpt(ai_idx)
+        except Exception:
+            _prog_txt = ""
+    sbar_txt = (f"STATUS: {status}{(' ' + _prog_txt) if _prog_txt else ''}  |  MODEL: {_MODEL_LABELS[model_idx]}  |  "
                 f"LANG: {_LANG_LABELS[lang_idx]}  |  OUT CH: {out_ch or '?'}  |  "
                 f"SEG: {chunk_len}s  |  VAD: {'ON' if vad_on else 'OFF'}  |  "
                 f"MODE: {'TRANSLATE->EN' if mode_idx else 'TRANSCRIBE'}")
     _draw_text(sbar_txt, rx + mg,
                sbar_y + sbar_h / 2 - fs_sm / 2, fs_sm, status_col)
 
-    # TRANSCRIBE button (right end of status bar)
-    tbtn_w = min(rw * 0.22, 150 * scale)
-    tbtn_x = rx + rw - tbtn_w - mg
-    tbtn_y = sbar_y + 2 * scale
-    tbtn_h = sbar_h - 4 * scale
+    # TRANSCRIBE button (right end of status bar). Rect comes from the shared
+    # helper so the click zone and this (flat-fallback) drawing always agree.
+    tbtn_x, tbtn_y, tbtn_w, tbtn_h = transcribe_btn_rect(rx, ry, rw, rh, scale)
     if status == _PROCESSING:
         tb_bg = (0.08, 0.18, 0.04, 1.0); tb_col = _AMBER; tb_lbl = "PROCESSING..."
     else:

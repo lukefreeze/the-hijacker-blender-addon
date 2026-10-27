@@ -364,6 +364,8 @@ def process_booster(rack_idx, context):
                 text=True,
                 bufsize=1,
             )
+            from core.proc_util import StderrDrain
+            _drain = StderrDrain(proc)
 
             for line in proc.stdout:
                 line = line.strip()
@@ -381,7 +383,7 @@ def process_booster(rack_idx, context):
                     _finish(rack_idx, scene_name, "READY"); return
 
             proc.wait()
-            stderr_txt = proc.stderr.read()
+            stderr_txt = _drain.text()
             if stderr_txt.strip():
                 print(f"[BOOSTER] stderr: {stderr_txt[:400]}")
 

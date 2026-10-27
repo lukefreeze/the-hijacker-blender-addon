@@ -52,9 +52,49 @@ def _get_patch_path():
     return os.path.join(addon_dir, "ai_engines", "knnvc", "patch_knnvc.py")
 
 
-def _get_voices_dir():
+def _addon_voices_dir():
+    """Voices folder inside the add-on (dev checkouts / hand-placed files)."""
     addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(addon_dir, "ai_engines", "knnvc", "voices")
+
+
+def _get_voices_dir():
+    """Where NEW reference voices are saved: a per-user folder outside the
+    add-on, so they survive reinstalling/updating the add-on and the add-on
+    folder can be read-only (extension installs). Falls back to the add-on's
+    own folder if Blender can't give us a user folder."""
+    try:
+        return bpy.utils.user_resource(
+            'SCRIPTS', path=os.path.join("hijacker_knnvc", "voices"), create=True)
+    except Exception:
+        return _addon_voices_dir()
+
+
+def get_voices_dirs():
+    """Every folder reference voices are read from, user folder first."""
+    dirs = [_get_voices_dir()]
+    legacy = _addon_voices_dir()
+    if legacy not in dirs:
+        dirs.append(legacy)
+    return dirs
+
+
+# Result of the latest ADD TO VOICES click per rack: (message, time.time()),
+# shown on the button for a few seconds so success/failure is visible.
+_add_result = {}
+
+
+def get_add_result(ai_idx, max_age=8.0):
+    import time as _t
+    r = _add_result.get(ai_idx)
+    if r and (_t.time() - r[1]) < max_age:
+        return r[0]
+    return ""
+
+
+def _set_add_result(ai_idx, msg):
+    import time as _t
+    _add_result[ai_idx] = (msg, _t.time())
 
 
 def is_processing(ai_idx):
@@ -312,7 +352,8 @@ def add_voice_from_timeline(ai_idx, context):
 
     python_cmd = _find_system_python()
     if not python_cmd:
-        print("[KNNVC] add_voice: system Python with torch not found")
+        print("[KNNVC] add_voice: Python with torch + torchaudio not found")
+        _set_add_result(ai_idx, "NOT INSTALLED")
         return
 
     # Source channel for extraction (p5, 0-based)
@@ -336,6 +377,7 @@ def add_voice_from_timeline(ai_idx, context):
                 break
     if not src_wav or not os.path.exists(src_wav):
         print(f"[KNNVC] add_voice: no audio strip on channel {add_ch}")
+        _set_add_result(ai_idx, f"NO AUDIO ON CH {add_ch}")
         return
 
     # Voice name — use stored value but never write fallback back to rack
@@ -349,7 +391,12 @@ def add_voice_from_timeline(ai_idx, context):
         safe_name = f"CH{add_ch}Sample"
 
     voices_dir  = _get_voices_dir()
-    os.makedirs(voices_dir, exist_ok=True)
+    try:
+        os.makedirs(voices_dir, exist_ok=True)
+    except Exception as e:
+        print(f"[KNNVC] add_voice: can't create voices folder {voices_dir}: {e}")
+        _set_add_result(ai_idx, "CAN'T SAVE")
+        return
     output_path = os.path.join(voices_dir, safe_name + ".wav")
 
     rack['add_voice_busy'] = True
@@ -369,9 +416,33 @@ def add_voice_from_timeline(ai_idx, context):
                 }, _af)
 
             convert_script = (
-                "import json, torchaudio, os\n"
+                "import json, torch, torchaudio, os\n"
                 f"args = json.load(open({repr(args_file)}, encoding=\'utf-8\'))\n"
-                "wav, sr = torchaudio.load(args[\'src\'])\n"
+                "def _sf():\n"
+                "    try:\n"
+                "        import soundfile\n"
+                "    except ImportError:\n"
+                "        import subprocess, sys\n"
+                "        subprocess.check_call([sys.executable, \'-m\', \'pip\', \'install\', \'--disable-pip-version-check\', \'soundfile\'])\n"
+                "        import soundfile\n"
+                "    return soundfile\n"
+                "def _load(p):\n"
+                "    try:\n"
+                "        return torchaudio.load(p)\n"
+                "    except Exception as e1:\n"
+                "        try:\n"
+                "            sf = _sf()\n"
+                "            d, r = sf.read(p, dtype=\'float32\', always_2d=True)\n"
+                "            return torch.from_numpy(d.T.copy()), r\n"
+                "        except Exception as e2:\n"
+                "            raise RuntimeError(\'cannot read audio: torchaudio: %s; soundfile: %s\' % (e1, e2))\n"
+                "def _save(p, w, r):\n"
+                "    try:\n"
+                "        torchaudio.save(p, w, r)\n"
+                "    except Exception:\n"
+                "        sf = _sf()\n"
+                "        sf.write(p, w.numpy().T, r)\n"
+                "wav, sr = _load(args[\'src\'])\n"
                 "# Apply VSE trim if specified\n"
                 "ts = args.get(\'trim_start\'); te = args.get(\'trim_end\')\n"
                 "if ts is not None and te is not None:\n"
@@ -379,19 +450,24 @@ def add_voice_from_timeline(ai_idx, context):
                 "    wav = wav[:, s:e]\n"
                 "if wav.shape[0] > 1: wav = wav.mean(dim=0, keepdim=True)\n"
                 "if sr != 16000: wav = torchaudio.functional.resample(wav, sr, 16000)\n"
-                "torchaudio.save(args[\'out\'], wav, 16000)\n"
+                "_save(args[\'out\'], wav, 16000)\n"
                 f"os.remove({repr(args_file)})\n"
                 "print(\'DONE\')\n"
             )
             r = subprocess.run(
                 python_cmd + ["-c", convert_script],
                 capture_output=True, text=True, timeout=60)
-            if r.returncode == 0 and "DONE" in r.stdout:
-                print(f"[KNNVC] add_voice: saved '{safe_name}.wav' to voices/")
+            if (r.returncode == 0 and "DONE" in r.stdout
+                    and os.path.isfile(output_path) and os.path.getsize(output_path) > 0):
+                print(f"[KNNVC] add_voice: saved '{safe_name}.wav' to {voices_dir}")
+                _set_add_result(ai_idx, f"ADDED: {safe_name}")
             else:
-                print(f"[KNNVC] add_voice: conversion failed: {r.stderr[-300:]}")
+                print(f"[KNNVC] add_voice: conversion failed (rc={r.returncode}): "
+                      f"{(r.stderr or r.stdout)[-600:]}")
+                _set_add_result(ai_idx, "FAILED - SEE CONSOLE")
         except Exception as e:
             print(f"[KNNVC] add_voice error: {e}")
+            _set_add_result(ai_idx, "FAILED - SEE CONSOLE")
         finally:
             try:
                 ai_racks2 = getattr(bpy.data.scenes.get(scene.name), "pb_ai_racks", [])
@@ -494,6 +570,8 @@ def convert_knnvc(ai_idx, context, preview_only=False):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", env=run_env)
+            from core.proc_util import StderrDrain
+            _drain = StderrDrain(proc)
 
             for line in proc.stdout:
                 line = line.strip()
@@ -513,7 +591,7 @@ def convert_knnvc(ai_idx, context, preview_only=False):
 
             proc.wait()
             if proc.returncode != 0 and ai_idx not in _pending_finish:
-                stderr = proc.stderr.read()
+                stderr = _drain.text()
                 print(f"[KNNVC] runner failed: {stderr}")
                 _pending_finish[ai_idx] = {
                     "status": "ERROR", "output_path": None, "scene_name": scene_name}

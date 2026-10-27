@@ -483,6 +483,7 @@ def get_model_env(base_env=None):
     env["HF_HOME"]               = hf_dir
     env["HUGGINGFACE_HUB_CACHE"] = os.path.join(hf_dir, "hub")
     env["TORCH_HOME"]            = torch_dir
+    env["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"   # runners' stderr is piped; bars are just noise there
     if platform.system() == "Windows":
         env["USERPROFILE"] = home_dir
     else:

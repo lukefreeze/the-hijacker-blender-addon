@@ -66,11 +66,63 @@ def main():
         device  = "cpu"
         compute = "int8"
 
+    # First use of a model downloads it (tiny ~75 MB ... medium ~1.5 GB ...
+    # large ~3 GB) with no output of its own, which used to look like a hang
+    # at 5%. Watch the model's cache folder and report PROGRESS 5..15 plus a
+    # STATUS line while that happens.
+    import threading, time as _time
+    _stop = threading.Event()
+
+    def _watch_download():
+        approx = {"tiny": 75e6, "tiny.en": 75e6, "base": 145e6, "base.en": 145e6,
+                  "small": 484e6, "small.en": 484e6, "medium": 1.53e9,
+                  "medium.en": 1.53e9, "large-v1": 3.09e9, "large-v2": 3.09e9,
+                  "large-v3": 3.09e9, "large": 3.09e9}
+        total = approx.get(model, 1.5e9)
+        try:
+            from huggingface_hub.constants import HF_HUB_CACHE
+            try:
+                from faster_whisper.utils import _MODELS
+                repo = _MODELS.get(model, "Systran/faster-whisper-" + model)
+            except Exception:
+                repo = "Systran/faster-whisper-" + model
+            folder = os.path.join(HF_HUB_CACHE, "models--" + repo.replace("/", "--"))
+        except Exception:
+            return
+        last = -1
+        while not _stop.is_set():
+            size = 0
+            try:
+                for dp, _dn, fn in os.walk(folder):
+                    for f in fn:
+                        try:
+                            size += os.path.getsize(os.path.join(dp, f))
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+            if size > 0:
+                frac = min(1.0, size / total)
+                pct = 5 + int(10 * frac)
+                if pct != last:
+                    last = pct
+                    print(f"PROGRESS:{pct}")
+                    print(f"STATUS:Downloading model {size/1e6:.0f} of ~{total/1e6:.0f} MB (first use only)")
+                    sys.stdout.flush()
+            _stop.wait(1.0)
+
+    threading.Thread(target=_watch_download, daemon=True).start()
     try:
+        print("STATUS:Loading model (downloads on first use)")
+        sys.stdout.flush()
         whisper_model = WhisperModel(model, device=device, compute_type=compute)
     except Exception as e:
+        _stop.set()
         print(f"ERROR:failed to load model '{model}': {e}")
         sys.exit(1)
+    _stop.set()
+    print(f"STATUS:Transcribing on {device.upper()}")
+    sys.stdout.flush()
 
     print("PROGRESS:15")
     sys.stdout.flush()

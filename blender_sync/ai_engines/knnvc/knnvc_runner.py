@@ -35,6 +35,70 @@ def apply_patch(patch_path):
         print(f"[KNNVC_RUNNER] patch warning: {e}")
 
 
+def _can_torchaudio_load(path):
+    """True if torchaudio can decode this file. Newer torchaudio releases (2.9+)
+    route load()/save() through the separate 'torchcodec' package, which a
+    plain pip install does not bring in, so load() raises ImportError there."""
+    try:
+        import torchaudio
+        torchaudio.load(path, frame_offset=0, num_frames=16)
+        return True
+    except Exception as e:
+        print(f"[KNNVC_RUNNER] torchaudio can't read audio ({type(e).__name__}); using soundfile")
+        return False
+
+
+def _import_soundfile():
+    """Import soundfile, pip-installing it first if this environment predates
+    it being a kNN-VC dependency."""
+    try:
+        import soundfile
+        return soundfile
+    except ImportError:
+        import subprocess
+        print("[KNNVC_RUNNER] installing soundfile ...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "--disable-pip-version-check", "soundfile"])
+        import soundfile
+        return soundfile
+
+
+def _load_audio(path):
+    """-> (float32 tensor [channels, samples], sample_rate), torchaudio first, soundfile second."""
+    import torch
+    try:
+        import torchaudio
+        return torchaudio.load(path)
+    except Exception as e_ta:
+        try:
+            sf = _import_soundfile()
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+            return torch.from_numpy(data.T.copy()), sr
+        except Exception as e_sf:
+            raise RuntimeError(f"could not read audio '{path}': torchaudio: {e_ta}; soundfile: {e_sf}")
+
+
+def _save_audio(path, wav, sr):
+    """wav: tensor [channels, samples]."""
+    try:
+        import torchaudio
+        torchaudio.save(path, wav, sr)
+    except Exception:
+        sf = _import_soundfile()
+        sf.write(path, wav.detach().cpu().numpy().T, sr)
+
+
+def _as_16k_mono(path):
+    import torch
+    import torchaudio
+    wav, sr = _load_audio(path)
+    if wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    if sr != 16000:
+        wav = torchaudio.functional.resample(wav, sr, 16000)
+    return wav[0]
+
+
 def run(src, ref, output, topk=4, ref_secs=30, patch_path=None):
     import torch
     import torchaudio
@@ -54,19 +118,27 @@ def run(src, ref, output, topk=4, ref_secs=30, patch_path=None):
     print(f"PROGRESS:30")
 
     # Trim reference to ref_secs to avoid VRAM issues
-    ref_wav, ref_sr = torchaudio.load(ref)
+    ref_wav, ref_sr = _load_audio(ref)
     max_samples = ref_sr * ref_secs
     if ref_wav.shape[1] > max_samples:
         ref_wav = ref_wav[:, :max_samples]
         tmp_ref = output + "_ref_trimmed.wav"
-        torchaudio.save(tmp_ref, ref_wav, ref_sr)
+        _save_audio(tmp_ref, ref_wav, ref_sr)
         ref = tmp_ref
     print(f"PROGRESS:40")
 
+    # kNN-VC's own loader uses torchaudio.load(); when that can't decode (see
+    # _can_torchaudio_load) hand it ready-made 16 kHz mono tensors instead.
+    if _can_torchaudio_load(src):
+        src_arg = src
+    else:
+        src_arg = _as_16k_mono(src)
+    ref_arg = ref if _can_torchaudio_load(ref) else _as_16k_mono(ref)
+
     # Extract features
-    query_seq   = knn_vc.get_features(src)
+    query_seq   = knn_vc.get_features(src_arg)
     print(f"PROGRESS:60")
-    matching_set = knn_vc.get_matching_set([ref])
+    matching_set = knn_vc.get_matching_set([ref_arg])
     print(f"PROGRESS:75")
 
     # Convert
@@ -74,7 +146,7 @@ def run(src, ref, output, topk=4, ref_secs=30, patch_path=None):
     print(f"PROGRESS:90")
 
     # Save
-    torchaudio.save(output, out_wav[None], 16000)
+    _save_audio(output, out_wav[None], 16000)
     print(f"PROGRESS:100")
     print(f"DONE:{output}")
 

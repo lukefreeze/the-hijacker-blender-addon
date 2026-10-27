@@ -409,6 +409,8 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", env=run_env)
+            from core.proc_util import StderrDrain
+            _drain = StderrDrain(proc)
 
             for line in proc.stdout:
                 line = line.strip()
@@ -430,7 +432,7 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
 
             proc.wait()
             if proc.returncode != 0 and ai_idx not in _pending_finish:
-                stderr = proc.stderr.read()
+                stderr = _drain.text()
                 print(f"[VOICEFIXER] runner failed: {stderr}")
                 _pending_finish[ai_idx] = {
                     "status": "ERROR", "output_path": None,

@@ -6946,10 +6946,14 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
                     return {'zone': 'ai_wsp_srt_browse', 'ai_idx': ai_idx}
 
             # ── Status bar TRANSCRIBE button ──────────────────────────────
-            _tbtn_w = min(rw * 0.22, 150 * scale)
-            _tbtn_x = rack_x + rw - _tbtn_w - _mg_w
-            _tbtn_y = _body_bot_w + 2 * scale
-            _tbtn_h = _sbar_h_w - 4 * scale
+            try:
+                from ui.racks.rack_whisper import transcribe_btn_rect as _wsp_tbr
+                _tbtn_x, _tbtn_y, _tbtn_w, _tbtn_h = _wsp_tbr(rack_x, rack_y, rw, rack_h, scale)
+            except Exception:
+                _tbtn_w = min(rw * 0.22, 150 * scale)
+                _tbtn_x = rack_x + rw - _tbtn_w - _mg_w
+                _tbtn_y = _body_bot_w + 2 * scale
+                _tbtn_h = _sbar_h_w - 4 * scale
             if _tbtn_x <= mouse_x <= _tbtn_x + _tbtn_w and _tbtn_y <= mouse_y <= _tbtn_y + _tbtn_h:
                 return {'zone': 'ai_wsp_transcribe', 'ai_idx': ai_idx}
 
