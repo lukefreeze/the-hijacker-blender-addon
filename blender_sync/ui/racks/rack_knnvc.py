@@ -686,13 +686,19 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
     if status == _PROCESSING:
         sh.bind(); sh.uniform_float("color",(0.30,0.10,0.40,1.0)); stb.draw(sh)
         fs_st = max(1,int(8*scale))
-        lbl_p = "CONVERTING..."
+        from core import ai_status as _ais
+        lbl_p = _ais.headline("knnvc", ai_idx, "CONVERTING...")
         tw_p  = _text_width(lbl_p, fs_st)
         _draw_text(lbl_p, cx+centre_w/2-tw_p/2,
                    state_y+state_h*0.6-fs_st/2, fs_st, _ACCENT)
-        _draw_text("This may take 30-60 seconds",
-                   cx+centre_w/2-_text_width("This may take 30-60 seconds",max(1,int(6*scale)))/2,
-                   state_y+state_h*0.35, max(1,int(6*scale)), _TEXT_DIM)
+        _fs_h = max(1, int(6*scale))
+        _hint = _ais.pick("knnvc", ai_idx, int((centre_w - 16*scale) / max(1.0, _fs_h * 0.56)))
+        _draw_text(_hint, cx+centre_w/2-_text_width(_hint, _fs_h)/2,
+                   state_y+state_h*0.35, _fs_h, (0.85, 0.70, 1.0, 1.0))
+        _bw = (centre_w - 24*scale)
+        _draw_rect(cx + 12*scale, state_y + state_h*0.16, _bw, max(2*scale, state_h*0.06), (0.14, 0.06, 0.20, 1.0))
+        _draw_rect(cx + 12*scale, state_y + state_h*0.16, _bw * _ais.get_fraction("knnvc", ai_idx),
+                   max(2*scale, state_h*0.06), (0.75, 0.40, 1.0, 1.0))
 
     elif status == _DONE:
         sh.bind(); sh.uniform_float("color",(0.02,0.08,0.04,1.0)); stb.draw(sh)
@@ -937,9 +943,18 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
     out_ch_sb   = int(getattr(rack,"p3",0.0)) or (active_chs[0]+1 if active_chs else 2)
 
     fs_sb = max(1,int(7*scale))
-    _draw_text(
-        f"ENGINE: kNN-VC  |  {src_str}  |  OUT:CH{out_ch_sb}  |  REF:{ref_name}  |  TOPK:{topk_disp}  |  OFFLINE",
-        sbar_x+7*scale, sbar_y+sbar_h/2-fs_sb/2, fs_sb, _TEXT_DIM)
+    _sb_txt = f"ENGINE: kNN-VC  |  {src_str}  |  OUT:CH{out_ch_sb}  |  REF:{ref_name}  |  TOPK:{topk_disp}  |  OFFLINE"
+    _sb_col = _TEXT_DIM
+    if status == _PROCESSING:
+        # progress shown ON the status screen, replacing its usual text
+        from core import ai_status as _ais
+        _fr = _ais.get_fraction("knnvc", ai_idx)
+        _bh = max(2*scale, sbar_h * 0.16)
+        _draw_rect(sbar_x + 3*scale, sbar_y + 2*scale, (sbar_w - 6*scale) * _fr, _bh,
+                   (0.75, 0.40, 1.0, 0.95))
+        _sb_txt = _ais.pick("knnvc", ai_idx, int((sbar_w - 24*scale) / max(1.0, fs_sb * 0.56)))
+        _sb_col = (0.93, 0.82, 1.0, 1.0)
+    _draw_text(_sb_txt, sbar_x+7*scale, sbar_y+sbar_h/2-fs_sb/2, fs_sb, _sb_col)
 
     # Status LED — suppressed once skinned; baked into the background art in
     # the bottom-right corner of the rack, same as the other static chrome.
@@ -1362,8 +1377,15 @@ def knnvc_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     ref_sel = voices[sel_idx][0] if voices else None
     if status == _PROCESSING:
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(now * 5.0))
-        _line("CONVERTING...", 214, KN_FS_BIG, KN_TEXT, a=pulse)
-        _line("This may take 30-60 seconds", 236, KN_FS_SMALL, KN_TEXT_DIM, 0.5)
+        from core import ai_status as _ais
+        _line(_ais.headline("knnvc", ai_idx, "CONVERTING..."), 214, KN_FS_BIG, KN_TEXT, a=pulse)
+        _mc = int(((scr[2] - scr[0]) - 40 * g.s) / max(1.0, KN_FS_SMALL * g.s * 0.56))
+        _line(_ais.pick("knnvc", ai_idx, _mc), 236, KN_FS_SMALL, KN_TEXT, 0.95)
+        _bx0 = scr[0] + (scr[2] - scr[0]) * 0.16
+        _bx1 = scr[2] - (scr[2] - scr[0]) * 0.16
+        _kn_quad(sh, _bx0, g.Y(251.0), _bx1, g.Y(247.0), (0.30, 0.04, 0.03, 0.9 * lv))
+        _kn_quad(sh, _bx0, g.Y(251.0), _bx0 + (_bx1 - _bx0) * max(0.01, _ais.get_fraction("knnvc", ai_idx)),
+                 g.Y(247.0), (1.0, 0.32, 0.22, 0.95 * lv))
     elif status == _DONE:
         _line("CONVERSION DONE", 214, KN_FS_BIG, KN_TEXT)
         info = "Output placed in VSE"
@@ -1503,5 +1525,15 @@ def knnvc_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     src_str = f"SRC:CH{active_chs[0]}" if active_chs else "SRC:unset"
     out_ch_sb = int(getattr(rack, "p3", 0.0)) or (active_chs[0] + 1 if active_chs else 2)
     sb = R(KN_STATUS)
-    _kn_text(f"ENGINE: kNN-VC  |  {src_str}  |  OUT:CH{out_ch_sb}  |  REF:{ref_name}  |  TOPK:{topk_disp}  |  OFFLINE",
-             sb[0] + 14 * g.s, (sb[1] + sb[3]) / 2, KN_FS_SMALL, g, KN_TEXT_DIM, lv, glow=0.6)
+    _sb_txt = f"ENGINE: kNN-VC  |  {src_str}  |  OUT:CH{out_ch_sb}  |  REF:{ref_name}  |  TOPK:{topk_disp}  |  OFFLINE"
+    _sb_col = KN_TEXT_DIM
+    if status == _PROCESSING:
+        # progress shown ON the status screen, replacing its usual text
+        from core import ai_status as _ais
+        _fr = max(0.0, min(1.0, _ais.get_fraction("knnvc", ai_idx)))
+        _bh = max(2 * g.s, (sb[3] - sb[1]) * 0.16)
+        _kn_quad(sh, sb[0] + 4 * g.s, sb[1] + 3 * g.s, sb[0] + 4 * g.s + ((sb[2] - sb[0]) - 8 * g.s) * _fr,
+                 sb[1] + 3 * g.s + _bh, (1.0, 0.30, 0.20, 0.95 * lv))
+        _sb_txt = _ais.pick("knnvc", ai_idx, int(((sb[2] - sb[0]) - 28 * g.s) / max(1.0, KN_FS_SMALL * g.s * 0.56)))
+        _sb_col = KN_TEXT
+    _kn_text(_sb_txt, sb[0] + 14 * g.s, (sb[1] + sb[3]) / 2, KN_FS_SMALL, g, _sb_col, lv, glow=0.6)

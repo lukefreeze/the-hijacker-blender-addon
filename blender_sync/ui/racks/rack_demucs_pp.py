@@ -734,12 +734,15 @@ def dm_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     lx = sl[0] + 4 * g.s
     lmax = min((sl[2] - sl[0]) - 14 * g.s, 360 * g.sx)
     if status == "PROCESSING":
-        _text("ANALYZING...", lx, g.Y(112.0), DM_FS_SCR_BIG, g, DM_GREEN, lv * (0.6 + 0.4 * pulse), max_w=lmax)
-        _text("This can take a minute or two.", lx, g.Y(143.0), DM_FS_SCR, g, DM_GREEN, lv, max_w=lmax)
+        from core import ai_status as _ais
+        _text(_ais.headline("demucs", ai_idx, "ANALYZING..."), lx, g.Y(112.0), DM_FS_SCR_BIG, g, DM_GREEN,
+              lv * (0.6 + 0.4 * pulse), max_w=lmax)
+        _mc = max(8, int(lmax / max(1.0, DM_FS_SCR * g.s * 0.56)))
+        _text(_ais.pick("demucs", ai_idx, _mc), lx, g.Y(143.0), DM_FS_SCR, g, DM_GREEN, lv, max_w=lmax)
         bx0, bx1 = sl[0] + 4 * g.s, sl[0] + 4 * g.s + min(lmax, 360 * g.sx)
         by0, by1 = g.Y(176.0), g.Y(170.0)
         _quad(sh, bx0, by0, bx1, by1, (0.05, 0.22, 0.09, 0.85 * lv))
-        fill = 0.35 + 0.65 * abs(math.sin(now * 1.5))
+        fill = max(0.02, _ais.get_fraction("demucs", ai_idx))
         _quad(sh, bx0, by0, bx0 + (bx1 - bx0) * fill, by1, (0.40, 1.0, 0.52, 0.95 * lv))
         _quad(sh, bx0, by0 - 2 * g.s, bx0 + (bx1 - bx0) * fill, by1 + 2 * g.s, (0.20, 1.0, 0.35, 0.18 * lv), "ADDITIVE")
     elif status == "DONE":

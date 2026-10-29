@@ -741,6 +741,14 @@ def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     scol = {"READY": WH_RED, "PROCESSING": WH_AMBER, "DONE": WH_CORE, "ERROR": (1.0, 0.30, 0.20, 1.0)}[status]
     txt = (f"{status}  |  {_MODEL_LABELS[model_idx]}  |  {_LANG_LABELS[lang_idx].upper()}  |  "
            f"OUT {out_ch if out_ch else '?'}  |  {chunk_len}s  |  VAD {'ON' if vad_on else 'OFF'}")
+    if busy:
+        # progress shown ON the status screen, replacing its usual text
+        from core import ai_status as _ais
+        _fr = max(0.0, min(1.0, _ais.get_fraction("whisper", ai_idx)))
+        _bh = max(2 * g.s, (st[3] - st[1]) * 0.16)
+        _quad(sh, st[0] + 4 * g.s, st[1] + 3 * g.s, st[0] + 4 * g.s + ((st[2] - st[0]) - 8 * g.s) * _fr,
+              st[1] + 3 * g.s + _bh, (1.0, 0.78, 0.30, 0.95 * lv))
+        txt = _ais.pick("whisper", ai_idx, int(((st[2] - st[0]) - 28 * g.s) / max(1.0, WH_FS_SCR * g.s * 0.56)))
     _text(txt, st[0] + 14 * g.s, (st[1] + st[3]) / 2, WH_FS_SCR, g, scol, lv * (0.7 + 0.3 * pulse if busy else 1.0),
           glow=0.7, max_w=(st[2] - st[0]) - 28 * g.s)
 
@@ -751,5 +759,10 @@ def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     elif status == "ERROR":
         _text("FAILED - check console", g.X(1300.0), g.Y(352.0), WH_FS_SMALL + 1.0, g, (1.0, 0.35, 0.25, 1.0), lv,
               glow=0.8, glow_col=(1.0, 0.25, 0.1), max_w=(1560.0 - 1300.0) * g.sx)
+    elif busy:
+        from core import ai_status as _ais
+        _lw = (1840.0 - 1300.0) * g.sx
+        _text(_ais.pick("whisper", ai_idx, int(_lw / max(1.0, (WH_FS_SMALL + 1.0) * g.s * 0.56))),
+              g.X(1300.0), g.Y(352.0), WH_FS_SMALL + 1.0, g, WH_AMBER, lv, glow=0.8, max_w=_lw)
     else:
         _text("No output yet", g.X(1300.0), g.Y(352.0), WH_FS_SMALL + 1.0, g, WH_NOTE, lv, glow=0.5)

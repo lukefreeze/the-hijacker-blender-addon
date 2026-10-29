@@ -550,6 +550,8 @@ def convert_knnvc(ai_idx, context, preview_only=False):
 
     rack.ai_status        = "PROCESSING"
     _cancel_flags[ai_idx] = False
+    from core import ai_status as _ais
+    _ais.reset("knnvc", ai_idx)
 
     def _worker():
         try:
@@ -575,9 +577,12 @@ def convert_knnvc(ai_idx, context, preview_only=False):
 
             for line in proc.stdout:
                 line = line.strip()
+                _ais.feed("knnvc", ai_idx, line)
                 if line.startswith("PROGRESS:"):
                     try: print(f"[KNNVC] rack {ai_idx}: {line.split(':')[1]}%")
                     except Exception: pass
+                elif line.startswith("STATUS:"):
+                    print(f"[KNNVC] rack {ai_idx}: {line.split(':', 1)[1].strip()}")
                 elif line.startswith("DONE:"):
                     out = line.split(":",1)[1].strip()
                     set_rack_output(ai_idx, out)

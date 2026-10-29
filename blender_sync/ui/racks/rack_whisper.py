@@ -576,19 +576,25 @@ def _draw_whisper_body(rx, ry, rw, rh, rack, ai_idx, scale):
         _r(rx, sbar_y, rw, sbar_h, (0.01, 0.03, 0.02, 1.0))
         _box(rx, sbar_y, rw, sbar_h, _BORDER)
 
-    _prog_txt = ""
-    if status == _PROCESSING:
-        try:
-            from core.ai_whisper import get_progress_text as _gpt
-            _prog_txt = _gpt(ai_idx)
-        except Exception:
-            _prog_txt = ""
+    _prog_txt = ""   # live progress now shows in the rack's progress banner (Racks.py)
     sbar_txt = (f"STATUS: {status}{(' ' + _prog_txt) if _prog_txt else ''}  |  MODEL: {_MODEL_LABELS[model_idx]}  |  "
                 f"LANG: {_LANG_LABELS[lang_idx]}  |  OUT CH: {out_ch or '?'}  |  "
                 f"SEG: {chunk_len}s  |  VAD: {'ON' if vad_on else 'OFF'}  |  "
                 f"MODE: {'TRANSLATE->EN' if mode_idx else 'TRANSCRIBE'}")
-    _draw_text(sbar_txt, rx + mg,
-               sbar_y + sbar_h / 2 - fs_sm / 2, fs_sm, status_col)
+    if status == _PROCESSING:
+        # progress shown ON the status screen, replacing its usual text.
+        # The screen occupies the left part of the bar (TRANSCRIBE sits at the right).
+        from core import ai_status as _ais
+        _sw = (rw * 0.52) - mg
+        _fr = _ais.get_fraction("whisper", ai_idx)
+        _r(rx + mg + 3 * scale, sbar_y + 2 * scale, (_sw - 6 * scale) * _fr, max(2 * scale, sbar_h * 0.16),
+           (0.30, 0.90, 0.45, 0.95))
+        sbar_txt = _ais.pick("whisper", ai_idx, int((_sw - 14 * scale) / max(1.0, fs_sm * 0.56)))
+        _draw_text(sbar_txt, rx + mg + 4 * scale,
+                   sbar_y + sbar_h / 2 - fs_sm / 2, fs_sm, (0.85, 1.0, 0.88, 1.0))
+    else:
+        _draw_text(sbar_txt, rx + mg,
+                   sbar_y + sbar_h / 2 - fs_sm / 2, fs_sm, status_col)
 
     # TRANSCRIBE button (right end of status bar). Rect comes from the shared
     # helper so the click zone and this (flat-fallback) drawing always agree.
@@ -938,5 +944,9 @@ def _draw_whisper_body(rx, ry, rw, rh, rack, ai_idx, scale):
         _draw_text("\u2713 Strips placed on timeline", col3_x, y3, fs_sm, _GREEN)
     elif status == _ERROR:
         _draw_text("\u2717 Failed \u2014 check console", col3_x, y3, fs_sm, _RED)
+    elif status == _PROCESSING:
+        from core import ai_status as _ais
+        _draw_text(_ais.pick("whisper", ai_idx, int(col_w * 1.0 / max(1.0, fs_sm * 0.56))),
+                   col3_x, y3, fs_sm, (0.85, 1.0, 0.88, 1.0))
     else:
         _draw_text("No output yet", col3_x, y3, fs_sm, _TEXT_LABEL)

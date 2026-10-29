@@ -756,6 +756,108 @@ def _print_debug_summary(final_elapsed):
 
 
 # ---------------------------------------------------------------------------
+# "Welcome once" - the transition (video + fanfare) plays on the very first
+# click only. A small marker file records that it has happened; it lives in
+# the user's Blender config area (outside the add-on folder, so reinstalling
+# or updating the add-on does not reset it, and outside the OS temp dir, so
+# cleanup tools do not wipe it). Delete the file to see the welcome again.
+# ---------------------------------------------------------------------------
+WELCOME_FILE_NAME = "hijacker_welcome.json"
+TOAST_TEXT        = "You've already been welcomed."
+TOAST_HOLD_S      = 2.2
+TOAST_FADE_S      = 0.4
+_toast_t0         = -1e9
+_toast_timer_registered = False
+
+
+def _welcome_file_path() -> str:
+    try:
+        user = bpy.utils.resource_path('USER')            # .../Blender/<version>
+        base = os.path.dirname(os.path.normpath(user))    # .../Blender (all versions)
+    except Exception:
+        base = os.path.join(os.path.expanduser("~"), ".hijacker")
+    return os.path.join(base, WELCOME_FILE_NAME)
+
+
+def _read_welcome() -> dict:
+    try:
+        import json
+        with open(_welcome_file_path(), "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {"welcomed": True}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {"welcomed": True}      # unreadable marker still counts as welcomed
+
+
+def _write_welcome(data: dict):
+    path = _welcome_file_path()
+    try:
+        import json
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+            f.write("\n")
+    except Exception as e:
+        print(f"[PACKAPUNCH] could not save welcome marker: {e}")
+
+
+def already_welcomed() -> bool:
+    return bool(_read_welcome().get("welcomed"))
+
+
+def _mark_welcomed():
+    _write_welcome({"welcomed": True, "toast_shown": False,
+                    "when": time.strftime("%Y-%m-%dT%H:%M:%S")})
+
+
+def _toast_due() -> bool:
+    """True exactly once: the second time the user switches INTO the
+    packapunch skin. Records that it has been shown."""
+    d = _read_welcome()
+    if d.get("toast_shown"):
+        return False
+    d["toast_shown"] = True
+    _write_welcome(d)
+    return True
+
+
+def show_toast():
+    """Pop the 'already welcomed' message for a couple of seconds."""
+    global _toast_t0, _toast_timer_registered
+    _toast_t0 = time.perf_counter()
+    _redraw_hud_areas()
+    if not _toast_timer_registered:
+        _toast_timer_registered = True
+        bpy.app.timers.register(_toast_timer, first_interval=1.0 / 30.0)
+
+
+def get_toast():
+    """(text, alpha) while the toast is visible, else None."""
+    t = time.perf_counter() - _toast_t0
+    total = TOAST_FADE_S + TOAST_HOLD_S + TOAST_FADE_S
+    if t < 0 or t >= total:
+        return None
+    if t < TOAST_FADE_S:
+        a = t / TOAST_FADE_S
+    elif t < TOAST_FADE_S + TOAST_HOLD_S:
+        a = 1.0
+    else:
+        a = 1.0 - (t - TOAST_FADE_S - TOAST_HOLD_S) / TOAST_FADE_S
+    return (TOAST_TEXT, max(0.0, min(1.0, a)))
+
+
+def _toast_timer():
+    global _toast_timer_registered
+    _redraw_hud_areas()
+    if get_toast() is None:
+        _toast_timer_registered = False
+        return None
+    return 1.0 / 30.0
+
+
+# ---------------------------------------------------------------------------
 # Trigger
 # ---------------------------------------------------------------------------
 def toggle():
@@ -768,7 +870,11 @@ def toggle():
     back to default is an instant skin swap with no fanfare: there's
     nothing to "reveal" on the way out, so replaying the PNG sequence
     (and the "PACK-A-PUNCH!" cue) on revert just looked/sounded like a
-    glitch rather than a deliberate second transition."""
+    glitch rather than a deliberate second transition.
+
+    The full transition only ever plays ONCE per user (first click ever) -
+    see "Welcome once" above; later clicks swap skins silently and show a
+    a one-time toast on the second entry, then nothing."""
     entering = get_active_skin() != TARGET_SKIN
     target   = TARGET_SKIN if entering else DEFAULT_SKIN
     if not entering:
@@ -783,6 +889,16 @@ def toggle():
             _cue_handle = None
         except Exception as e:
             print(f"[PACKAPUNCH] could not stop the transition audio: {e}")
+    if entering:
+        if already_welcomed():
+            # Welcome is a one-time thing: still swap the skin so the
+            # button works, but no video / fanfare. The toast shows only on
+            # the second entry ever, never again after that.
+            start(target, play_audio=False, play_video=False)
+            if _toast_due():
+                show_toast()
+            return
+        _mark_welcomed()
     start(target, play_audio=entering, play_video=entering)
 
 

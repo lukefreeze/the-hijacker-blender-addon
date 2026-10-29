@@ -368,6 +368,8 @@ def separate_demucs(ai_idx, context):
 
     rack.ai_status        = "PROCESSING"
     _cancel_flags[ai_idx] = False
+    from core import ai_status as _ais
+    _ais.reset("demucs", ai_idx)
 
     def _worker():
         stems_placed = {}
@@ -404,12 +406,15 @@ def separate_demucs(ai_idx, context):
 
             for line in proc.stdout:
                 line = line.strip()
+                _ais.feed("demucs", ai_idx, line)
                 if line.startswith("PROGRESS:"):
                     try:
                         pct = int(line.split(":")[1])
                         print(f"[DEMUCS] rack {ai_idx}: {pct}%")
                     except Exception:
                         pass
+                elif line.startswith("STATUS:"):
+                    print(f"[DEMUCS] rack {ai_idx}: {line.split(':', 1)[1].strip()}")
                 elif line.startswith("STEM_DONE:"):
                     try:
                         _, stem, wav = line.split(":", 2)
