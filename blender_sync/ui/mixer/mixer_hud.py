@@ -471,6 +471,29 @@ def draw_callback_px(self, context) -> None:
         except Exception as _pape2:
             print(f"[PACKAPUNCH] overlay draw error: {_pape2}")
 
+        # "Already welcomed" toast (PACK-A-PUNCH button after the first use).
+        try:
+            from core import packapunch as _pap3
+            _toast = _pap3.get_toast()
+            if _toast is not None:
+                _t_text, _t_a = _toast
+                _t_scale = max(0.75, min(1.5, height / 900.0))
+                _t_size = int(16 * _t_scale)
+                blf.size(0, _t_size)
+                _t_w, _t_h = blf.dimensions(0, _t_text)
+                _pad_x, _pad_y = 22 * _t_scale, 12 * _t_scale
+                _bw, _bh = _t_w + 2 * _pad_x, _t_h + 2 * _pad_y
+                _bx = (width - _bw) / 2.0
+                _by = height * 0.12
+                gpu.state.blend_set("ALPHA")
+                draw_rounded_rect(_bx, _by, _bw, _bh, 8 * _t_scale,
+                                  (0.05, 0.05, 0.06, 0.88 * _t_a))
+                blf.color(0, 1.0, 1.0, 1.0, _t_a)
+                blf.position(0, _bx + _pad_x, _by + _pad_y + 2 * _t_scale, 0)
+                blf.draw(0, _t_text)
+        except Exception as _pape3:
+            print(f"[PACKAPUNCH] toast draw error: {_pape3}")
+
     except Exception as e:
         print(f"DRAW ERROR: {e}")
         import traceback; traceback.print_exc()
