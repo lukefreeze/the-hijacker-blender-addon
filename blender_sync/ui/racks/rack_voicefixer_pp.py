@@ -513,9 +513,17 @@ def vf_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
 
     if status == _PROCESSING:
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(now * 5.0))
-        _line("RESTORING...", 150, VF_FS_BIG, VF_GREEN, a=pulse)
-        _line("Neural vocoder rebuilding speech", 188, VF_FS_SMALL, VF_GREEN_DIM, 0.5)
-        _line("This may take 30-90 seconds", 212, VF_FS_SMALL, VF_GREEN_DIM, 0.4)
+        from core import ai_status as _ais
+        _line(_ais.headline("voicefixer", ai_idx, "RESTORING..."), 150, VF_FS_BIG, VF_GREEN, a=pulse)
+        _mc = int(((scr[2] - scr[0]) - 40 * g.s) / max(1.0, VF_FS_SMALL * g.s * 0.56))
+        _line(_ais.pick("voicefixer", ai_idx, _mc), 188, VF_FS_SMALL, VF_GREEN, 0.95)
+        _line("Needed once, then kept on this computer" if _ais.is_downloading("voicefixer", ai_idx)
+              else "Neural vocoder rebuilding speech", 212, VF_FS_SMALL, VF_GREEN_DIM, 0.5)
+        _bx0 = scr[0] + (scr[2] - scr[0]) * 0.16
+        _bx1 = scr[2] - (scr[2] - scr[0]) * 0.16
+        _quad(sh, _bx0, g.Y(228.0), _bx1, g.Y(224.0), (0.05, 0.22, 0.09, 0.9 * lv))
+        _quad(sh, _bx0, g.Y(228.0), _bx0 + (_bx1 - _bx0) * max(0.01, _ais.get_fraction("voicefixer", ai_idx)),
+              g.Y(224.0), (0.40, 1.0, 0.52, 0.95 * lv))
     elif status == _DONE:
         _line("RESTORATION DONE", 140, VF_FS_BIG, VF_GREEN)
         info = "Output placed in VSE"
@@ -592,8 +600,18 @@ def vf_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     # ── status slot ──────────────────────────────────────────────────────────
     sb = R(VF_STATUS)
     src_str = f"SRC:CH{active_chs[0]}" if active_chs else "SRC:unset"
-    _text(f"ENGINE: VoiceFixer  |  {src_str}  |  OUT:CH{out_ch_val}  |  MODE:{_MODE_LABELS[mode_idx]}  |  OFFLINE",
-          sb[0] + 12 * g.s, (sb[1] + sb[3]) / 2, VF_FS_TINY, g, VF_GREEN_DIM, lv, glow=0.6,
+    _sb_txt = f"ENGINE: VoiceFixer  |  {src_str}  |  OUT:CH{out_ch_val}  |  MODE:{_MODE_LABELS[mode_idx]}  |  OFFLINE"
+    _sb_col = VF_GREEN_DIM
+    if status == _PROCESSING:
+        # progress printed ON the status screen in place of its usual text
+        from core import ai_status as _ais
+        _fr = max(0.0, min(1.0, _ais.get_fraction("voicefixer", ai_idx)))
+        _bh = max(2 * g.s, (sb[3] - sb[1]) * 0.16)
+        _quad(sh, sb[0] + 4 * g.s, sb[1] + 3 * g.s, sb[0] + 4 * g.s + ((sb[2] - sb[0]) - 8 * g.s) * _fr,
+              sb[1] + 3 * g.s + _bh, (0.40, 1.0, 0.52, 0.95 * lv))
+        _sb_txt = _ais.pick("voicefixer", ai_idx, int(((sb[2] - sb[0]) - 24 * g.s) / max(1.0, VF_FS_TINY * g.s * 0.56)))
+        _sb_col = VF_GREEN
+    _text(_sb_txt, sb[0] + 12 * g.s, (sb[1] + sb[3]) / 2, VF_FS_TINY, g, _sb_col, lv, glow=0.6,
           max_w=(sb[2] - sb[0]) - 24 * g.s)
 
     # ── status lamp ──────────────────────────────────────────────────────────

@@ -524,15 +524,20 @@ def _draw_voicefixer_body(rx, ry, rw, rh, rack, ai_idx, scale):
     if status == _PROCESSING:
         if not _has_skin:
             sh.bind(); sh.uniform_float("color",(0.04,0.12,0.20,1.0)); stb.draw(sh)
+        from core import ai_status as _ais
         fs_st = _vf_fs(8, scale)
-        _draw_text("RESTORING...", _st_tx,
+        _draw_text(_ais.headline("voicefixer", ai_idx, "RESTORING..."), _st_tx,
                    state_y+state_h*0.65-fs_st/2+_st_ty, fs_st, _ACCENT)
-        _draw_text("Neural vocoder rebuilding speech",
-                   _st_tx, state_y+state_h*0.42+_st_ty,
-                   _vf_fs(6, scale), _TEXT_DIM)
-        _draw_text("This may take 30-90 seconds",
-                   _st_tx, state_y+state_h*0.24+_st_ty,
-                   _vf_fs(6, scale), _TEXT_DIM)
+        _fs_h = _vf_fs(6, scale)
+        _draw_text(_ais.pick("voicefixer", ai_idx, int((centre_w - 20*scale) / max(1.0, _fs_h * 0.56))),
+                   _st_tx, state_y+state_h*0.42+_st_ty, _fs_h, (0.80, 0.93, 1.0, 1.0))
+        _draw_text("Needed once, then kept on this computer" if _ais.is_downloading("voicefixer", ai_idx)
+                   else "Neural vocoder rebuilding speech",
+                   _st_tx, state_y+state_h*0.24+_st_ty, _fs_h, _TEXT_DIM)
+        _pbw = centre_w - 24*scale
+        _draw_rect(cx + 12*scale, state_y + state_h*0.08, _pbw, max(2*scale, state_h*0.05), (0.04, 0.12, 0.20, 1.0))
+        _draw_rect(cx + 12*scale, state_y + state_h*0.08, _pbw * _ais.get_fraction("voicefixer", ai_idx),
+                   max(2*scale, state_h*0.05), (0.25, 0.65, 1.0, 1.0))
 
     elif status == _DONE:
         if not _has_skin:
@@ -735,11 +740,23 @@ def _draw_voicefixer_body(rx, ry, rw, rh, rack, ai_idx, scale):
 
     src_str = f"SRC:CH{active_chs[0]}" if active_chs else "SRC:unset"
     fs_sb   = _vf_fs(7, scale)
+    _sb_txt = f"ENGINE: VoiceFixer  |  {src_str}  |  OUT:CH{out_ch_val}  |  MODE:{_MODE_LABELS[mode_idx]}  |  OFFLINE"
+    _sb_col = _TEXT_DIM
+    if status == _PROCESSING:
+        # Download / processing progress is shown ON the status screen,
+        # replacing its usual text until the job ends.
+        from core import ai_status as _ais
+        _fr = _ais.get_fraction("voicefixer", ai_idx)
+        _bh = max(2*scale, sbar_h * 0.16)
+        _draw_rect(sbar_x + 3*scale, sbar_y + 2*scale, (sbar_w - 6*scale) * _fr, _bh,
+                   (0.25, 0.65, 1.0, 0.95))
+        _sb_txt = _ais.pick("voicefixer", ai_idx, int((sbar_w - 20*scale) / max(1.0, fs_sb * 0.56)))
+        _sb_col = (0.80, 0.93, 1.0, 1.0)
     _draw_text(
-        f"ENGINE: VoiceFixer  |  {src_str}  |  OUT:CH{out_ch_val}  |  MODE:{_MODE_LABELS[mode_idx]}  |  OFFLINE",
+        _sb_txt,
         sbar_x+7*scale + VF_STATUSBAR_TEXT_X_OFFSET*scale,
         sbar_y+sbar_h/2-fs_sb/2 + VF_STATUSBAR_TEXT_Y_OFFSET*scale,
-        fs_sb, _TEXT_DIM)
+        fs_sb, _sb_col)
 
     # Status LED — suppressed once skinned; baked into the background art in
     # the bottom-right corner of the rack, same as rack_knnvc.py's.

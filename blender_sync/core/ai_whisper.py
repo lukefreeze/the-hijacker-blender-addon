@@ -66,16 +66,10 @@ _POSITION_Y = {0: 0.90, 1: 0.50, 2: 0.05}
 
 # Latest PROGRESS/STATUS from the running runner, per rack index, for the
 # rack's status bar (plain dict: written by the worker thread, read by draw code).
-_progress_text = {}
-
-
 def get_progress_text(ai_idx):
-    """e.g. '15% - Downloading model 310 of ~1530 MB (first use only)', or ''."""
-    d = _progress_text.get(ai_idx)
-    if not d:
-        return ""
-    pct, msg = d.get("pct", ""), d.get("msg", "")
-    return (f"{pct}% - {msg}" if pct and msg else (f"{pct}%" if pct else msg))
+    """Banner text for the running job (see core/ai_status.py)."""
+    from core import ai_status
+    return ai_status.get_text("whisper", ai_idx)
 
 
 
@@ -354,7 +348,8 @@ def transcribe_whisper(ai_idx, context):
 
     rack.ai_status        = "PROCESSING"
     _cancel_flags[ai_idx] = False
-    _progress_text.pop(ai_idx, None)
+    from core import ai_status as _ais
+    _ais.reset("whisper", ai_idx)
 
     def _worker():
         try:
@@ -373,17 +368,14 @@ def transcribe_whisper(ai_idx, context):
             result_segs = []
             for line in proc.stdout:
                 line = line.strip()
+                _ais.feed("whisper", ai_idx, line)
                 if line.startswith("PROGRESS:"):
                     try:
-                        _pct = line.split(':',1)[1].strip()
-                        _progress_text.setdefault(ai_idx, {})["pct"] = _pct
-                        print(f"[WHISPER] rack {ai_idx}: {_pct}%")
+                        print(f"[WHISPER] rack {ai_idx}: {line.split(':',1)[1].strip()}%")
                     except Exception:
                         pass
                 elif line.startswith("STATUS:"):
-                    _msg = line.split(':',1)[1].strip()
-                    _progress_text.setdefault(ai_idx, {})["msg"] = _msg
-                    print(f"[WHISPER] rack {ai_idx}: {_msg}")
+                    print(f"[WHISPER] rack {ai_idx}: {line.split(':',1)[1].strip()}")
                 elif line.startswith("RESULT:"):
                     try:
                         result_segs = json.loads(line.split(":", 1)[1].strip())

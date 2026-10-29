@@ -545,14 +545,18 @@ def _draw_demucs_body(rx, ry, rw, rh, rack, ai_idx, scale):
         t_now    = time.time()
         pulse    = 0.5 + 0.5 * math.sin(t_now * 4.0)
         head_col = (_GREEN[0], _GREEN[1] * 0.5 + 0.5 * pulse, _GREEN[2], 1.0)
-        _draw_text("ANALYZING…", left_x0, ly, fs_head, head_col)
+        # Live job progress is printed on this screen (headline, status line
+        # with percentage / download info, and a real progress bar).
+        from core import ai_status as _ais
+        _grp = "demucs"
+        _draw_text(_ais.headline(_grp, ai_idx, "ANALYZING…"), left_x0, ly, fs_head, head_col)
         ly -= line_h_l
-        _draw_text("This can take a minute or two.", left_x0, ly, fs_body, _GREEN)
+        _mc = max(8, int(left_w_s / max(1.0, fs_body * 0.56)))
+        _draw_text(_ais.pick(_grp, ai_idx, _mc), left_x0, ly, fs_body, _GREEN)
         ly -= line_h_l + 4*scale
         bar_h = 3*scale
         _draw_rect(left_x0, ly, left_w_s, bar_h, (0.04, 0.15, 0.06, 1.0))
-        fill_pulse = 0.4 + 0.6 * abs(math.sin(t_now * 1.5))
-        _draw_rect(left_x0, ly, left_w_s * fill_pulse, bar_h, _GREEN)
+        _draw_rect(left_x0, ly, left_w_s * max(0.02, _ais.get_fraction(_grp, ai_idx)), bar_h, _GREEN)
     elif status == "DONE":
         _draw_text("DEMUCS COMPLETE", left_x0, ly, fs_head, _GREEN)
         ly -= line_h_l

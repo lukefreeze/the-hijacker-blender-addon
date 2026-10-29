@@ -82,8 +82,9 @@ def main():
     try:
         # demucs 4.x CLI — WAV is default output format (no --wav flag needed)
         # Use default 16-bit PCM output (not --int24) so meters.py can read it
+        wrap = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demucs_wrap.py")
         cmd_args = [
-            sys.executable, "-m", "demucs",
+            sys.executable, wrap,
             "-n",    model,
             "-o",    tmp_out,
             "--clip-mode", "rescale",
@@ -96,6 +97,13 @@ def main():
             cmd_args += ["--overlap", "0.25", "--shifts", "1"]
 
         cmd_args.append(src_path)
+
+        # Some models are "bags" of several networks, and --shifts repeats the
+        # pass: Demucs draws one progress bar per pass, so overall progress
+        # is (finished passes + this pass) / total passes.
+        bag_n = {"htdemucs_ft": 4, "mdx_extra": 4, "mdx_extra_q": 4,
+                 "mdx": 4, "mdx_q": 4}.get(model, 1)
+        total_passes = bag_n            # --shifts 0 or 1 both mean a single pass per network
 
         print("PROGRESS:15")
         sys.stdout.flush()
@@ -118,15 +126,46 @@ def main():
 
         # Relay stderr progress lines
         progress_val = [15]
+        state = {"dl": False, "pass": 0, "last_raw": 0.0, "sep": False}
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        try:
+            import hj_download as _hd
+        except Exception:
+            _hd = None
+
+        print("STATUS:Loading model (downloads on first use)")
+        sys.stdout.flush()
 
         def _read_stderr():
             for line in proc.stderr:
                 line = line.strip()
-                if "%" in line:
+                if line.startswith("HJDL|"):
+                    try:
+                        _, lab, d, t_ = line.split("|")
+                        d, t_ = int(d), int(t_)
+                        state["dl"] = True
+                        if t_ > 0:
+                            print(f"PROGRESS:{10 + int(5 * min(1.0, d / t_))}")
+                        txt = _hd.status_text(lab, d, t_) if _hd else f"Downloading {lab}"
+                        print(f"STATUS:{txt}")
+                        sys.stdout.flush()
+                    except Exception:
+                        pass
+                elif "%" in line:
                     try:
                         pct_str = [p for p in line.split() if "%" in p][0]
-                        pct = float(pct_str.replace("%", ""))
-                        mapped = 15 + int(pct * 0.75)
+                        pct = float(pct_str.split("%")[0].replace("|", "").strip().rstrip("%"))
+                        if state["dl"] or not state["sep"]:
+                            state["dl"] = False
+                            state["sep"] = True
+                            print("STATUS:Separating stems")
+                        # a new progress bar starts (next network in the bag): count a pass
+                        if pct < state["last_raw"] - 30.0:
+                            state["pass"] += 1
+                        state["last_raw"] = pct
+                        frac = (state["pass"] + pct / 100.0) / float(total_passes)
+                        mapped = 15 + int(min(1.0, frac) * 75)
                         if mapped > progress_val[0]:
                             progress_val[0] = mapped
                             print(f"PROGRESS:{mapped}")

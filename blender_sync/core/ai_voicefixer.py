@@ -76,6 +76,22 @@ def _find_system_python():
     global _PYTHON_CMD
     if _PYTHON_CMD:
         return _PYTHON_CMD
+    # The rack already reports "installed" from a quick `pip show` of the
+    # managed venv. Importing voicefixer here (which drags in torch, librosa
+    # etc.) can take well over the finder's few-second timeout on a cold
+    # start - fresh Windows account, antivirus scanning the DLLs - and then
+    # a perfectly good install was reported as "not found". Trust the venv
+    # when pip knows the package; the runner subprocess reports any REAL
+    # import problem with its full traceback.
+    try:
+        from core import ai_pydeps as _pydeps
+        vp = _pydeps.get_venv_python()
+        if vp and _pydeps.venv_has_pip_package("voicefixer", timeout=20):
+            _PYTHON_CMD = [vp]
+            print(f"[VOICEFIXER] venv Python: {vp}")
+            return _PYTHON_CMD
+    except Exception as _e:
+        print(f"[VOICEFIXER] venv check error: {_e}")
     try:
         from core.ai_python_finder import find_python_with as _fpw
         pkg = "voicefixer"
@@ -392,6 +408,8 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
         return
     rack.ai_status        = "PROCESSING"
     _cancel_flags[ai_idx] = False
+    from core import ai_status as _ais
+    _ais.reset("voicefixer", ai_idx)
 
     def _worker():
         try:
@@ -414,9 +432,12 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
 
             for line in proc.stdout:
                 line = line.strip()
+                _ais.feed("voicefixer", ai_idx, line)
                 if line.startswith("PROGRESS:"):
                     try: print(f"[VOICEFIXER] rack {ai_idx}: {line.split(':')[1]}%")
                     except Exception: pass
+                elif line.startswith("STATUS:"):
+                    print(f"[VOICEFIXER] rack {ai_idx}: {line.split(':', 1)[1].strip()}")
                 elif line.startswith("DONE:"):
                     out = line.split(":", 1)[1].strip()
                     _pending_finish[ai_idx] = {

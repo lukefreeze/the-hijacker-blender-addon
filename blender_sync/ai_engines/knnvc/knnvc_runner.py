@@ -110,12 +110,26 @@ def run(src, ref, output, topk=4, ref_secs=30, patch_path=None):
     apply_patch(patch_path)
     print(f"PROGRESS:10")
 
+    # Model files (WavLM + vocoder, ~1.3 GB) download on first use. Use the
+    # resumable downloader so a dropped connection continues instead of
+    # failing, and so the rack can show a download percentage.
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import hj_download as _hd
+        _hd.install_torch_hub_patch("kNN-VC voice models")
+    except Exception as _e:
+        print(f"STATUS:", flush=True)
+        print(f"[kNN-VC] resumable downloader unavailable: {_e}", file=sys.stderr)
+
+    print("STATUS:Loading voice models (downloaded on first use only)", flush=True)
+
     # Load model
     knn_vc = torch.hub.load(
         "bshall/knn-vc", "knn_vc",
-        prematched=True, trust_repo=True, pretrained=True)
+        prematched=True, trust_repo=True, pretrained=True, device=device)
     knn_vc = knn_vc.to(device)
     print(f"PROGRESS:30")
+    print(f"STATUS:Preparing audio on {device.upper()}", flush=True)
 
     # Trim reference to ref_secs to avoid VRAM issues
     ref_wav, ref_sr = _load_audio(ref)
@@ -127,23 +141,36 @@ def run(src, ref, output, topk=4, ref_secs=30, patch_path=None):
         ref = tmp_ref
     print(f"PROGRESS:40")
 
-    # kNN-VC's own loader uses torchaudio.load(); when that can't decode (see
-    # _can_torchaudio_load) hand it ready-made 16 kHz mono tensors instead.
-    if _can_torchaudio_load(src):
-        src_arg = src
-    else:
-        src_arg = _as_16k_mono(src)
+    # Hand kNN-VC ready-made 16 kHz mono tensors (works whether or not
+    # torchaudio can decode the file) so the source can be processed in
+    # slices, which gives the rack a real progress signal.
+    src_wav = _as_16k_mono(src)
     ref_arg = ref if _can_torchaudio_load(ref) else _as_16k_mono(ref)
 
-    # Extract features
-    query_seq   = knn_vc.get_features(src_arg)
-    print(f"PROGRESS:60")
+    # Extract features slice by slice (20 s = 1000 WavLM frames per slice)
+    SLICE = 16000 * 20
+    total = src_wav.shape[0]
+    cuts  = list(range(0, total, SLICE)) or [0]
+    if len(cuts) > 1 and total - cuts[-1] < 16000:      # fold a <1 s tail into the previous slice
+        cuts.pop()
+    cuts.append(total)
+    n_sl  = len(cuts) - 1
+    feats = []
+    for k in range(n_sl):
+        print(f"STATUS:Analysing the source voice ({k + 1} of {n_sl})", flush=True)
+        feats.append(knn_vc.get_features(src_wav[cuts[k]:cuts[k + 1]]))
+        print(f"PROGRESS:{40 + int(30 * (k + 1) / n_sl)}", flush=True)
+    query_seq = torch.cat(feats, dim=0) if len(feats) > 1 else feats[0]
+
+    print("STATUS:Analysing the target voice", flush=True)
     matching_set = knn_vc.get_matching_set([ref_arg])
-    print(f"PROGRESS:75")
+    print(f"PROGRESS:75", flush=True)
 
     # Convert
+    print("STATUS:Converting the voice", flush=True)
     out_wav = knn_vc.match(query_seq, matching_set, topk=topk)
-    print(f"PROGRESS:90")
+    print(f"PROGRESS:90", flush=True)
+    print("STATUS:Saving", flush=True)
 
     # Save
     _save_audio(output, out_wav[None], 16000)

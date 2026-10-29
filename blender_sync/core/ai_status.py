@@ -104,3 +104,60 @@ def get_text(group, idx):
     if eta:
         parts.append(eta)
     return " - ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Text for on-screen display. The racks print this INSIDE their own screens
+# (status bar / the "ANALYZING" screen) in place of the usual text while a
+# job runs, so it must fit: pick() returns the most informative variant that
+# fits in max_chars characters.
+# ---------------------------------------------------------------------------
+import re as _re
+
+_DL_RE = _re.compile(r"^Downloading (.+?): (\d+)% \((\d+) of (\d+) MB\)")
+
+
+def get_variants(group, idx):
+    """Candidate texts, most informative first."""
+    st = _state.get((group, idx))
+    if not st:
+        return ["Starting..."]
+    if st["dl"]:
+        m = _DL_RE.match(st["msg"])
+        if not m:
+            return [st["msg"], "Downloading model - one-time download", "Downloading model"]
+        label, pct, d, t = m.group(1), m.group(2), m.group(3), m.group(4)
+        return [
+            st["msg"],
+            f"Downloading {label}: {pct}% ({d}/{t} MB) - one-time download",
+            f"Downloading {pct}% ({d}/{t} MB) - one-time download",
+            f"Downloading model {pct}% - one-time download",
+            f"Downloading {pct}%",
+            f"DL {pct}%",
+        ]
+    pct = int(st["pct"])
+    eta = _eta(st)
+    out = []
+    if st["msg"]:
+        out.append(f"{pct}% - {st['msg']}" + (f" - {eta}" if eta else ""))
+        if eta:
+            out.append(f"{pct}% - {st['msg']}")
+    if eta:
+        out.append(f"{pct}% - {eta}")
+    out.append(f"Processing {pct}%")
+    out.append(f"{pct}%")
+    return out
+
+
+def pick(group, idx, max_chars):
+    """Most informative variant that fits max_chars (falls back to the shortest)."""
+    vs = get_variants(group, idx)
+    for v in vs:
+        if len(v) <= max_chars:
+            return v
+    return vs[-1]
+
+
+def headline(group, idx, default="ANALYZING..."):
+    """Big-screen title: says DOWNLOADING while a model downloads."""
+    return "DOWNLOADING MODEL..." if is_downloading(group, idx) else default

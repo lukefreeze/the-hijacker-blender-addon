@@ -71,6 +71,8 @@ def main():
     # at 5%. Watch the model's cache folder and report PROGRESS 5..15 plus a
     # STATUS line while that happens.
     import threading, time as _time
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import hj_download as _hd
     _stop = threading.Event()
 
     def _watch_download():
@@ -102,18 +104,28 @@ def main():
             except Exception:
                 pass
             if size > 0:
-                frac = min(1.0, size / total)
-                pct = 5 + int(10 * frac)
-                if pct != last:
-                    last = pct
-                    print(f"PROGRESS:{pct}")
-                    print(f"STATUS:Downloading model {size/1e6:.0f} of ~{total/1e6:.0f} MB (first use only)")
+                frac = min(0.99, size / total)       # the total is an estimate: never claim 100% early
+                step = int(frac * 100)
+                if step != last:
+                    last = step
+                    print(f"PROGRESS:{5 + int(10 * frac)}")
+                    print("STATUS:" + _hd.status_text(f"Whisper {model} model", min(size, total * 0.99), total))
                     sys.stdout.flush()
-            _stop.wait(1.0)
+            _stop.wait(0.5)
 
-    threading.Thread(target=_watch_download, daemon=True).start()
+    # Only report a download when the model is not already on disk.
     try:
-        print("STATUS:Loading model (downloads on first use)")
+        from faster_whisper.utils import download_model as _dm
+        _dm(model, local_files_only=True)
+        _cached = True
+    except Exception:
+        _cached = False
+    _wt = None
+    if not _cached:
+        _wt = threading.Thread(target=_watch_download, daemon=True)
+        _wt.start()
+    try:
+        print("STATUS:Loading model" if _cached else "STATUS:Preparing model download")
         sys.stdout.flush()
         whisper_model = WhisperModel(model, device=device, compute_type=compute)
     except Exception as e:
@@ -121,6 +133,8 @@ def main():
         print(f"ERROR:failed to load model '{model}': {e}")
         sys.exit(1)
     _stop.set()
+    if _wt is not None:
+        _wt.join(timeout=3)          # so no late "Downloading" line lands after the next status
     print(f"STATUS:Transcribing on {device.upper()}")
     sys.stdout.flush()
 
