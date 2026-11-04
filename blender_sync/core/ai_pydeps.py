@@ -133,6 +133,15 @@ def get_state(group):
     return _state.get(group, {"status": _STATUS_IDLE, "message": "", "started": 0.0})
 
 
+def get_install_percent(group):
+    """0-100 progress of a running install (an estimate: pip only reveals the
+    total download size as it goes), or 100 once finished."""
+    st = get_state(group)
+    if st["status"] == _STATUS_DONE:
+        return 100
+    return int(st.get("pct", 0.0))
+
+
 def is_installing(group):
     return get_state(group)["status"] in (_STATUS_CREATING_VENV, _STATUS_INSTALLING)
 
@@ -318,8 +327,20 @@ def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs):
             pass
 
         all_specs = list(pip_specs) + list(extra_pip_specs or [])
+        # `--progress-bar raw` makes pip print plain "Progress <done> of
+        # <total>" byte counts per download even though it is not talking to
+        # a terminal, which is what the percentage below is built from.
+        # Only used when this pip lists the option (older pips reject it).
+        _raw_args = []
+        try:
+            _help = subprocess.run([vp, "-m", "pip", "install", "--help"], capture_output=True,
+                                   text=True, timeout=30).stdout
+            if "--progress-bar" in _help and "raw" in _help.split("--progress-bar", 1)[1][:300]:
+                _raw_args = ["--progress-bar", "raw"]
+        except Exception:
+            pass
         proc = subprocess.Popen(
-            [vp, "-m", "pip", "install", "--disable-pip-version-check"] + all_specs,
+            [vp, "-m", "pip", "install", "--disable-pip-version-check"] + _raw_args + all_specs,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", bufsize=1)
         _proc_handles[group] = proc
@@ -333,17 +354,47 @@ def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs):
         # fetched and its size instead of a raw, truncated pip log line.
         import re
         _collect_re = re.compile(r'^Collecting\s+(\S+)')
-        _dl_re      = re.compile(r'^Downloading\s+\S+\s+\(([\d.]+\s*[KMGT]?B)\)')
+        _dl_re      = re.compile(r'^Downloading\s+(\S+)\s+\(([\d.]+)\s*([kKMGT]?B)\)')
+        _prog_re    = re.compile(r'^Progress\s+(\d+)\s+of\s+(\d+)')
+        _have_re    = re.compile(r'^Requirement already satisfied:\s+([A-Za-z0-9_.\-]+)')
+        _units      = {"B": 1.0, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12}
+
+        # Rough size (MB) of what each rack normally has to download on a
+        # fresh machine. Only a floor for the percentage's denominator
+        # (the real total is not known until pip has seen every package).
+        _floor_mb = {"demucs": 300.0, "knnvc": 300.0, "voicefixer": 450.0, "whisper": 120.0}.get(group, 200.0)
+        _shared_mb = {"torch": 120.0, "torchaudio": 10.0, "numpy": 15.0}
+        pr = {"completed": 0.0, "cur_total": 0.0, "cur_done": 0.0,
+              "floor": _floor_mb * 1e6, "phase": "resolve", "t_inst": 0.0}
+
+        def _update_pct(st):
+            if pr["phase"] == "install":
+                # no byte counts while pip unpacks: creep from 90 toward 98
+                new = min(98.0, 90.0 + (time.time() - pr["t_inst"]) * 0.25)
+            elif pr["completed"] + pr["cur_total"] > 0:
+                denom = max(pr["completed"] + pr["cur_total"], pr["floor"])
+                frac = (pr["completed"] + pr["cur_done"]) / denom
+                new = 3.0 + 85.0 * min(1.0, frac)
+            else:
+                new = 2.0
+            st["pct"] = max(st.get("pct", 0.0), new)     # never goes backwards
 
         last_line = ""
         for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
-            last_line = line[:70]
             st = _state.get(group)
             if st is None or st.get("status") != _STATUS_INSTALLING:
                 continue  # cancelled mid-stream — stop updating progress fields
+            mp = _prog_re.match(line)
+            if mp:                                   # byte progress of the current file
+                pr["cur_done"] = float(mp.group(1))
+                if int(mp.group(2)) > 0:
+                    pr["cur_total"] = float(mp.group(2))
+                _update_pct(st)
+                continue
+            last_line = line[:70]
             st["message"] = last_line
             m = _collect_re.match(line)
             if m:
@@ -351,8 +402,27 @@ def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs):
                 st["package_size"] = ""
                 st["package_num"]  = st.get("package_num", 0) + 1
             m2 = _dl_re.match(line)
-            if m2:
-                st["package_size"] = m2.group(1)
+            if m2 and not m2.group(1).endswith(".metadata"):   # (metadata stubs are tiny: ignore)
+                st["package"]      = m2.group(1).split("-")[0]
+                st["package_size"] = f"{m2.group(2)} {m2.group(3)}"
+                pr["completed"] += pr["cur_total"]   # previous file finished
+                pr["cur_done"] = 0.0
+                try:
+                    pr["cur_total"] = float(m2.group(2)) * _units.get(m2.group(3).upper(), 1.0)
+                except Exception:
+                    pr["cur_total"] = 0.0
+                pr["phase"] = "download"
+            m3 = _have_re.match(line)
+            if m3 and m3.group(1).lower() in _shared_mb:   # already on disk: less to fetch
+                pr["floor"] = max(30e6, pr["floor"] - _shared_mb[m3.group(1).lower()] * 1e6)
+            if line.startswith("Installing collected packages"):
+                pr["completed"] += pr["cur_total"]
+                pr["cur_total"] = pr["cur_done"] = 0.0
+                pr["phase"] = "install"
+                pr["t_inst"] = time.time()
+                st["package"] = ""
+                st["message"] = "Installing packages…"
+            _update_pct(st)
         proc.wait()
         _proc_handles.pop(group, None)
 

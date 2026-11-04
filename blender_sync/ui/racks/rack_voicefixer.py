@@ -306,19 +306,11 @@ def _draw_setup_warning(rx, ry, rw, rh, scale, has_skin=False):
 
     _vf_status_y = cmd_y + 10 * scale
     if _vf_kind == "busy":
-        for _i, _line in enumerate(_vf_lines):
-            _draw_text(_line, tx, _vf_status_y + _i * (fs_s + 3*scale), fs_s, _WARN_TEXT)
-        import time as _vf_time
-        _bar_w = warn_w - 28 * scale
-        _bar_h = max(3 * scale, 3)
-        _bar_x = tx
-        _bar_y = _vf_status_y + len(_vf_lines) * (fs_s + 3*scale) + 3*scale
-        _draw_rect(_bar_x, _bar_y, _bar_w, _bar_h, (0.0, 0.07, 0.10, 1.0))
-        _seg_w = _bar_w * 0.28
-        _t     = (_vf_time.time() * 0.35) % 1.0
-        _pos   = _t * (_bar_w + _seg_w) - _seg_w
-        _seg_x = max(_bar_x, min(_bar_x + _bar_w - _seg_w, _bar_x + _pos))
-        _draw_rect(_seg_x, _bar_y, min(_seg_w, _bar_x + _bar_w - _seg_x), _bar_h, _WARN_TEXT)
+        from ui.racks.install_panel import draw_install_view as _div
+        _btn_h_vf = max(16*scale, fs_s+8*scale)
+        _div(_draw_rect, _draw_text, _text_width, warn_x, warn_y, warn_w, warn_h, scale,
+             "VOICEFIXER", _vf_lines, _pydeps.get_install_percent("voicefixer"),
+             _WARN_BG, _WARN_TEXT, _WARN_DIM, _btn_h_vf)
     elif _vf_kind == "error" and _vf_lines:
         _draw_text(_vf_lines[0], tx, _vf_status_y, fs_s, _WARN_TEXT)
 

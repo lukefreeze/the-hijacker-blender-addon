@@ -394,22 +394,11 @@ def _draw_warning(rx, ry, rw, rh, scale):
 
     _wsp_status_y = cy2 + ch + 4 * scale
     if _wsp_kind == "busy":
-        for _i, _line in enumerate(_wsp_lines):
-            _draw_text(_line, tx, _wsp_status_y + _i * (fs_s + 3*scale), fs_s, _WARN_TEXT)
-        # Animated activity bar — pip doesn't reliably report byte-level %
-        # progress when it isn't talking to a real terminal, so this shows
-        # "still working" rather than a fabricated percentage.
-        import time as _wsp_time
-        _bar_w = bw - 28 * scale
-        _bar_h = max(3 * scale, 3)
-        _bar_x = tx
-        _bar_y = _wsp_status_y + len(_wsp_lines) * (fs_s + 3*scale) + 3*scale
-        _r(_bar_x, _bar_y, _bar_w, _bar_h, (0.10, 0.07, 0.0, 1.0))
-        _seg_w = _bar_w * 0.28
-        _t     = (_wsp_time.time() * 0.35) % 1.0
-        _pos   = _t * (_bar_w + _seg_w) - _seg_w
-        _seg_x = max(_bar_x, min(_bar_x + _bar_w - _seg_w, _bar_x + _pos))
-        _r(_seg_x, _bar_y, min(_seg_w, _bar_x + _bar_w - _seg_x), _bar_h, _WARN_TEXT)
+        from ui.racks.install_panel import draw_install_view as _div
+        _btn_h_w = max(16 * scale, fs_s + 8 * scale)
+        _div(_r, _draw_text, _text_width, bx, by, bw, bh, scale,
+             "WHISPER", _wsp_lines, _pydeps.get_install_percent("whisper"),
+             _WARN_BG, _WARN_TEXT, _WARN_DIM, _btn_h_w)
     elif _wsp_kind == "error" and _wsp_lines:
         _draw_text(_wsp_lines[0], tx, _wsp_status_y, fs_s, _WARN_TEXT)
 

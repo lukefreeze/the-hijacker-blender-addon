@@ -252,19 +252,11 @@ def _draw_setup_warning(rx, ry, rw, rh, scale, has_skin=False):
 
     _rv_status_y = cmd_y + 10 * scale
     if _rv_kind == "busy":
-        for _i, _line in enumerate(_rv_lines):
-            _draw_text(_line, tx, _rv_status_y + _i * (fs_s + 3*scale), fs_s, _WARN_TEXT)
-        import time as _rv_time
-        _bar_w = warn_w - 28 * scale
-        _bar_h = max(3 * scale, 3)
-        _bar_x = tx
-        _bar_y = _rv_status_y + len(_rv_lines) * (fs_s + 3*scale) + 3*scale
-        _draw_rect(_bar_x, _bar_y, _bar_w, _bar_h, (0.10, 0.07, 0.0, 1.0))
-        _seg_w = _bar_w * 0.28
-        _t     = (_rv_time.time() * 0.35) % 1.0
-        _pos   = _t * (_bar_w + _seg_w) - _seg_w
-        _seg_x = max(_bar_x, min(_bar_x + _bar_w - _seg_w, _bar_x + _pos))
-        _draw_rect(_seg_x, _bar_y, min(_seg_w, _bar_x + _bar_w - _seg_x), _bar_h, _WARN_TEXT)
+        from ui.racks.install_panel import draw_install_view as _div
+        _btn_h_rv = max(16*scale, fs_s+8*scale)
+        _div(_draw_rect, _draw_text, _text_width, warn_x, warn_y, warn_w, warn_h, scale,
+             "KNN-VC", _rv_lines, _pydeps.get_install_percent("knnvc"),
+             _WARN_BG, _WARN_TEXT, _WARN_DIM, _btn_h_rv)
     elif _rv_kind == "error" and _rv_lines:
         _draw_text(_rv_lines[0], tx, _rv_status_y, fs_s, _WARN_TEXT)
 
