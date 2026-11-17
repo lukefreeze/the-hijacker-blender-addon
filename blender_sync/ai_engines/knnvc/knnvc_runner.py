@@ -100,6 +100,10 @@ def _as_16k_mono(path):
 
 
 def run(src, ref, output, topk=4, ref_secs=30, patch_path=None):
+    try:   # progress lines must reach the add-on the moment they are printed
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     import torch
     import torchaudio
 
@@ -116,7 +120,9 @@ def run(src, ref, output, topk=4, ref_secs=30, patch_path=None):
     try:
         sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         import hj_download as _hd
-        _hd.install_torch_hub_patch("kNN-VC voice models")
+        _hd.install_torch_hub_patch(
+            "kNN-VC voice models",
+            after_status="Loading voice models (downloaded on first use only)")
     except Exception as _e:
         print(f"STATUS:", flush=True)
         print(f"[kNN-VC] resumable downloader unavailable: {_e}", file=sys.stderr)

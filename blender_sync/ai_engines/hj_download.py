@@ -185,11 +185,13 @@ def download_file(url, dest, emit=None, hash_prefix=None, max_stalls=6, adopt_ex
 
 
 def install_torch_hub_patch(label="AI model", min_bytes=3 * 1024 * 1024,
-                            emit_factory=None, print_done=True):
+                            emit_factory=None, print_done=True, after_status=""):
     """Make torch.hub use the resumable downloader above, with status output.
 
     torch.hub's own download cannot resume and only draws a console bar.
     Files smaller than min_bytes (repo zips, tiny configs) download silently.
+    after_status: STATUS text shown once a download ends (default "" = clear it),
+    so the rack never keeps saying "Downloading" while the next step runs.
     emit_factory(label) -> emit(done, total); default prints PROGRESS/STATUS.
     """
     import torch.hub as _hub
@@ -203,7 +205,6 @@ def install_torch_hub_patch(label="AI model", min_bytes=3 * 1024 * 1024,
             emit = stdout_emitter(label, 5, 15) if loud else None
         download_file(url, dst, emit=emit, hash_prefix=hash_prefix)
         if loud and print_done:
-            print("STATUS:")
-            sys.stdout.flush()
+            print(f"STATUS:{after_status}", flush=True)
 
     _hub.download_url_to_file = _patched

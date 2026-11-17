@@ -238,6 +238,12 @@ def _draw_setup_warning(rx, ry, rw, rh, scale, has_skin=False):
     sh.bind(); sh.uniform_float("color",(0.44,0.24,0.00,1.0)); cb.draw(sh)
     _draw_text("pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126",
                cmd_x+6*scale, cmd_y+cmd_h/2-fs_b/2, fs_b, _WARN_TEXT)
+    from ui.racks import install_panel as _ip
+    _ip.reset_copy_zones("knnvc")
+    _cmd_k = "pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126"
+    _ip.draw_copy_hint(_draw_text, _text_width, "knnvc", cmd_x, cmd_y, cmd_w, cmd_h, scale,
+                       _cmd_k, _WARN_DIM, _WARN_TEXT,
+                       avoid_w=_text_width(_cmd_k, fs_b) + 12*scale)
 
     ty = cmd_y - lh * 1.2
     _draw_text("Models (~1.3GB) auto-download on first use. Restart Blender after install.", tx, ty, fs_s, _WARN_DIM)
@@ -257,8 +263,6 @@ def _draw_setup_warning(rx, ry, rw, rh, scale, has_skin=False):
         _div(_draw_rect, _draw_text, _text_width, warn_x, warn_y, warn_w, warn_h, scale,
              "KNN-VC", _rv_lines, _pydeps.get_install_percent("knnvc"),
              _WARN_BG, _WARN_TEXT, _WARN_DIM, _btn_h_rv)
-    elif _rv_kind == "error" and _rv_lines:
-        _draw_text(_rv_lines[0], tx, _rv_status_y, fs_s, _WARN_TEXT)
 
     btn_w = min(170*scale, warn_w*0.44)
     btn_h = max(16*scale, fs_s+8*scale)
@@ -279,8 +283,10 @@ def _draw_setup_warning(rx, ry, rw, rh, scale, has_skin=False):
     tw_btn = _text_width(lbl,fs_btn)
     _draw_text(lbl, btn_x+btn_w/2-tw_btn/2, btn_y+btn_h/2-fs_btn/2, fs_btn, _WARN_TEXT)
     if _rv_kind == "error" and _rv_lines:
-        _draw_text(_rv_lines[0][:70], tx, btn_y + btn_h + 4*scale,
-                    max(1, int(6*scale)), (1.0, 0.45, 0.4, 1.0))
+        _ip.draw_error_band(_draw_rect, _draw_text, _text_width, "knnvc", _WARN_BG, _WARN_TEXT,
+                            _WARN_DIM, tx, warn_w - 24*scale, btn_y + btn_h + 6*scale,
+                            cmd_y - 4*scale, scale, _rv_lines[0],
+                            _pydeps.get_error_text("knnvc"))
     return btn_x, btn_y, btn_w, btn_h
 
 
@@ -300,7 +306,7 @@ def _start_knnvc_install():
 
     _pydeps.start_install(
         "knnvc",
-        pip_specs=["torch", "torchaudio", "soundfile"],   # soundfile: fallback audio reader/writer when torchaudio can't decode
+        pip_specs=["torch", "torchaudio", "soundfile", "numpy"],   # soundfile: fallback audio reader/writer when torchaudio can't decode
         check_module=["torch", "torchaudio"],
         on_done=_on_done,
     )
@@ -343,6 +349,11 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
         try: rack['rvc_setup_btn'] = (bx,by,bw,bh)
         except Exception: pass
         return
+    try:
+        from ui.racks.install_panel import reset_copy_zones as _rcz
+        _rcz("knnvc")          # no setup panel on screen: nothing to copy
+    except Exception:
+        pass
 
     rail_h   = RACK_RAIL_H * scale
     body_bot = ry

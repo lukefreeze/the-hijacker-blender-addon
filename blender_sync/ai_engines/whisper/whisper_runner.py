@@ -207,6 +207,16 @@ def main():
             wf_out.writeframes(out_samples.tobytes())
 
         transcribe_src = safe_path
+        # Hand faster-whisper the samples directly. Its own file loader (PyAV)
+        # fails on some PyAV/faster-whisper version pairs, e.g.
+        # "open() got an unexpected keyword argument 'metadata_errors'",
+        # and we already hold clean 16 kHz mono audio.
+        try:
+            import numpy as _np
+            transcribe_src = (_np.frombuffer(out_samples.tobytes(), dtype=_np.int16)
+                              .astype(_np.float32) / 32768.0)
+        except Exception:
+            pass
     except Exception as e:
         # If conversion fails, use original and hope for the best
         transcribe_src = src_path

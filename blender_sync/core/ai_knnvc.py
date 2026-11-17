@@ -152,7 +152,7 @@ def _apply_finish(ai_idx, info):
                 target_ch  = int(getattr(rack, "p3", 0.0)) or (active_chs[0]+1 if active_chs else 2)
                 target_ch  = max(1, min(9, target_ch))
 
-                place_frame = scene.frame_start
+                place_frame = info.get("place_frame", scene.frame_start)
                 strip_name  = f"kNNVC_{ai_idx}_{int(time.time()) % 100000}"
                 _vse.get_strips_collection(seq).new_sound(
                     name=strip_name,
@@ -516,16 +516,39 @@ def convert_knnvc(ai_idx, context, preview_only=False):
         print("[KNNVC] ERROR: no source channel assigned in rail")
         return
     src_ch  = active_chs[0]
-    seq     = scene.sequence_editor
-    src_wav = None
+    seq       = scene.sequence_editor
+    src_strip = None
     if seq:
         for strip in _vse.get_all_strips(seq):
             if strip.channel == src_ch and hasattr(strip, "sound"):
-                src_wav = bpy.path.abspath(strip.sound.filepath)
+                src_strip = strip
                 break
-    if not src_wav or not os.path.exists(src_wav):
+    if not src_strip:
         rack.ai_status = "ERROR"
         print(f"[KNNVC] ERROR: no audio on channel {src_ch}")
+        return
+    src_file = bpy.path.abspath(src_strip.sound.filepath)
+    if not os.path.exists(src_file):
+        rack.ai_status = "ERROR"
+        print(f"[KNNVC] ERROR: source file not found: {src_file}")
+        return
+
+    # Convert only what is on the timeline: render the strip's trimmed span
+    # (Blender's Render Audio) instead of reading the whole source file.
+    src_wav = os.path.join(tempfile.gettempdir(), f"pb_knnvc_{ai_idx}_src_{int(time.time())}.wav")
+    try:
+        from core.audio_export import mixdown_channel
+        seq_strips = list(_vse.get_all_strips(seq))
+        place_frame = mixdown_channel(scene, seq_strips, src_ch, src_wav,
+                                      strip=src_strip, tag="KNNVC", limit_to_strip=True)
+        import wave
+        with wave.open(src_wav, "r") as wf:
+            print(f"[KNNVC] exported timeline audio: {wf.getnframes() / wf.getframerate():.2f}s "
+                  f"(from frame {place_frame})")
+    except Exception as export_err:
+        rack.ai_status = "ERROR"
+        print(f"[KNNVC] ERROR: export failed: {export_err}")
+        import traceback; traceback.print_exc()
         return
 
     try:
@@ -588,7 +611,8 @@ def convert_knnvc(ai_idx, context, preview_only=False):
                     set_rack_output(ai_idx, out)
                     _pending_finish[ai_idx] = {
                         "status": "DONE", "output_path": out,
-                        "scene_name": scene_name, "preview_only": preview_only}
+                        "scene_name": scene_name, "preview_only": preview_only,
+                        "place_frame": place_frame}
                 elif line.startswith("ERROR:"):
                     print(f"[KNNVC] {line}")
                     _pending_finish[ai_idx] = {

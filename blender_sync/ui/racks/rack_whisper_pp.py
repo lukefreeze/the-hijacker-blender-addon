@@ -757,12 +757,9 @@ def wh_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
         _text("OK - strips placed on timeline", g.X(1300.0), g.Y(352.0), WH_FS_SMALL + 1.0, g, WH_CORE, lv, glow=0.8,
               max_w=(1560.0 - 1300.0) * g.sx)
     elif status == "ERROR":
-        _text("FAILED - check console", g.X(1300.0), g.Y(352.0), WH_FS_SMALL + 1.0, g, (1.0, 0.35, 0.25, 1.0), lv,
+        from core import ai_status as _ais_e
+        _e = _ais_e.get_error("whisper", ai_idx)
+        _text(("ERROR - " + _e) if _e else "FAILED - check console", g.X(1300.0), g.Y(352.0), WH_FS_SMALL + 1.0, g, (1.0, 0.35, 0.25, 1.0), lv,
               glow=0.8, glow_col=(1.0, 0.25, 0.1), max_w=(1560.0 - 1300.0) * g.sx)
-    elif busy:
-        from core import ai_status as _ais
-        _lw = (1840.0 - 1300.0) * g.sx
-        _text(_ais.pick("whisper", ai_idx, int(_lw / max(1.0, (WH_FS_SMALL + 1.0) * g.s * 0.56))),
-              g.X(1300.0), g.Y(352.0), WH_FS_SMALL + 1.0, g, WH_AMBER, lv, glow=0.8, max_w=_lw)
     else:
         _text("No output yet", g.X(1300.0), g.Y(352.0), WH_FS_SMALL + 1.0, g, WH_NOTE, lv, glow=0.5)

@@ -48,3 +48,123 @@ def draw_install_view(draw_rect, draw_text, text_width, px, py, pw, ph, scale,
     draw_rect(bar_x, bar_y, bar_w, bar_h, (0.01, 0.01, 0.01, 1.0))
     draw_rect(bar_x, bar_y, bar_w * pct / 100.0, bar_h, fg)
     draw_text(label, bar_x + bar_w + 8 * scale, bar_y + bar_h / 2 - fs_h / 2, fs_h, fg)
+
+
+# ---------------------------------------------------------------------------
+# Click-to-copy text
+#
+# The racks are drawn with the GPU, so their text cannot be selected like
+# normal UI text. Instead the setup panels register "copy zones": clicking a
+# terminal command or an error message copies the full text to the clipboard
+# (Racks.py handles the click, see zone 'ai_copy_text').
+# ---------------------------------------------------------------------------
+import time as _time
+
+_zones = {}          # group -> [(x, y, w, h, text), ...]
+_copied_at = {}      # text -> time.time() of the last copy
+_COPIED_FLASH_S = 1.6
+
+
+def reset_copy_zones(group):
+    _zones[group] = []
+
+
+def add_copy_zone(group, x, y, w, h, text):
+    _zones.setdefault(group, []).append((x, y, w, h, text))
+
+
+def hit_copy_zone(group, mx, my):
+    """Text to copy if (mx, my) is inside one of the group's zones, else None."""
+    for (x, y, w, h, text) in _zones.get(group, ()):
+        if x <= mx <= x + w and y <= my <= y + h:
+            return text
+    return None
+
+
+def mark_copied(text):
+    _copied_at[text] = _time.time()
+    try:
+        import bpy
+
+        def _later():
+            try:
+                for window in bpy.context.window_manager.windows:
+                    for area in window.screen.areas:
+                        if area.type in ('NODE_EDITOR', 'SEQUENCE_EDITOR'):
+                            area.tag_redraw()
+            except Exception:
+                pass
+            return None
+        bpy.app.timers.register(_later, first_interval=_COPIED_FLASH_S + 0.1)
+    except Exception:
+        pass
+
+
+def _just_copied(text):
+    return _time.time() - _copied_at.get(text, -1e9) < _COPIED_FLASH_S
+
+
+def draw_copy_hint(draw_text, text_width, group, x, y, w, h, scale, text, dim, fg,
+                   avoid_w=0.0):
+    """Make the box (x, y, w, h) click-to-copy for `text`, with a small COPY
+    label at its right edge (skipped when the command text would run into it)."""
+    add_copy_zone(group, x, y, w, h, text)
+    fs = max(1, int(6 * scale))
+    done = _just_copied(text)
+    label = "COPIED" if done else "COPY"
+    lw = text_width(label, fs)
+    if avoid_w + lw + 14 * scale < w or done:
+        draw_text(label, x + w - lw - 6 * scale, y + h / 2 - fs / 2, fs, fg if done else dim)
+
+
+def _wrap(text_width, text, fs, max_w, max_lines):
+    words = text.replace("\n", " ").split()
+    lines, cur = [], ""
+    for wd in words:
+        trial = (cur + " " + wd).strip()
+        if text_width(trial, fs) <= max_w or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = wd
+        if len(lines) >= max_lines:
+            break
+    else:
+        if cur:
+            lines.append(cur)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    shown = " ".join(lines)
+    clipped = len(shown) < len(" ".join(words))
+    if clipped and lines:
+        last = lines[-1]
+        while last and text_width(last + "...", fs) > max_w:
+            last = last[:-1]
+        lines[-1] = last + "..."
+    return lines
+
+
+def draw_error_band(draw_rect, draw_text, text_width, group, bg, fg, dim, x, w,
+                    y_bottom, y_top, scale, message, full_text=None):
+    """Error readout for a setup panel: a wrapped message (as much of it as
+    fits) under a "click to copy" heading. Clicking it copies `full_text`
+    (the whole pip output when available) to the clipboard."""
+    full_text = full_text or message
+    if y_top - y_bottom < 8 * scale:
+        return
+    draw_rect(x - 4 * scale, y_bottom - 2 * scale, w + 8 * scale,
+              (y_top - y_bottom) + 4 * scale, bg)
+    fs = max(1, int(6 * scale))
+    lh = fs + 3 * scale
+    n_fit = max(1, int((y_top - y_bottom) / lh))
+    red = (1.0, 0.45, 0.4, 1.0)
+    done = _just_copied(full_text)
+    head = "COPIED TO CLIPBOARD" if done else "ERROR  -  CLICK HERE TO COPY THE FULL TEXT"
+    body = _wrap(text_width, message, fs, w - 6 * scale, max(1, min(4, n_fit - 1))) if n_fit > 1 else []
+    ty = y_top - fs
+    draw_text(head, x, ty, fs, fg if done else dim)
+    for ln in body:
+        ty -= lh
+        draw_text(ln, x, ty, fs, red)
+    add_copy_zone(group, x - 4 * scale, y_bottom - 2 * scale, w + 8 * scale,
+                  (y_top - y_bottom) + 4 * scale, full_text)

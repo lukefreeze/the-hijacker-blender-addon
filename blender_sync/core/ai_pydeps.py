@@ -142,6 +142,15 @@ def get_install_percent(group):
     return int(st.get("pct", 0.0))
 
 
+def get_error_text(group):
+    """The full text of the last install error (what a user would paste into
+    a bug report), or "" when there is none."""
+    st = get_state(group)
+    if st.get("status") != _STATUS_ERROR:
+        return ""
+    return st.get("detail") or st.get("message", "")
+
+
 def is_installing(group):
     return get_state(group)["status"] in (_STATUS_CREATING_VENV, _STATUS_INSTALLING)
 
@@ -165,7 +174,7 @@ def get_progress_display(group):
     status = st["status"]
 
     if status == _STATUS_ERROR:
-        return ([st.get("message", "")[:70]], "RETRY INSTALL  >", "error")
+        return ([st.get("message", "")], "RETRY INSTALL  >", "error")
 
     if status in (_STATUS_CREATING_VENV, _STATUS_INSTALLING):
         lines = []
@@ -284,28 +293,131 @@ def cancel_install(group):
             pass
 
 
-def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs):
+_venv_lock = threading.Lock()   # one rack at a time creates the venv / upgrades pip
+_pip_ready = set()              # venv pythons whose pip has been verified this session
+
+
+def _pip_works(vp):
+    try:
+        r = subprocess.run([vp, "-m", "pip", "--version"], capture_output=True,
+                           timeout=60, text=True, encoding="utf-8", errors="replace")
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _pip_version_major(vp):
+    """Major version of the venv's pip, or None if pip does not run."""
+    try:
+        r = subprocess.run([vp, "-m", "pip", "--version"], capture_output=True,
+                           timeout=60, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            return None
+        import re as _re
+        m = _re.match(r"pip\s+(\d+)", r.stdout.strip())
+        return int(m.group(1)) if m else 0
+    except Exception:
+        return None
+
+
+def _wipe_pip_files(vp):
+    """Delete pip's own folders from the venv so ensurepip can lay down a clean copy.
+    (ensurepip alone keeps a damaged pip: it sees the right version and does nothing.)"""
+    import glob
+    import shutil
+    root = os.path.dirname(os.path.dirname(vp))
+    sites = [os.path.join(root, "Lib", "site-packages")]
+    sites += glob.glob(os.path.join(root, "lib", "python*", "site-packages"))
+    for sp in sites:
+        for pat in ("pip", "pip-*.dist-info", "pip-*.egg-info"):
+            for path in glob.glob(os.path.join(sp, pat)):
+                shutil.rmtree(path, ignore_errors=True)
+
+
+def _repair_pip(vp):
+    """Make the venv's pip work again. Returns True when `pip --version` runs."""
+    def _ensurepip():
+        try:
+            subprocess.run([vp, "-m", "ensurepip", "--upgrade"], capture_output=True,
+                           timeout=180, text=True, encoding="utf-8", errors="replace")
+        except Exception as e:
+            print(f"[AI PYDEPS] ensurepip failed: {e}")
+    _ensurepip()
+    if _pip_works(vp):
+        return True
+    print("[AI PYDEPS] pip still damaged after ensurepip; reinstalling pip's files")
+    try:
+        _wipe_pip_files(vp)
+    except Exception as e:
+        print(f"[AI PYDEPS] could not clear pip files: {e}")
+    _ensurepip()
+    return _pip_works(vp)
+
+
+def _looks_like_broken_pip(text):
+    t = (text or "").lower()
+    return ("no module named 'pip" in t or "no module named pip" in t
+            or "pip._internal" in t and "modulenotfounderror" in t)
+
+
+def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs, _retry=False):
     try:
         root = _venv_root()
-        vp = get_venv_python()
 
-        if not vp:
-            _state[group]["message"] = "Creating Python environment…"
-            _tag_redraw_all()
-            blender_python = sys.executable
-            r = subprocess.run(
-                [blender_python, "-m", "venv", root],
-                capture_output=True, timeout=120, text=True, encoding="utf-8")
+        # Creating the venv and upgrading pip must never overlap between
+        # racks: one rack replacing pip's files while another rack's pip is
+        # running makes that pip die with "No module named 'pip._internal'".
+        with _venv_lock:
             vp = get_venv_python()
             if not vp:
-                err = (r.stderr or r.stdout or "unknown error").strip()[-400:]
-                _state[group] = {
-                    "status": _STATUS_ERROR,
-                    "message": f"Could not create Python environment: {err}",
-                    "started": time.time()}
-                if on_done:
-                    on_done(False)
-                return
+                _state[group]["message"] = "Creating Python environment…"
+                _tag_redraw_all()
+                blender_python = sys.executable
+                r = subprocess.run(
+                    [blender_python, "-m", "venv", root],
+                    capture_output=True, timeout=120, text=True, encoding="utf-8",
+                    errors="replace")
+                vp = get_venv_python()
+                if not vp:
+                    err = (r.stderr or r.stdout or "unknown error").strip()[-400:]
+                    _state[group] = {
+                        "status": _STATUS_ERROR,
+                        "message": f"Could not create Python environment: {err}",
+                        "detail": (r.stderr or r.stdout or "").strip()[-3000:],
+                        "started": time.time()}
+                    if on_done:
+                        on_done(False)
+                    return
+
+            if vp not in _pip_ready:
+                if not _pip_works(vp):
+                    _state[group]["message"] = "Repairing pip…"
+                    _tag_redraw_all()
+                    _repair_pip(vp)
+                # Upgrade pip only when it is old (the progress parsing below
+                # needs a reasonably recent one). A modern pip is left alone:
+                # an upgrade that gets interrupted leaves pip half-removed.
+                _major = _pip_version_major(vp)
+                if _major is not None and _major < 23:
+                    try:
+                        subprocess.run([vp, "-m", "pip", "install", "--upgrade", "pip"],
+                                       capture_output=True, timeout=600)
+                    except Exception:
+                        pass
+                if not _pip_works(vp):
+                    _repair_pip(vp)
+                if _pip_works(vp):
+                    _pip_ready.add(vp)
+                else:
+                    _state[group] = {
+                        "status": _STATUS_ERROR,
+                        "message": "pip inside the add-on's Python environment is damaged and "
+                                   "could not be repaired. Delete the AI models from the AI "
+                                   "settings menu and install again.",
+                        "started": time.time()}
+                    if on_done:
+                        on_done(False)
+                    return
 
         if get_state(group)["status"] == _STATUS_CANCELLED:
             if on_done:
@@ -315,16 +427,6 @@ def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs):
         _state[group]["status"]  = _STATUS_INSTALLING
         _state[group]["message"] = "Installing…"
         _tag_redraw_all()
-
-        # Best-effort pip upgrade — failure here isn't fatal. Also brings
-        # pip itself up to a version that reliably prints the "Collecting
-        # X" / "Downloading X (SIZE)" lines the progress parsing below
-        # depends on, on whatever pip Blender's bundled Python shipped with.
-        try:
-            subprocess.run([vp, "-m", "pip", "install", "--upgrade", "pip"],
-                            capture_output=True, timeout=120)
-        except Exception:
-            pass
 
         all_specs = list(pip_specs) + list(extra_pip_specs or [])
         # `--progress-bar raw` makes pip print plain "Progress <done> of
@@ -380,6 +482,7 @@ def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs):
             st["pct"] = max(st.get("pct", 0.0), new)     # never goes backwards
 
         last_line = ""
+        _tail = []
         for line in proc.stdout:
             line = line.strip()
             if not line:
@@ -394,7 +497,10 @@ def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs):
                     pr["cur_total"] = float(mp.group(2))
                 _update_pct(st)
                 continue
-            last_line = line[:70]
+            last_line = line[:400]
+            _tail.append(line[:400])
+            if len(_tail) > 25:
+                del _tail[0]
             st["message"] = last_line
             m = _collect_re.match(line)
             if m:
@@ -432,9 +538,26 @@ def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs):
             return
 
         if proc.returncode != 0:
+            _detail = "\n".join(_tail)
+            if not _retry and _looks_like_broken_pip(_detail):
+                # pip itself was damaged (e.g. replaced mid-run): repair it and go again once
+                print("[AI PYDEPS] pip looks broken; repairing and retrying once")
+                with _venv_lock:
+                    _pip_ready.discard(vp)
+                    _fixed = _repair_pip(vp)
+                    if _fixed:
+                        _pip_ready.add(vp)
+                if _fixed:
+                    _state[group]["status"]  = _STATUS_INSTALLING
+                    _state[group]["message"] = "Installing…"
+                    _install_worker(group, pip_specs, check_module, on_done,
+                                    extra_pip_specs, _retry=True)
+                    return
+            print(f"[AI PYDEPS] {group}: pip install failed:\n{_detail}")
             _state[group] = {
                 "status": _STATUS_ERROR,
                 "message": f"pip install failed: {last_line}",
+                "detail": f"pip install failed ({group}):\n{_detail}",
                 "started": time.time()}
             if on_done:
                 on_done(False)
@@ -728,6 +851,37 @@ def _move_to_trash(path):
         return False
 
 
+def invalidate_dep_caches():
+    """Forget every rack's cached "dependencies found" answer, so each AI rack
+    re-checks and goes back to its INSTALL screen when its packages are gone
+    (used after deleting the managed environment). Safe to call any time."""
+    targets = (
+        ("ui.racks.rack_demucs",     "_dm_dep_cache"),
+        ("ui.racks.rack_knnvc",      "_dep_cache"),
+        ("ui.racks.rack_voicefixer", "_vf_dep_cache"),
+        ("ui.racks.rack_whisper",    "_dep_cache"),
+    )
+    import importlib
+    for mod_name, attr in targets:
+        try:
+            mod = importlib.import_module(mod_name)
+            cache = getattr(mod, attr)
+            cache["ok"] = False
+            cache["checked"] = False
+            if "when" in cache:
+                cache["when"] = 0.0
+        except Exception as e:
+            print(f"[AI PYDEPS] could not reset {mod_name} dependency check: {e}")
+    try:
+        import bpy
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type in ('NODE_EDITOR', 'SEQUENCE_EDITOR'):
+                    area.tag_redraw()
+    except Exception:
+        pass
+
+
 def delete_everything():
     """Deletes the ENTIRE managed folder — the shared venv (so all four
     racks go back to needing INSTALL again) and every downloaded model.
@@ -755,8 +909,10 @@ def delete_everything():
             if not trashed:
                 shutil.rmtree(root, ignore_errors=True)
         _state.clear()
+        _pip_ready.clear()
         _storage_cache["status"] = "IDLE"
         _storage_cache["bytes"]  = 0
+        invalidate_dep_caches()     # racks must notice the packages are gone
         if trashed:
             print("[AI PYDEPS] moved managed Python environment + all "
                   "downloaded AI models to the Recycle Bin/Trash")

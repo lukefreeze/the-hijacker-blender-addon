@@ -374,27 +374,9 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
     # Mute all channels except the source, run mixdown at scene length,
     # then restore mutes. This exports exactly what's in the sequence.
     try:
-        seq_strips     = list(_vse.get_all_strips(scene.sequence_editor)) if scene.sequence_editor else []
-        original_mutes = {}
-        for s in seq_strips:
-            if hasattr(s, 'mute'):
-                original_mutes[s.name] = s.mute
-                s.mute = (s.channel != src_ch)
-
-        bpy.ops.sound.mixdown(
-            filepath=src_wav,
-            check_existing=False,
-            relative_path=False,
-            codec='PCM',
-            container='WAV',
-        )
-
-        for s in seq_strips:
-            if hasattr(s, 'mute') and s.name in original_mutes:
-                s.mute = original_mutes[s.name]
-
-        if not os.path.exists(src_wav):
-            raise RuntimeError("mixdown produced no file")
+        seq_strips = list(_vse.get_all_strips(scene.sequence_editor)) if scene.sequence_editor else []
+        from core.audio_export import mixdown_channel
+        mixdown_channel(scene, seq_strips, src_ch, src_wav, strip=src_strip, tag="VOICEFIXER")
 
         import wave
         with wave.open(src_wav, 'r') as wf:

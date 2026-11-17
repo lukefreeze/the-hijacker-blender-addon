@@ -381,6 +381,11 @@ def _draw_warning(rx, ry, rw, rh, scale):
     _box(cx2, cy2, cw, ch, (0.44, 0.24, 0.00, 1.0))
     _draw_text("pip install faster-whisper",
                cx2 + 6 * scale, cy2 + ch / 2 - fs_b / 2, fs_b, _WARN_TEXT)
+    from ui.racks import install_panel as _ip
+    _ip.reset_copy_zones("whisper")
+    _ip.draw_copy_hint(_draw_text, _text_width, "whisper", cx2, cy2, cw, ch, scale,
+                       "pip install faster-whisper", _WARN_DIM, _WARN_TEXT,
+                       avoid_w=_text_width("pip install faster-whisper", fs_b) + 12 * scale)
     ty = cy2 - lh * 1.2
     _draw_text("CUDA auto-used if available.  CPU also works.", tx, ty, fs_s, _WARN_DIM)
     ty -= lh
@@ -399,8 +404,6 @@ def _draw_warning(rx, ry, rw, rh, scale):
         _div(_r, _draw_text, _text_width, bx, by, bw, bh, scale,
              "WHISPER", _wsp_lines, _pydeps.get_install_percent("whisper"),
              _WARN_BG, _WARN_TEXT, _WARN_DIM, _btn_h_w)
-    elif _wsp_kind == "error" and _wsp_lines:
-        _draw_text(_wsp_lines[0], tx, _wsp_status_y, fs_s, _WARN_TEXT)
 
     dw = min(170 * scale, bw * 0.44); dh = max(16 * scale, fs_s + 8 * scale)
     dx2 = bx + bw - dw - 12 * scale; dy2 = by + 8 * scale
@@ -417,8 +420,10 @@ def _draw_warning(rx, ry, rw, rh, scale):
     _draw_text(lbl, dx2 + dw / 2 - tw_d / 2,
                dy2 + dh / 2 - fs_s / 2, fs_s, _WARN_TEXT)
     if _wsp_kind == "error" and _wsp_lines:
-        _draw_text(_wsp_lines[0][:70], tx, dy2 + dh + 4*scale,
-                    max(1, int(6*scale)), (1.0, 0.45, 0.4, 1.0))
+        _ip.draw_error_band(_r, _draw_text, _text_width, "whisper", _WARN_BG, _WARN_TEXT,
+                            _WARN_DIM, tx, bw - 28 * scale, dy2 + dh + 6 * scale,
+                            cy2 - 4 * scale, scale, _wsp_lines[0],
+                            _pydeps.get_error_text("whisper"))
     return dx2, dy2, dw, dh
 
 
@@ -519,6 +524,11 @@ def _draw_whisper_body(rx, ry, rw, rh, rack, ai_idx, scale):
             _draw_warning(rx, body_bot, rw, body_h, scale)
         return
 
+    try:
+        from ui.racks.install_panel import reset_copy_zones as _rcz
+        _rcz("whisper")        # no setup panel on screen: nothing to copy
+    except Exception:
+        pass
     get_system_fonts()   # kick off scan if not done
 
     if not _has_skin:
@@ -932,10 +942,8 @@ def _draw_whisper_body(rx, ry, rw, rh, rack, ai_idx, scale):
     if status == _DONE:
         _draw_text("\u2713 Strips placed on timeline", col3_x, y3, fs_sm, _GREEN)
     elif status == _ERROR:
-        _draw_text("\u2717 Failed \u2014 check console", col3_x, y3, fs_sm, _RED)
-    elif status == _PROCESSING:
-        from core import ai_status as _ais
-        _draw_text(_ais.pick("whisper", ai_idx, int(col_w * 1.0 / max(1.0, fs_sm * 0.56))),
-                   col3_x, y3, fs_sm, (0.85, 1.0, 0.88, 1.0))
+        from core import ai_status as _ais_e
+        _e = _ais_e.get_error("whisper", ai_idx)
+        _draw_text(("\u2717 " + _e) if _e else "\u2717 Failed \u2014 check console", col3_x, y3, fs_sm, _RED)
     else:
         _draw_text("No output yet", col3_x, y3, fs_sm, _TEXT_LABEL)

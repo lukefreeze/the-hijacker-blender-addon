@@ -27,6 +27,7 @@ import tempfile
 import threading
 import time
 import bpy
+from core import ai_status as _aiserr
 
 from core import vse_compat as _vse
 
@@ -251,6 +252,7 @@ def separate_demucs(ai_idx, context):
     python_cmd = _find_system_python()
     if not python_cmd:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("demucs", ai_idx, "Not installed - run setup")
         print("[DEMUCS] ERROR: system Python with demucs not found")
         print("[DEMUCS] Install with: pip install demucs")
         return
@@ -258,6 +260,7 @@ def separate_demucs(ai_idx, context):
     runner_path = _get_runner_path()
     if not os.path.exists(runner_path):
         rack.ai_status = "ERROR"
+        _aiserr.set_error("demucs", ai_idx, "Add-on file missing")
         print(f"[DEMUCS] ERROR: runner not found at {runner_path}")
         return
 
@@ -265,6 +268,7 @@ def separate_demucs(ai_idx, context):
     active_chs = [ci + 1 for ci in range(9) if getattr(rack, f"ch{ci}", False)]
     if not active_chs:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("demucs", ai_idx, "Select an input channel")
         print("[DEMUCS] ERROR: no input channel assigned")
         return
     src_ch_1based = active_chs[0]
@@ -281,6 +285,7 @@ def separate_demucs(ai_idx, context):
                 break
     if not src_strip:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("demucs", ai_idx, "No audio on that channel")
         print(f"[DEMUCS] ERROR: no audio strip on channel {src_ch_1based}")
         return
 
@@ -293,6 +298,7 @@ def separate_demucs(ai_idx, context):
 
     if not active_stems:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("demucs", ai_idx, "Select at least 1 stem")
         print("[DEMUCS] ERROR: no stems selected")
         return
 
@@ -327,22 +333,11 @@ def separate_demucs(ai_idx, context):
         os.makedirs(out_dir, exist_ok=True)
 
     try:
-        seq_strips     = list(_vse.get_all_strips(seq))
-        original_mutes = {s.name: s.mute for s in seq_strips if hasattr(s, "mute")}
-        for s in seq_strips:
-            if hasattr(s, "mute"):
-                s.mute = (s.channel != src_ch_1based)
-
-        bpy.ops.sound.mixdown(
-            filepath=src_wav, check_existing=False,
-            relative_path=False, codec="PCM", container="WAV")
-
-        for s in seq_strips:
-            if hasattr(s, "mute") and s.name in original_mutes:
-                s.mute = original_mutes[s.name]
-
-        if not os.path.exists(src_wav):
-            raise RuntimeError("mixdown produced no file")
+        seq_strips = list(_vse.get_all_strips(seq))
+        from core.audio_export import mixdown_channel
+        # returns the timeline frame the exported file starts at
+        frame_start = mixdown_channel(scene, seq_strips, src_ch_1based, src_wav,
+                                      strip=src_strip, tag="DEMUCS")
 
         import wave
         with wave.open(src_wav, "r") as wf:
@@ -351,6 +346,7 @@ def separate_demucs(ai_idx, context):
 
     except Exception as ex:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("demucs", ai_idx, "Could not export audio")
         print(f"[DEMUCS] export error: {ex}")
         import traceback; traceback.print_exc()
         return
@@ -434,7 +430,7 @@ def separate_demucs(ai_idx, context):
             proc.wait()
             stderr_txt = _drain.text()
             if stderr_txt.strip():
-                print(f"[DEMUCS] stderr: {stderr_txt[:400]}")
+                print(f"[DEMUCS] stderr: {stderr_txt[-1500:]}")
 
             if proc.returncode != 0 or not stems_placed:
                 _pending_finish[ai_idx] = {

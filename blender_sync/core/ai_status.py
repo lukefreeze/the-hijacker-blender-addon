@@ -13,15 +13,27 @@ Plain dict state: written by worker threads, read by the draw callback.
 import time
 
 _state = {}   # (group, idx) -> dict
+_errors = {}  # (group, idx) -> short, user-facing reason the last start failed
+
+
+def set_error(group, idx, msg):
+    """Remember a short plain-language reason the rack could not start (shown on the rack)."""
+    _errors[(group, idx)] = msg
+
+
+def get_error(group, idx, default=""):
+    return _errors.get((group, idx), default)
 
 
 def reset(group, idx):
+    _errors.pop((group, idx), None)
     _state[(group, idx)] = {"pct": 0.0, "msg": "", "t_start": time.time(),
                             "base_t": None, "base_pct": 0.0, "dl": False}
 
 
 def clear(group, idx):
     _state.pop((group, idx), None)
+    _errors.pop((group, idx), None)
 
 
 def feed(group, idx, line):

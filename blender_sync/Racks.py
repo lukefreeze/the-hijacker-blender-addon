@@ -6621,6 +6621,18 @@ def hit_test_ai_racks(mouse_x, mouse_y, ai_section_top_y, rack_x, scale,
             except Exception:
                 pass
 
+        # Setup panels: click a terminal command or an error message to copy it
+        _copy_group = {"RVC": "knnvc", "RESEMBLE": "voicefixer",
+                       "DEMUCS": "demucs", "WHISPER": "whisper"}.get(rack.ai_type)
+        if _copy_group and not rack.collapsed:
+            try:
+                from ui.racks.install_panel import hit_copy_zone as _hcz
+                _ctext = _hcz(_copy_group, mouse_x, mouse_y)
+                if _ctext:
+                    return {'zone': 'ai_copy_text', 'ai_idx': ai_idx, 'text': _ctext}
+            except Exception:
+                pass
+
         # Preset arrows — exact same geometry as draw code
         try:
             from ui.mixer.draw_utils import text_width as _tw_ps
@@ -7765,6 +7777,18 @@ def handle_ai_rack_click(hit, context):
             _start_voicefixer_install()
         except Exception as e:
             print(f"[VOICEFIXER] install trigger failed: {e}")
+        return True
+
+    # Copy a setup-panel command / error message to the clipboard
+    if zone == 'ai_copy_text':
+        try:
+            txt = hit.get('text', '')
+            bpy.context.window_manager.clipboard = txt
+            from ui.racks.install_panel import mark_copied
+            mark_copied(txt)
+            print(f"[AI RACKS] copied {len(txt)} characters to the clipboard")
+        except Exception as e:
+            print(f"[AI RACKS] copy failed: {e}")
         return True
 
     # Demucs — install demucs + static-ffmpeg into the addon's managed venv

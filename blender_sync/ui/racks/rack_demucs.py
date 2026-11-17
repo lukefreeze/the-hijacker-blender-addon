@@ -214,6 +214,14 @@ def _draw_setup_warning(rx, ry, rw, rh, scale):
                cmd_x + 6 * scale, cmd_y + cmd_h - lh*1.2, fs_b, _WARN_TEXT)
     _draw_text("winget install Gyan.FFmpeg",
                cmd_x + 6 * scale, cmd_y + cmd_h - lh*2.4, fs_b, _WARN_TEXT)
+    from ui.racks import install_panel as _ip
+    _ip.reset_copy_zones("demucs")
+    _c1 = "py -3.12 -m pip install demucs"
+    _c2 = "winget install Gyan.FFmpeg"
+    _ip.draw_copy_hint(_draw_text, _text_width, "demucs", cmd_x, cmd_y + cmd_h * 0.62, cmd_w, cmd_h * 0.38,
+                       scale, _c1, _WARN_DIM, _WARN_TEXT, avoid_w=_text_width(_c1, fs_b) + 12 * scale)
+    _ip.draw_copy_hint(_draw_text, _text_width, "demucs", cmd_x, cmd_y + cmd_h * 0.28, cmd_w, cmd_h * 0.34,
+                       scale, _c2, _WARN_DIM, _WARN_TEXT, avoid_w=_text_width(_c2, fs_b) + 12 * scale)
     _draw_text("(then copy ffprobe.exe to your Python folder if ffmpeg alias is broken)",
                cmd_x + 6 * scale, cmd_y + 4*scale, max(1, int(6*scale)), _WARN_DIM)
 
@@ -239,8 +247,6 @@ def _draw_setup_warning(rx, ry, rw, rh, scale):
         _div(_draw_rect, _draw_text, _text_width, warn_x, warn_y, warn_w, warn_h, scale,
              "DEMUCS", _dm_lines, _pydeps.get_install_percent("demucs"),
              _WARN_BG, _WARN_TEXT, _WARN_DIM, _btn_h_dm)
-    elif _dm_kind == "error" and _dm_lines:
-        _draw_text(_dm_lines[0], tx, _dm_status_y, fs_s, _WARN_TEXT)
 
     btn_w = min(170 * scale, warn_w * 0.44)
     btn_h = max(16 * scale, fs_s + 8 * scale)
@@ -263,8 +269,10 @@ def _draw_setup_warning(rx, ry, rw, rh, scale):
     _draw_text(lbl, btn_x + btn_w/2 - tw_btn/2,
                btn_y + btn_h/2 - fs_btn/2, fs_btn, _WARN_TEXT)
     if _dm_kind == "error" and _dm_lines:
-        _draw_text(_dm_lines[0][:70], tx, btn_y + btn_h + 4*scale,
-                    max(1, int(6*scale)), (1.0, 0.45, 0.4, 1.0))
+        _ip.draw_error_band(_draw_rect, _draw_text, _text_width, "demucs", _WARN_BG, _WARN_TEXT,
+                            _WARN_DIM, tx, warn_w - 24 * scale, btn_y + btn_h + 6 * scale,
+                            cmd_y - 4 * scale, scale, _dm_lines[0],
+                            _pydeps.get_error_text("demucs"))
     return btn_x, btn_y, btn_w, btn_h
 
 
@@ -283,8 +291,8 @@ def _start_demucs_install():
 
     _pydeps.start_install(
         "demucs",
-        pip_specs=["demucs"],
-        check_module="demucs",
+        pip_specs=["demucs", "numpy"],   # numpy: torch/demucs fail at run time without it
+        check_module=["demucs", "numpy"],
         on_done=_on_done,
         extra_pip_specs=["static-ffmpeg"],
     )
@@ -348,6 +356,12 @@ def _draw_demucs_body(rx, ry, rw, rh, rack, ai_idx, scale):
         try: rack['dm_setup_btn'] = (bx, by, bw, bh)
         except Exception: pass
         return
+
+    try:
+        from ui.racks.install_panel import reset_copy_zones as _rcz
+        _rcz("demucs")         # no setup panel on screen: nothing to copy
+    except Exception:
+        pass
 
     # One-time init guard — runs exactly once per rack instance.
     # PB_AIRackSettings shares FloatProperty slots across all AI rack types,
@@ -802,7 +816,9 @@ def _draw_demucs_body(rx, ry, rw, rh, rack, ai_idx, scale):
     if status == "DONE":
         _draw_text("✓ Stems split to timeline", rx2, cursor, micro_fs, _GREEN)
     elif status == "ERROR":
-        _draw_text("✗ Failed — check console", rx2, cursor, micro_fs, _RED)
+        from core import ai_status as _ais_e
+        _e = _ais_e.get_error("demucs", ai_idx)
+        _draw_text(("✗ " + _e) if _e else "✗ Failed — check console", rx2, cursor, micro_fs, _RED)
     else:
         _draw_text("No output yet", rx2, cursor, micro_fs, _TEXT_MUTED)
     cursor += micro_fs + 6*scale

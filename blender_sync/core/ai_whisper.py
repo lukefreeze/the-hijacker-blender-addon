@@ -32,6 +32,7 @@ import tempfile
 import threading
 import time
 import bpy
+from core import ai_status as _aiserr
 
 from core import vse_compat as _vse
 
@@ -196,9 +197,18 @@ def _apply_finish(ai_idx, info):
             dur = max(1, ef - sf)
             sname = f"WSP_{ai_idx}_{placed}_{int(time.time()) % 100000}"
             try:
-                t = _vse.get_strips_collection(seq).new_effect(
-                    name=sname, type='TEXT', channel=subtitle_ch,
-                    frame_start=sf, frame_end=sf + dur)
+                _coll = _vse.get_strips_collection(seq)
+                try:   # Blender 5.x takes length=...
+                    t = _coll.new_effect(name=sname, type='TEXT', channel=subtitle_ch,
+                                         frame_start=sf, length=dur)
+                except TypeError:   # older Blender takes frame_end=...
+                    t = _coll.new_effect(name=sname, type='TEXT', channel=subtitle_ch,
+                                         frame_start=sf, frame_end=sf + dur)
+                try:
+                    if int(t.frame_final_duration) != dur:
+                        t.frame_final_duration = dur
+                except Exception:
+                    pass
                 t.text        = text
                 t.font_size   = font_size
                 t.location[1] = pos_y
@@ -241,12 +251,14 @@ def transcribe_whisper(ai_idx, context):
     python_cmd = _find_system_python()
     if not python_cmd:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("whisper", ai_idx, "Not installed - run setup")
         print("[WHISPER] ERROR: system Python with faster-whisper not found")
         return
 
     runner_path = _get_runner_path()
     if not os.path.exists(runner_path):
         rack.ai_status = "ERROR"
+        _aiserr.set_error("whisper", ai_idx, "Add-on file missing")
         print(f"[WHISPER] ERROR: runner not found at {runner_path}")
         return
 
@@ -254,6 +266,7 @@ def transcribe_whisper(ai_idx, context):
     active_chs = [ci + 1 for ci in range(9) if getattr(rack, f"ch{ci}", False)]
     if not active_chs:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("whisper", ai_idx, "Select an input channel")
         print("[WHISPER] ERROR: no input channel assigned")
         return
     src_ch = active_chs[0]
@@ -267,6 +280,7 @@ def transcribe_whisper(ai_idx, context):
                 break
     if not src_strip:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("whisper", ai_idx, "No audio on that channel")
         print(f"[WHISPER] ERROR: no audio strip on channel {src_ch}")
         return
 
@@ -306,23 +320,9 @@ def transcribe_whisper(ai_idx, context):
     scene_name = scene.name
 
     try:
-        seq_strips     = list(_vse.get_all_strips(scene.sequence_editor)) if scene.sequence_editor else []
-        original_mutes = {}
-        for s in seq_strips:
-            if hasattr(s, 'mute'):
-                original_mutes[s.name] = s.mute
-                s.mute = (s.channel != src_ch)
-
-        bpy.ops.sound.mixdown(
-            filepath=src_wav, check_existing=False,
-            relative_path=False, codec='PCM', container='WAV')
-
-        for s in seq_strips:
-            if hasattr(s, 'mute') and s.name in original_mutes:
-                s.mute = original_mutes[s.name]
-
-        if not os.path.exists(src_wav):
-            raise RuntimeError("mixdown produced no file")
+        seq_strips = list(_vse.get_all_strips(scene.sequence_editor)) if scene.sequence_editor else []
+        from core.audio_export import mixdown_channel
+        mixdown_channel(scene, seq_strips, src_ch, src_wav, strip=src_strip, tag="WHISPER")
 
         import wave
         with wave.open(src_wav, 'r') as wf:
@@ -331,6 +331,7 @@ def transcribe_whisper(ai_idx, context):
 
     except Exception as ex:
         rack.ai_status = "ERROR"
+        _aiserr.set_error("whisper", ai_idx, "Could not export audio")
         print(f"[WHISPER] export error: {ex}")
         import traceback; traceback.print_exc()
         return

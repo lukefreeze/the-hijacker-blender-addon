@@ -751,7 +751,9 @@ def dm_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     elif status == "ERROR":
         _text("SOMETHING WENT WRONG", lx, g.Y(112.0), DM_FS_SCR_BIG, g, DM_RED, lv, glow=0.6,
               glow_col=(1.0, 0.25, 0.15), max_w=lmax)
-        _text("Check the console, then retry.", lx, g.Y(143.0), DM_FS_SCR, g, DM_GREEN, lv, max_w=lmax)
+        from core import ai_status as _ais_e
+        _e = _ais_e.get_error("demucs", ai_idx)
+        _text((_e + ".") if _e else "Check the console, then retry.", lx, g.Y(143.0), DM_FS_SCR, g, DM_GREEN, lv, max_w=lmax)
     else:
         s1 = in_ch_num is not None
         s3 = n_active > 0
@@ -825,8 +827,11 @@ def dm_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
         crt_lines.append(("LAST RUN: stems split", DM_GREEN))
         crt_lines.append(("to timeline", DM_GREEN))
     elif status == "ERROR":
+        from core import ai_status as _ais_e
+        _e = _ais_e.get_error("demucs", ai_idx)
         crt_lines.append(("LAST RUN: failed -", DM_RED))
-        crt_lines.append(("check console", DM_RED))
+        for _el in (_wrap(_e, 24)[:2] if _e else ["check console"]):
+            crt_lines.append((_el, DM_RED))
     elif status == "PROCESSING":
         crt_lines.append(("LAST RUN: working...", DM_GREEN))
     else:
