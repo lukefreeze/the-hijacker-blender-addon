@@ -371,7 +371,10 @@ _ENGINE_VERSION    = "2023.11.14-2"
 _ENGINE_RELEASE    = "https://github.com/rhasspy/piper/releases/tag/" + _ENGINE_VERSION
 _ENGINE_BASE_URL   = "https://github.com/rhasspy/piper/releases/download/" + _ENGINE_VERSION + "/"
 # Path of the starter voice inside the rhasspy/piper-voices repo (no extension).
-STARTER_VOICE_PATH = "en/en_US/lessac/medium/en_US-lessac-medium"
+# en_US-ljspeech-medium is trained from scratch on the public-domain LJ Speech
+# dataset, so it is free for commercial use with no attribution. (The previous
+# starter, lessac, derives from a research/non-commercial-only dataset.)
+STARTER_VOICE_PATH = "en/en_US/ljspeech/medium/en_US-ljspeech-medium"
 
 _engine_state  = {"status": "IDLE", "pct": 0.0, "msg": "", "error": ""}
 _engine_cancel = False

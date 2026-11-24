@@ -9,7 +9,7 @@
 #  ├──────────────────────────────────┬──────────────────────────────────┤
 #  │  SCRIPT (text input area)        │  VOICE SELECTOR (card list)      │
 #  │                                  │                                  │
-#  │  [GENERATE]  [CLEAR]             │  en_US-lessac-medium  ← selected │
+#  │  [GENERATE]  [CLEAR]             │  en_US-ljspeech-medium ← selected │
 #  │  char count                      │  en_US-ryan-high                 │
 #  ├──────────────────────────────────┴──────────────────────────────────┤
 #  │  OUTPUT WAVEFORM (after generation)                                  │

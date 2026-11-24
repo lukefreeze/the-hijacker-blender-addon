@@ -5,7 +5,7 @@ name: Engine tests
 
 on:
   push:
-    branches: [ feature/hijacker-engine, feature/audio-engine-hardening ]
+    branches: [ main, feature/audio-engine-hardening ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
