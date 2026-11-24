@@ -68,7 +68,7 @@ def _find_system_python():
     # search every other AI rack already uses.
     try:
         from core.ai_python_finder import find_python_with as _fpw
-        cmd = _fpw("demucs")
+        cmd = _fpw("demucs", timeout=60)
         if cmd:
             _PYTHON_CMD = cmd
             print(f"[DEMUCS] Python: {' '.join(cmd)}")

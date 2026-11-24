@@ -81,7 +81,7 @@ def _find_system_python():
     try:
         from core.ai_python_finder import find_python_with as _fpw
         pkg = "faster_whisper"
-        cmd = _fpw(pkg)
+        cmd = _fpw(pkg, timeout=60)
         if cmd:
             _PYTHON_CMD = cmd
             print(f"[WHISPER] system Python: {' '.join(cmd)}")
@@ -376,6 +376,7 @@ def transcribe_whisper(ai_idx, context):
             _drain = StderrDrain(proc)
 
             result_segs = []
+            got_result = False
             for line in proc.stdout:
                 line = line.strip()
                 _ais.feed("whisper", ai_idx, line)
@@ -389,6 +390,7 @@ def transcribe_whisper(ai_idx, context):
                 elif line.startswith("RESULT:"):
                     try:
                         result_segs = json.loads(line.split(":", 1)[1].strip())
+                        got_result = True
                     except Exception as je:
                         print(f"[WHISPER] JSON parse error: {je}")
                 elif line.startswith("INFO:"):
@@ -403,7 +405,12 @@ def transcribe_whisper(ai_idx, context):
                     }
 
             proc.wait()
-            if proc.returncode != 0 and ai_idx not in _pending_finish:
+            if proc.returncode != 0 and got_result and ai_idx not in _pending_finish:
+                # The transcript arrived intact; the process then crashed while
+                # shutting down (seen with CUDA on Windows). Keep the result.
+                print(f"[WHISPER] runner exited rc={proc.returncode} after "
+                      f"delivering its result - ignoring the exit code")
+            if proc.returncode != 0 and not got_result and ai_idx not in _pending_finish:
                 print(f"[WHISPER] runner failed rc={proc.returncode}: "
                       f"{_drain.text()[-400:]}")
                 _pending_finish[ai_idx] = {

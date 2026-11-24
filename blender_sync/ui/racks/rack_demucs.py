@@ -117,23 +117,11 @@ def _run_dep_check():
         pass
     if not ok:
         try:
-            import subprocess, platform
-            from core.ai_python_finder import (
-                _win_python_paths, _mac_python_paths, _linux_python_paths)
-            sys_name = platform.system()
-            candidates = (_win_python_paths() if sys_name == "Windows"
-                          else _mac_python_paths() if sys_name == "Darwin"
-                          else _linux_python_paths())
-            for cmd in candidates:
-                try:
-                    r = subprocess.run(
-                        cmd + ["-m", "pip", "show", "demucs"],
-                        capture_output=True, timeout=5)
-                    if r.returncode == 0:
-                        ok = True
-                        break
-                except Exception:
-                    continue
+            from core.ai_python_finder import find_system_python_with
+            _sys_cmd = find_system_python_with("demucs", timeout=60)
+            if _sys_cmd:
+                print(f"[DEMUCS] dep check: found in system Python {' '.join(_sys_cmd)}")
+                ok = True
         except Exception as e:
             print(f"[DEMUCS] dep check error: {e}")
     _dm_dep_cache["ok"]       = ok

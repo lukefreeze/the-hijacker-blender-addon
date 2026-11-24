@@ -95,7 +95,7 @@ def _find_system_python():
     try:
         from core.ai_python_finder import find_python_with as _fpw
         pkg = "voicefixer"
-        cmd = _fpw(pkg)
+        cmd = _fpw(pkg, timeout=60)
         if cmd:
             _PYTHON_CMD = cmd
             print(f"[VOICEFIXER] system Python: {' '.join(cmd)}")

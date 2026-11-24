@@ -324,6 +324,14 @@ def main():
 
     print("PROGRESS:100")
     sys.stdout.flush()
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    # The result is delivered. Skip normal interpreter shutdown: on Windows,
+    # tearing down CTranslate2/CUDA at exit can hard-crash the process
+    # (0xC0000409) *after* a perfectly good transcription.
+    os._exit(0)
 
 
 if __name__ == "__main__":

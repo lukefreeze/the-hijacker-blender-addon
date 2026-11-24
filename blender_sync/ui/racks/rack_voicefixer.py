@@ -194,23 +194,11 @@ def _run_dep_check():
         try:
             # Use pip show instead of importing voicefixer directly — importing
             # pulls in torch which takes 2-3s just for the import check.
-            import subprocess, platform
-            from core.ai_python_finder import (
-                _win_python_paths, _mac_python_paths, _linux_python_paths)
-            sys = platform.system()
-            candidates = (_win_python_paths() if sys == "Windows"
-                          else _mac_python_paths() if sys == "Darwin"
-                          else _linux_python_paths())
-            for cmd in candidates:
-                try:
-                    r = subprocess.run(
-                        cmd + ["-m", "pip", "show", "voicefixer"],
-                        capture_output=True, timeout=5)
-                    if r.returncode == 0:
-                        found = True
-                        break
-                except Exception:
-                    continue
+            from core.ai_python_finder import find_system_python_with
+            _sys_cmd = find_system_python_with("voicefixer", timeout=60)
+            if _sys_cmd:
+                print(f"[VOICEFIXER] dep check: found in system Python {' '.join(_sys_cmd)}")
+                found = True
         except Exception as e:
             print(f"[VOICEFIXER] dep check error: {e}")
     _vf_dep_cache["ok"]       = found

@@ -123,6 +123,16 @@ def find_python_with(package, timeout=4):
     except Exception:
         pass
 
+    return find_system_python_with(packages, timeout=timeout)
+
+
+def find_system_python_with(package, timeout=4):
+    """Like find_python_with() but ONLY scans system Pythons (not the managed
+    venv). Racks' "is it installed?" checks and the code that runs the job
+    must both use this same scan with the same timeout, otherwise the rack can
+    say "installed" while the run says "not found" (a cold import of
+    faster-whisper or torch can take well over a few seconds)."""
+    packages = [package] if isinstance(package, str) else list(package)
     sys = platform.system()
     if sys == "Windows":
         candidates = _win_python_paths()

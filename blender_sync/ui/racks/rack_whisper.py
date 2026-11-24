@@ -249,23 +249,11 @@ def _dep_worker():
     try:
         if ok:
             raise StopIteration
-        import subprocess, platform
-        from core.ai_python_finder import (
-            _win_python_paths, _mac_python_paths, _linux_python_paths)
-        sys_name = platform.system()
-        candidates = (_win_python_paths() if sys_name == "Windows"
-                      else _mac_python_paths() if sys_name == "Darwin"
-                      else _linux_python_paths())
-        for cmd in candidates:
-            try:
-                r = subprocess.run(
-                    cmd + ["-m", "pip", "show", "faster-whisper"],
-                    capture_output=True, timeout=5)
-                if r.returncode == 0:
-                    ok = True
-                    break
-            except Exception:
-                continue
+        from core.ai_python_finder import find_system_python_with
+        _sys_cmd = find_system_python_with("faster_whisper", timeout=60)
+        if _sys_cmd:
+            print(f"[WHISPER] dep check: found in system Python {' '.join(_sys_cmd)}")
+            ok = True
     except StopIteration:
         pass
     except Exception as e:
