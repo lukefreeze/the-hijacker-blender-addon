@@ -28,6 +28,16 @@ import os
 import sys
 
 
+
+# Windows pipes default to the legacy code page (cp1252), so printing a track
+# name or transcript with other characters raises UnicodeEncodeError and kills
+# the job. The add-on reads this process's output as UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 def main():
     # Force UTF-8 on Windows — default CP1252 codepage breaks paths with
     # non-ASCII characters in STEM_DONE output lines.

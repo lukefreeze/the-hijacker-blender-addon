@@ -150,6 +150,10 @@ def _apply_finish(ai_idx, info):
         segments = info.get("segments", [])
         if not segments:
             print(f"[WHISPER] rack {ai_idx}: no segments returned")
+            # Say so on the rack instead of finishing silently with nothing added.
+            rack.ai_status = "ERROR"
+            _aiserr.set_error("whisper", ai_idx,
+                              "No speech found on that channel (is it silent, or music only?)")
             return
 
         seq = scene.sequence_editor
@@ -322,7 +326,12 @@ def transcribe_whisper(ai_idx, context):
     try:
         seq_strips = list(_vse.get_all_strips(scene.sequence_editor)) if scene.sequence_editor else []
         from core.audio_export import mixdown_channel
-        mixdown_channel(scene, seq_strips, src_ch, src_wav, strip=src_strip, tag="WHISPER")
+        # The exported file starts at the timeline frame mixdown_channel returns
+        # (the scene start, not necessarily where the source strip starts), so
+        # subtitle times must be measured from that frame.
+        _file_start = mixdown_channel(scene, seq_strips, src_ch, src_wav, strip=src_strip, tag="WHISPER")
+        if _file_start is not None:
+            strip_frame_start = int(_file_start)
 
         import wave
         with wave.open(src_wav, 'r') as wf:
@@ -382,6 +391,8 @@ def transcribe_whisper(ai_idx, context):
                         result_segs = json.loads(line.split(":", 1)[1].strip())
                     except Exception as je:
                         print(f"[WHISPER] JSON parse error: {je}")
+                elif line.startswith("INFO:"):
+                    print(f"[WHISPER] runner: {line[5:].strip()}")
                 elif line.startswith("ERROR:"):
                     print(f"[WHISPER] runner: {line}")
                     _pending_finish[ai_idx] = {

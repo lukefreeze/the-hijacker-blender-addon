@@ -25,6 +25,16 @@ import os
 import sys
 
 
+
+# Windows pipes default to the legacy code page (cp1252), so printing a track
+# name or transcript with other characters raises UnicodeEncodeError and kills
+# the job. The add-on reads this process's output as UTF-8.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--args", required=True,
@@ -243,6 +253,19 @@ def main():
         if language:
             transcribe_kwargs["language"] = language
 
+        # Report how loud the audio is: "no speech found" on a silent or very
+        # quiet channel looks identical to a real failure otherwise.
+        try:
+            import numpy as _np2
+            if hasattr(transcribe_src, "dtype"):
+                _peak = float(_np2.max(_np2.abs(transcribe_src))) if len(transcribe_src) else 0.0
+                _rms  = float(_np2.sqrt(_np2.mean(_np2.square(transcribe_src)))) if len(transcribe_src) else 0.0
+                _db = lambda v: (20.0 * _np2.log10(v)) if v > 1e-9 else -120.0
+                print(f"INFO:audio {len(transcribe_src)/16000.0:.1f}s, peak {_db(_peak):.1f} dBFS, "
+                      f"rms {_db(_rms):.1f} dBFS, speech filter {'on' if vad else 'off'}")
+        except Exception:
+            pass
+
         segments_iter, info = whisper_model.transcribe(transcribe_src, **transcribe_kwargs)
         print("PROGRESS:20")
         sys.stdout.flush()
@@ -261,6 +284,23 @@ def main():
                 print(f"PROGRESS:{pct}")
                 sys.stdout.flush()
 
+        # The speech filter (VAD) can discard everything on singing, heavily
+        # processed or very noisy audio. If it found nothing, try once more
+        # without it before giving up.
+        if not segments_list and vad:
+            print("INFO:no speech found with the speech filter on - retrying without it")
+            print("STATUS:Retrying without the speech filter")
+            sys.stdout.flush()
+            transcribe_kwargs["vad_filter"] = False
+            segments_iter, info = whisper_model.transcribe(transcribe_src, **transcribe_kwargs)
+            for seg in segments_iter:
+                segments_list.append({
+                    "start": round(seg.start, 3),
+                    "end":   round(seg.end,   3),
+                    "text":  seg.text,
+                })
+            print(f"INFO:retry without speech filter found {len(segments_list)} segment(s)")
+
     except Exception as e:
         print(f"ERROR:transcription failed: {e}")
         import traceback
@@ -278,7 +318,7 @@ def main():
     sys.stdout.flush()
 
     # ── Output ────────────────────────────────────────────────────────────
-    result_json = json.dumps(segments_list, ensure_ascii=False)
+    result_json = json.dumps(segments_list, ensure_ascii=True)
     print(f"RESULT:{result_json}")
     sys.stdout.flush()
 

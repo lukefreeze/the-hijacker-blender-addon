@@ -7145,14 +7145,18 @@ def handle_ai_rack_click(hit, context):
                 if result.get("ok"):
                     if result.get("trashed"):
                         _ai_settings_result_msg = (
-                            f"Moved {size_txt} to Recycle Bin/Trash — "
-                            f"restore it from there if this was a mistake."
+                            f"Moved {size_txt} to the Recycle Bin/Trash."
                         )
                     else:
                         _ai_settings_result_msg = (
                             f"Deleted {size_txt} permanently — "
                             f"Recycle Bin/Trash wasn't available on this machine."
                         )
+                elif result.get("reason") in ("in_use", "installing"):
+                    _ai_settings_result_msg = (
+                        "Can't delete yet: an AI job or download is still running. "
+                        "Wait for it to finish, then try again."
+                    )
                 else:
                     _ai_settings_result_msg = "Delete failed — check the system console."
                 _ai_settings_result_at = _asd_time.time()

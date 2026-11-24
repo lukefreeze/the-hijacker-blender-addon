@@ -103,8 +103,11 @@ def venv_has_module(module_name, timeout=5):
         if r.returncode == 0 and "ok" in r.stdout:
             return True
         tail = (r.stderr or r.stdout or "").strip().splitlines()[-1:] or ["no output"]
-        print(f"[AI PYDEPS] 'import {module_name}' failed in the add-on environment "
-              f"(exit {r.returncode}): {tail[0][:300]}")
+        # "No module named X" just means it is not installed yet, which is the
+        # normal state before an install: only report genuine load failures.
+        if "ModuleNotFoundError" not in tail[0] and "No module named" not in tail[0]:
+            print(f"[AI PYDEPS] 'import {module_name}' failed in the add-on environment "
+                  f"(exit {r.returncode}): {tail[0][:300]}")
         return False
     except subprocess.TimeoutExpired:
         print(f"[AI PYDEPS] 'import {module_name}' did not finish within {timeout}s "
@@ -468,6 +471,7 @@ def _install_worker_locked(group, pip_specs, check_module, on_done, extra_pip_sp
         # racks: one rack replacing pip's files while another rack's pip is
         # running makes that pip die with "No module named 'pip._internal'".
         with _venv_lock:
+            cleanup_pending_deletes()
             vp = get_venv_python()
             if not vp:
                 _state[group]["message"] = "Creating Python environment…"
@@ -996,32 +1000,95 @@ def invalidate_dep_caches():
         pass
 
 
-def delete_everything():
-    """Deletes the ENTIRE managed folder — the shared venv (so all four
-    racks go back to needing INSTALL again) and every downloaded model.
-    Refuses while an install is running.
+_PENDING_TAG = ".deleting-"
 
-    Tries to move the folder to the OS Recycle Bin/Trash first, so an
-    accidental confirm can still be undone the normal way. Only falls back
-    to a permanent shutil.rmtree delete if the OS trash mechanism isn't
-    available on this machine.
+
+def _force_rmtree(path):
+    """Delete a folder tree, clearing read-only flags, using extended-length
+    paths on Windows (model caches nest deeper than the old 260-character
+    limit). Returns True if the folder is gone afterwards."""
+    import shutil, stat
+    target = path
+    if platform.system() == "Windows":
+        ap = os.path.abspath(path)
+        if not ap.startswith("\\\\?\\"):
+            target = "\\\\?\\" + ap
+
+    def _on_err(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    for _ in range(3):
+        try:
+            shutil.rmtree(target, onerror=_on_err)
+        except Exception:
+            pass
+        if not os.path.exists(path):
+            return True
+        time.sleep(0.5)
+    return not os.path.exists(path)
+
+
+def cleanup_pending_deletes():
+    """Remove folders left behind by an earlier delete that could not finish
+    (files still locked then). They are renamed out of the way first, so the
+    live environment is never half-deleted; this just finishes the job."""
+    try:
+        root = _venv_root()
+        parent = os.path.dirname(root.rstrip("\\/"))
+        base = os.path.basename(root.rstrip("\\/")) + _PENDING_TAG
+        for name in os.listdir(parent):
+            if name.startswith(base):
+                _force_rmtree(os.path.join(parent, name))
+    except Exception as e:
+        print(f"[AI PYDEPS] could not clean up an old deleted folder: {e}")
+
+
+def delete_everything():
+    """Deletes the ENTIRE managed folder: the shared venv (so all four racks
+    go back to needing INSTALL again) and every downloaded model.
+    Refuses while an install is running, or while anything is still using
+    the folder (a download or AI job in progress).
+
+    The folder is first RENAMED out of the way. That is an all-or-nothing
+    check: Windows refuses to rename a folder with a running program or open
+    file inside it, so a half-deleted environment (the cause of the damaged
+    pip we kept seeing) can no longer happen. The renamed folder is then
+    moved to the Recycle Bin/Trash, or deleted if that is not possible.
 
     Returns a dict: {"ok": bool, "trashed": bool, "reason": str|None}.
-    "trashed" tells the caller whether this can be undone via Recycle
-    Bin/Trash (True) or was a permanent delete (False).
+    reason == "installing" / "in_use" when it refused.
     """
-    import shutil
     if any_group_installing():
-        print("[AI PYDEPS] refusing to delete — an install is running")
+        print("[AI PYDEPS] refusing to delete: an install is running")
         return {"ok": False, "trashed": False, "reason": "installing"}
 
     root = _venv_root()
     trashed = False
     try:
+        cleanup_pending_deletes()
         if os.path.isdir(root):
-            trashed = _move_to_trash(root)
+            pending = root.rstrip("\\/") + _PENDING_TAG + str(int(time.time()))
+            renamed = False
+            last_err = None
+            for _ in range(6):
+                try:
+                    os.rename(root, pending)
+                    renamed = True
+                    break
+                except OSError as e:
+                    last_err = e
+                    time.sleep(0.4)
+            if not renamed:
+                print(f"[AI PYDEPS] cannot delete: the folder is in use ({last_err})")
+                return {"ok": False, "trashed": False, "reason": "in_use"}
+            trashed = _move_to_trash(pending)
             if not trashed:
-                shutil.rmtree(root, ignore_errors=True)
+                if not _force_rmtree(pending):
+                    print("[AI PYDEPS] some files are still locked; they will be removed next time")
         _state.clear()
         _pip_ready.clear()
         _storage_cache["status"] = "IDLE"

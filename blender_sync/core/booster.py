@@ -362,6 +362,8 @@ def process_booster(rack_idx, context):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
             from core.proc_util import StderrDrain

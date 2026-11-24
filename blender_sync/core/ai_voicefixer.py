@@ -376,7 +376,11 @@ def enhance_voicefixer(ai_idx, context, preview_only=False):
     try:
         seq_strips = list(_vse.get_all_strips(scene.sequence_editor)) if scene.sequence_editor else []
         from core.audio_export import mixdown_channel
-        mixdown_channel(scene, seq_strips, src_ch, src_wav, strip=src_strip, tag="VOICEFIXER")
+        # Place the result where the exported audio starts on the timeline
+        # (the scene start), not where the source strip happens to start.
+        _file_start = mixdown_channel(scene, seq_strips, src_ch, src_wav, strip=src_strip, tag="VOICEFIXER")
+        if _file_start is not None:
+            strip_frame_start = int(_file_start)
 
         import wave
         with wave.open(src_wav, 'r') as wf:
