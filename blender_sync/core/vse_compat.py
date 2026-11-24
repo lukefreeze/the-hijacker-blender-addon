@@ -11,9 +11,9 @@ a running Blender 5.2 (via bpy.context.scene.sequence_editor's dir()):
 only 'strips' / 'strips_all' / 'active_strip' exist there, and .strips'
 factory methods (new_sound, new_effect, new_meta, etc.) are unchanged.
 
-Since this addon's bl_info declares a minimum of Blender 4.3 and needs to
+Since this addon's bl_info declares a minimum of Blender 4.5 and needs to
 keep working there too, every call site uses these two helpers instead of
-hardcoding either name, so the addon runs unmodified from 4.3 through 5.x
+hardcoding either name, so the addon runs unmodified from 4.5 through 5.x
 (and future renames only need a fix in this one file).
 """
 

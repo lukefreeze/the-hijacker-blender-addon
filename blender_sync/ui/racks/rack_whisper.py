@@ -240,7 +240,10 @@ def _dep_worker():
     try:
         from core import ai_pydeps as _pydeps
         if _pydeps.venv_has_pip_package("faster-whisper", timeout=20):
-            ok = True
+            # pip metadata alone is not proof: a package left half-installed
+            # (e.g. PyAV missing a DLL) is "installed" but cannot be imported.
+            # Treat that as not installed so the rack offers a repair-install.
+            ok = _pydeps.venv_has_module("faster_whisper", timeout=90)
     except Exception as e:
         print(f"[WHISPER] venv dep check error: {e}")
     try:

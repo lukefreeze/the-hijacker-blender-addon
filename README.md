@@ -153,7 +153,7 @@ build.bat                       ← Windows build script (MSVC + vcpkg PortAudio
 ## Installation
 
 ### Requirements
-- Blender 4.5 or 5.2 (both tested). Blender 4.3 is the minimum the add-on declares but hasn't been tested.
+- Blender 4.5 or newer (4.5 and 5.2 are tested). Older versions aren't supported: for example Blender 4.1's built-in Python lacks a file (`python3.dll`) that the Whisper package needs.
 - Windows x64. macOS and Linux engines are included but haven't been tested inside Blender yet.
 - An internet connection the first time you install an AI rack (the engines and models are downloaded, not bundled). Everything works offline afterwards.
 
@@ -208,7 +208,6 @@ See [ROADMAP.md](ROADMAP.md) for the full development plan.
 **Still to come:**
 - [ ] macOS and Linux real-world testing
 - [ ] Undo support and save trigger
-- [ ] Blender 4.3 testing
 
 ---
 

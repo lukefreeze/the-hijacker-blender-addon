@@ -100,8 +100,18 @@ def venv_has_module(module_name, timeout=5):
         r = subprocess.run(
             [vp, "-c", f"import {module_name}; print('ok')"],
             capture_output=True, timeout=timeout, text=True, encoding="utf-8")
-        return r.returncode == 0 and "ok" in r.stdout
-    except Exception:
+        if r.returncode == 0 and "ok" in r.stdout:
+            return True
+        tail = (r.stderr or r.stdout or "").strip().splitlines()[-1:] or ["no output"]
+        print(f"[AI PYDEPS] 'import {module_name}' failed in the add-on environment "
+              f"(exit {r.returncode}): {tail[0][:300]}")
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"[AI PYDEPS] 'import {module_name}' did not finish within {timeout}s "
+              "(first start after an install can be slow)")
+        return False
+    except Exception as e:
+        print(f"[AI PYDEPS] could not test 'import {module_name}': {e}")
         return False
 
 
@@ -178,6 +188,9 @@ def get_progress_display(group):
 
     if status in (_STATUS_CREATING_VENV, _STATUS_INSTALLING):
         lines = []
+        if st.get("waiting"):
+            lines.append("Waiting for another install to finish…")
+            return (lines, "CANCEL", "busy")
         if status == _STATUS_CREATING_VENV:
             lines.append("Setting up Python environment…")
         else:
@@ -360,7 +373,94 @@ def _looks_like_broken_pip(text):
             or "pip._internal" in t and "modulenotfounderror" in t)
 
 
+# Only one pip install may run at a time. All racks share one virtual
+# environment, and two pips changing it together can collide (for example
+# "[WinError 5] Access is denied" on torch's _C.pyd while another rack's pip
+# or a freshly started Python has that file open, or a half-removed package).
+# Installs started while another is running wait their turn. An RLock so the
+# retry path below (same thread calling _install_worker again) can re-enter.
+_install_run_lock = threading.RLock()
+
+
+def _import_error_text(vp, module_name, timeout=120):
+    """Run `import <module>` in the managed venv; return None if it works,
+    otherwise the error text (or a note that it timed out)."""
+    try:
+        r = subprocess.run([vp, "-c", f"import {module_name}"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=timeout)
+        if r.returncode == 0:
+            return None
+        return (r.stderr or r.stdout or "import failed").strip()
+    except subprocess.TimeoutExpired:
+        return f"import timed out after {timeout}s"
+    except Exception as e:
+        return str(e)
+
+
+def _heal_broken_import(vp, module_name, group):
+    """pip said the install worked but `import <module>` fails (typically a
+    package left half-written by an interrupted or overlapping install, e.g.
+    PyAV's 'DLL load failed while importing _core'). Find the package named
+    in the traceback and force-reinstall just that one. Returns True if the
+    module imports afterwards."""
+    import re
+    err = _import_error_text(vp, module_name)
+    if err is None:
+        return True
+    names = re.findall(r"site-packages[\\/]+([A-Za-z0-9_]+)", err)
+    names = [n for n in names if not n.startswith("_")]
+    if not names:
+        print(f"[AI PYDEPS] {group}: import {module_name} fails and no package could be "
+              f"identified: {err.splitlines()[-1][:300]}")
+        return False
+    pkg = names[-1]
+    print(f"[AI PYDEPS] {group}: import {module_name} failed ({err.splitlines()[-1][:200]}); "
+          f"reinstalling '{pkg}'")
+    try:
+        _state[group]["message"] = f"Repairing {pkg}…"
+        _tag_redraw_all()
+    except Exception:
+        pass
+    try:
+        subprocess.run([vp, "-m", "pip", "install", "--disable-pip-version-check",
+                        "--force-reinstall", "--no-deps", pkg],
+                       capture_output=True, text=True, timeout=900)
+    except Exception as e:
+        print(f"[AI PYDEPS] {group}: reinstall of '{pkg}' failed: {e}")
+        return False
+    err = _import_error_text(vp, module_name)
+    if err is not None:
+        print(f"[AI PYDEPS] {group}: still failing after reinstalling '{pkg}': "
+              f"{err.splitlines()[-1][:300]}")
+        return False
+    return True
+
+
 def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs, _retry=False):
+    if not _install_run_lock.acquire(blocking=False):
+        try:
+            _state[group]["waiting"] = True
+        except Exception:
+            pass
+        _tag_redraw_all()
+        _install_run_lock.acquire()
+    try:
+        try:
+            _state[group]["waiting"] = False
+        except Exception:
+            pass
+        if get_state(group)["status"] == _STATUS_CANCELLED:
+            if on_done:
+                on_done(False)
+            return
+        _install_worker_locked(group, pip_specs, check_module, on_done,
+                               extra_pip_specs, _retry)
+    finally:
+        _install_run_lock.release()
+
+
+def _install_worker_locked(group, pip_specs, check_module, on_done, extra_pip_specs, _retry=False):
     try:
         root = _venv_root()
 
@@ -569,11 +669,25 @@ def _install_worker(group, pip_specs, check_module, on_done, extra_pip_specs, _r
         # imported successfully, so it needs to verify each one.
         check_modules = ([check_module] if isinstance(check_module, str)
                           else list(check_module) if check_module else [])
-        missing = [m for m in check_modules if not venv_has_module(m, timeout=15)]
+        missing = [m for m in check_modules if not venv_has_module(m, timeout=60)]
+        # Packages that installed but won't load: repair them once.
+        missing = [m for m in missing if not _heal_broken_import(vp, m, group)]
         if missing:
+            _err = (_import_error_text(vp, missing[0], timeout=120) or "").strip()
+            _last = _err.splitlines()[-1][:160] if _err else ""
+            # Some Blender builds ship a Python without python3.dll, which
+            # packages built against Python's stable ABI (e.g. PyAV 18) need.
+            try:
+                if (sys.platform == "win32" and "DLL load failed" in _err and not
+                        os.path.exists(os.path.join(sys.base_prefix, "bin", "python3.dll"))):
+                    _last = ("This Blender's built-in Python has no python3.dll, which this "
+                             "package needs. Please use Blender 4.5 or newer.")
+            except Exception:
+                pass
             _state[group] = {
                 "status": _STATUS_ERROR,
-                "message": f"Installed, but {', '.join(missing)!r} still won't import.",
+                "message": f"Installed, but {', '.join(missing)!r} still won't import. {_last}".strip(),
+                "detail": _err[-3000:],
                 "started": time.time()}
             if on_done:
                 on_done(False)
