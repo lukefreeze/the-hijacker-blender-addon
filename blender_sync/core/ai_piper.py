@@ -416,7 +416,7 @@ def piper_engine_present(max_age=1.0):
             if os.path.isdir(root):
                 for entry in os.listdir(root):
                     cands.append(os.path.join(root, entry, exe_name))
-        found = any(os.path.isfile(c) for c in cands)
+        found = any(os.path.isfile(c) and _engine_complete(c) for c in cands)
     except Exception:
         found = False
     _present_cache["t"] = now
@@ -605,6 +605,116 @@ def _extract_engine(archive, dest_dir):
                 _engine_state.update(pct=60 + 10.0 * (i + 1) / max(1, len(members)))
 
 
+# ---------------------------------------------------------------------------
+# macOS runtime libraries
+#
+# Rhasspy's macOS Piper archive ships the `piper` program WITHOUT the
+# libraries it links against (libespeak-ng, libpiper_phonemize, libonnxruntime
+# - they only exist in the separate piper-phonemize release) and without any
+# rpath telling macOS where to look, so on its own it dies at launch with
+# "dyld: Library not loaded: @rpath/libespeak-ng.1.dylib". We download the
+# libraries from the piper-phonemize release, put them next to `piper`, and
+# launch piper with a library search path pointing at that folder. The
+# upstream binaries are unsigned and not hardened, so macOS honours that
+# environment variable and nothing in the download has to be modified.
+# ---------------------------------------------------------------------------
+_PHONEMIZE_VERSION  = "2023.11.14-4"
+_PHONEMIZE_BASE_URL = ("https://github.com/rhasspy/piper-phonemize/releases/download/"
+                       + _PHONEMIZE_VERSION + "/")
+_MAC_REQUIRED_LIBS  = ("libespeak-ng.1.dylib", "libpiper_phonemize.1.dylib",
+                       "libonnxruntime.1.14.1.dylib")
+
+
+def _is_macos():
+    return platform.system().lower() == "darwin"
+
+
+def _phonemize_archive_name():
+    machine = platform.machine().lower()
+    return ("piper-phonemize_macos_aarch64.tar.gz" if "arm" in machine
+            else "piper-phonemize_macos_x64.tar.gz")
+
+
+def _mac_libs_present(engine_dir):
+    return all(os.path.isfile(os.path.join(engine_dir, n)) for n in _MAC_REQUIRED_LIBS)
+
+
+def _engine_complete(exe_path):
+    """True if the engine at exe_path has everything it needs to start.
+    Only macOS needs extra files next to the executable."""
+    if not _is_macos():
+        return True
+    return _mac_libs_present(os.path.dirname(exe_path))
+
+
+def _piper_env(exe_dir):
+    """Environment for launching piper. On macOS this adds the engine folder
+    to the dynamic-library search path (see the note above)."""
+    env = dict(os.environ)
+    if _is_macos():
+        old_fb = env.get("DYLD_FALLBACK_LIBRARY_PATH") or "/usr/local/lib:/usr/lib"
+        env["DYLD_FALLBACK_LIBRARY_PATH"] = exe_dir + os.pathsep + old_fb
+        old_lp = env.get("DYLD_LIBRARY_PATH")
+        env["DYLD_LIBRARY_PATH"] = exe_dir + (os.pathsep + old_lp if old_lp else "")
+    return env
+
+
+def _extract_mac_libs(archive, dest_dir):
+    """Copy the .dylib files out of the piper-phonemize archive's lib/ folder
+    into dest_dir. Symlinks (libfoo.1.dylib -> libfoo.1.2.3.dylib) become real
+    copies, so nothing depends on symlinks surviving. Returns the names written."""
+    import tarfile, posixpath
+    written = []
+    with tarfile.open(archive, "r:*") as t:
+        members = {m.name.lstrip("./"): m for m in t.getmembers()}
+        for name, m in members.items():
+            if _engine_cancel:
+                raise _EngineCancelled()
+            if posixpath.dirname(name).split("/")[-1] != "lib":
+                continue
+            base = posixpath.basename(name)
+            if base not in _MAC_REQUIRED_LIBS:
+                continue
+            src = m
+            hops = 0
+            while src.issym() and hops < 5:
+                tgt = posixpath.normpath(posixpath.join(posixpath.dirname(src.name.lstrip("./")),
+                                                        src.linkname))
+                src = members.get(tgt)
+                hops += 1
+                if src is None:
+                    break
+            if src is None or not src.isfile():
+                continue
+            target = _safe_join(dest_dir, base)
+            with t.extractfile(src) as fin, open(target, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+            os.chmod(target, 0o755)
+            written.append(base)
+    return written
+
+
+def _selftest_engine(dest_dir, exe_name):
+    """macOS: run `piper --help` once and turn a launch failure into a clear
+    error, so a broken engine can never be reported as installed."""
+    exe = os.path.join(dest_dir, exe_name)
+    try:
+        r = subprocess.run([exe, "--help"], cwd=dest_dir, env=_piper_env(dest_dir),
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=30)
+    except OSError as e:
+        if getattr(e, "errno", None) == 86 or "Bad CPU type" in str(e):
+            raise RuntimeError("This Piper engine needs Rosetta on Apple Silicon. "
+                               "In Terminal run: softwareupdate --install-rosetta")
+        raise RuntimeError(f"Piper could not be started: {e}")
+    except subprocess.TimeoutExpired:
+        return   # it started and kept running - good enough
+    out = (r.stdout or "") + (r.stderr or "")
+    if "Library not loaded" in out or "dyld" in out.lower() or r.returncode < 0:
+        raise RuntimeError("Piper installed but cannot start: " + out.strip()[:160])
+
+
+
 def start_engine_install():
     """Download + install the Piper engine and a starter voice, in the
     background. Poll get_engine_progress_display() for UI state."""
@@ -625,10 +735,21 @@ def start_engine_install():
         tmp_dir = tempfile.mkdtemp(prefix="hijacker_piper_")
         try:
             archive = os.path.join(tmp_dir, archive_name)
-            _engine_download(_ENGINE_BASE_URL + archive_name, archive, 0, 60, "Downloading Piper",
+            _piper_hi = 35 if _is_macos() else 60
+            _engine_download(_ENGINE_BASE_URL + archive_name, archive, 0, _piper_hi, "Downloading Piper",
                              magic=((b"PK\x03\x04",) if archive_name.endswith(".zip") else (b"\x1f\x8b",)))
+            mac_lib_archive = None
+            if _is_macos():
+                mac_lib_archive = os.path.join(tmp_dir, _phonemize_archive_name())
+                _engine_download(_PHONEMIZE_BASE_URL + _phonemize_archive_name(), mac_lib_archive,
+                                 35, 60, "Downloading Piper libraries", magic=(b"\x1f\x8b",))
             _engine_state.update(status="EXTRACTING", pct=60.0, msg="Unpacking")
             _extract_engine(archive, dest_dir)
+            if mac_lib_archive:
+                names = _extract_mac_libs(mac_lib_archive, dest_dir)
+                print(f"[PIPER] macOS libraries installed: {', '.join(sorted(names))}")
+                if not _mac_libs_present(dest_dir):
+                    raise RuntimeError("Piper libraries were downloaded but are incomplete")
 
             if platform.system().lower() != "windows":
                 import stat as _stat
@@ -638,6 +759,9 @@ def start_engine_install():
                         os.chmod(p, os.stat(p).st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
             if not os.path.isfile(os.path.join(dest_dir, exe_name)):
                 raise RuntimeError("download unpacked but " + exe_name + " was not found")
+            if _is_macos():
+                _engine_state.update(status="EXTRACTING", pct=72.0, msg="Checking Piper starts")
+                _selftest_engine(dest_dir, exe_name)
             _present_cache["t"] = 0.0
 
             # Starter voice so the rack can speak immediately (skipped if the
@@ -872,6 +996,7 @@ def generate_piper(ai_idx, context, preview_only=False):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=exe_dir,        # so piper finds espeak-ng-data/
+                env=_piper_env(exe_dir),
                 text=True,
                 encoding="utf-8",
             )
@@ -914,7 +1039,11 @@ def generate_piper(ai_idx, context, preview_only=False):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            _finish(ai_idx, scene_name, "ERROR", error_msg=str(e))
+            if getattr(e, "errno", None) == 86 or "Bad CPU type" in str(e):
+                _finish(ai_idx, scene_name, "ERROR",
+                        error_msg="Piper needs Rosetta: run 'softwareupdate --install-rosetta' in Terminal")
+            else:
+                _finish(ai_idx, scene_name, "ERROR", error_msg=str(e))
 
     t = threading.Thread(target=_worker, name=f"Piper_rack{ai_idx}", daemon=True)
     _active_jobs[ai_idx] = t

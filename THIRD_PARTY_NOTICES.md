@@ -47,7 +47,7 @@ into the add-on.
 |---|---|---|
 | Piper engine, release 2023.11.14-2 (`rhasspy/piper`) | GitHub release, downloaded by the rack's DOWNLOAD & INSTALL button into the add-on folder | MIT. The repository was archived on 6 Oct 2025; development moved to [OHF-Voice/piper1-gpl](https://github.com/OHF-Voice/piper1-gpl) (GPL-3.0). The Hijacker uses the old, MIT release |
 | espeak-ng (phonemiser, part of the Piper release) | Same release archive | **GPL-3.0-or-later**, run as a separate subprocess. Source: https://github.com/espeak-ng/espeak-ng |
-| piper-phonemize, onnxruntime (part of the Piper release) | Same release archive | MIT |
+| piper-phonemize, onnxruntime (part of the Piper release; on macOS downloaded from the separate piper-phonemize release, https://github.com/rhasspy/piper-phonemize/releases, together with espeak-ng's library) | Same release archive (macOS: piper-phonemize release) | MIT (espeak-ng library: GPL-3.0-or-later) |
 | Voice models (`rhasspy/piper-voices` on Hugging Face) | Downloaded per voice | **Per voice.** The Hugging Face repository is tagged MIT, but that does not cover each voice's training data. Each voice has its own model card and dataset licence |
 
 **Starter voice.** On first install the rack downloads one starter voice,
