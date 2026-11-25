@@ -7572,64 +7572,19 @@ def handle_ai_rack_click(hit, context):
                 print(f"[AI RACKS] preset → {presets[new_idx][0]}")
         return True
 
-    # kNN-VC CONVERT button
+    # kNN-VC GENERATE button: ALWAYS processes the audio with the current
+    # settings, then places the result on the output channel when it finishes
+    # (see core.ai_knnvc._apply_finish). It never re-uses an earlier output, so
+    # changing a setting or the source channel and pressing GENERATE again
+    # always gives a fresh result.
     if zone == 'ai_rvc_convert':
         ai_racks = getattr(context.scene, "pb_ai_racks", [])
         i = hit['ai_idx']
         if i < len(ai_racks):
             try:
-                from core.ai_knnvc import (convert_knnvc, has_rack_output,
-                                            _rack_output_path)
-                import os, time as _t
-                scene = context.scene
-                # If a preview has already been processed, just place it on
-                # the timeline without running conversion again.
-                wav_path = _rack_output_path.get(i)
-                if not wav_path or not os.path.exists(wav_path):
-                    import glob, tempfile
-                    matches = sorted(glob.glob(
-                        os.path.join(tempfile.gettempdir(),
-                                     f"pb_knnvc_{i}_*.wav")))
-                    if matches:
-                        wav_path = matches[-1]
-                        _rack_output_path[i] = wav_path
-
-                if wav_path and os.path.exists(wav_path):
-                    # Copy to project folder so the file survives temp-dir cleanup
-                    try:
-                        from core.ai_knnvc import _persist_output, _rack_output_path
-                        wav_path = _persist_output(wav_path, i)
-                        _rack_output_path[i] = wav_path
-                    except Exception as _pe:
-                        print(f"[KNNVC] WARNING: persist failed: {_pe}")
-                    # Place on timeline
-                    print(f"[KNNVC] generate: placing output on timeline")
-                    from core import vse_compat as _vse
-                    rack = ai_racks[i]
-                    seq  = scene.sequence_editor
-                    if not seq:
-                        scene.sequence_editor_create()
-                        seq = scene.sequence_editor
-                    _grp_off_kn = getattr(rack, 'group_idx', 0) * 9
-                    active_chs = [_grp_off_kn + ci + 1 for ci in range(9)
-                                  if getattr(rack, f"ch{ci}", False)]
-                    target_ch  = int(getattr(rack, "p3", 0.0)) or                                  (active_chs[0]+1 if active_chs else 2)
-                    target_ch  = max(1, min(9, target_ch))
-                    place_frame = scene.frame_start
-                    strip_name  = f"kNNVC_{i}_{int(_t.time()) % 100000}"
-                    _vse.get_strips_collection(seq).new_sound(
-                        name=strip_name, filepath=wav_path,
-                        channel=target_ch, frame_start=place_frame)
-                    rack.ai_status = "DONE"
-                    print(f"[KNNVC] placed '{strip_name}' on ch{target_ch}"
-                          f" at frame {place_frame}")
-                    for window in context.window_manager.windows:
-                        for area in window.screen.areas:
-                            if area.type in ('SEQUENCE_EDITOR','NODE_EDITOR'):
-                                area.tag_redraw()
-                else:
-                    # No preview yet - run full conversion and place on done
-                    convert_knnvc(i, context, preview_only=False)
+                from core.ai_knnvc import convert_knnvc, stop_rack_preview
+                stop_rack_preview(i)
+                convert_knnvc(i, context, preview_only=False)
             except Exception as e:
                 print(f"[KNNVC] convert failed: {e}")
                 import traceback; traceback.print_exc()

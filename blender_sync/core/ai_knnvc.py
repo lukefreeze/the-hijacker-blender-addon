@@ -235,6 +235,25 @@ def is_rack_previewing(ai_idx):
         return False
 
 
+_job_is_preview = {}   # ai_idx -> True if the most recent job was a PREVIEW run
+
+
+def last_job_was_preview(ai_idx):
+    """True if the most recent conversion for this rack was started by PREVIEW
+    (so the UI can say PROCESSING on the preview button, not GENERATING)."""
+    return bool(_job_is_preview.get(ai_idx, False))
+
+
+def stop_rack_preview(ai_idx):
+    """Stop this rack's preview playback if it is playing."""
+    handle = _rack_preview_state.pop(ai_idx, None)
+    if handle is not None:
+        try:
+            handle.stop()
+        except Exception:
+            pass
+
+
 def has_rack_output(ai_idx):
     """Return True if this rack has a valid conversion output ready to preview."""
     path = _rack_output_path.get(ai_idx)
@@ -629,6 +648,7 @@ def convert_knnvc(ai_idx, context, preview_only=False):
             _pending_finish[ai_idx] = {
                 "status": "ERROR", "output_path": None, "scene_name": scene_name}
 
+    _job_is_preview[ai_idx] = bool(preview_only)
     t = threading.Thread(target=_worker, name=f"kNNVC_{ai_idx}", daemon=True)
     _active_jobs[ai_idx] = t
     t.start()

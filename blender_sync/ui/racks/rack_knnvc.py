@@ -790,15 +790,22 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
         _has_out_gen = _hro(ai_idx)
     except Exception:
         pass
-    if status == _PROCESSING:
+    # GENERATE always processes and places, so it only ever reads GENERATE or
+    # GENERATING (never "place on track"). A PREVIEW run shows PROCESSING on the
+    # preview button instead.
+    _prev_job = False
+    try:
+        from core.ai_knnvc import last_job_was_preview as _ljp
+        _prev_job = _ljp(ai_idx)
+    except Exception:
+        pass
+    if status == _PROCESSING and not _prev_job:
         c_lbl = "GENERATING..."
-    elif _has_out_gen:
-        c_lbl = "PLACE ON TRACK"
     else:
         c_lbl = "GENERATE"
     c_bg  = (0.08,0.02,0.12,1.0) if status == _PROCESSING else (0.10,0.03,0.15,1.0)
     # Button chrome suppressed once skinned — baked into the art; only the
-    # state-dependent label (GENERATE/GENERATING.../PLACE ON TRACK) below
+    # state-dependent label (GENERATE/GENERATING...) below
     # still needs to draw live.
     if not _has_skin:
         _draw_rect(conv_x, btn_y2, conv_w, btn_h2, c_bg)
@@ -822,8 +829,9 @@ def _draw_rvc_body(rx, ry, rw, rh, rack, ai_idx, scale):
     except Exception:
         pass
     _prev_bg  = (0.18,0.04,0.24,1.0) if _is_playing else (0.04,0.02,0.06,1.0)
-    prev_col  = _ACCENT if (_has_out or _is_playing) else _ACCENT_DIM
-    pv_lbl    = "■ STOP" if _is_playing else "> PREVIEW"
+    prev_col  = _ACCENT      # PREVIEW always processes, so it is always usable
+    pv_lbl    = ("PROCESSING..." if (status == _PROCESSING and _prev_job)
+                 else "■ STOP" if _is_playing else "> PREVIEW")
     # Button chrome suppressed once skinned — baked into the art; only the
     # state-dependent label (PREVIEW/STOP) below still needs to draw live.
     if not _has_skin:
@@ -1427,10 +1435,17 @@ def knnvc_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
         _has_out_gen = _hro(ai_idx)
     except Exception:
         pass
-    if status == _PROCESSING:
+    # GENERATE always processes and places, so it only ever reads GENERATE or
+    # GENERATING (never "place on track"). A PREVIEW run shows PROCESSING on the
+    # preview button instead.
+    _prev_job = False
+    try:
+        from core.ai_knnvc import last_job_was_preview as _ljp
+        _prev_job = _ljp(ai_idx)
+    except Exception:
+        pass
+    if status == _PROCESSING and not _prev_job:
         c_lbl = "GENERATING..."
-    elif _has_out_gen:
-        c_lbl = "PLACE ON TRACK"
     else:
         c_lbl = "GENERATE"
     gr = R(KN_GENERATE)
@@ -1443,8 +1458,10 @@ def knnvc_pp_draw(rx, ry, rw, rh, rack, ai_idx, scale):
     except Exception:
         pass
     pr = R(KN_PREVIEW)
-    _kn_text("■ STOP" if _is_playing else "> PREVIEW", (pr[0] + pr[2]) / 2, (pr[1] + pr[3]) / 2,
-             KN_FS_LABEL, g, KN_TEXT if (_has_out or _is_playing) else KN_TEXT_DIM, 1.0, "c")   # painted on metal: stays lit
+    _kn_text("PROCESSING..." if (status == _PROCESSING and _prev_job)
+             else "■ STOP" if _is_playing else "> PREVIEW",
+             (pr[0] + pr[2]) / 2, (pr[1] + pr[3]) / 2,
+             KN_FS_LABEL, g, KN_TEXT, 1.0, "c")   # painted on metal: stays lit
 
     # ── OUT CH ────────────────────────────────────────────────────────────────
     out_ch_val = int(getattr(rack, "p3", 0.0)) or (active_chs[0] + 1 if active_chs else 2)
