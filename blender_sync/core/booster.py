@@ -6,36 +6,20 @@
 # Runs in a background thread, same pattern as the other AI/processing racks.
 #
 # Steps:
-#   1. Extract channel audio to temp WAV using aud
-#   2. Run booster_runner.py subprocess to apply gain + soft limiter
-#   3. Save boosted WAV as <original>_boosted_+NdB.wav alongside the original
+#   1. Extract channel audio (32-bit float, nothing is clipped or rounded)
+#   2. Apply gain + look-ahead limiter in-process (core/booster_dsp.py, NumPy)
+#   3. Save boosted 32-bit float WAV as <original>_boosted_+NdB.wav next to the original
 #   4. Place new strip on next free VSE channel, strip.volume = 1.0
 #   5. Mute original strip so new louder one plays immediately
 # =============================================================================
 
 import os
-import sys
-import json
-import wave
-import subprocess
 import threading
 import tempfile
 
 import bpy
 
 from core import vse_compat as _vse
-
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-_ADDON_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_RUNNER     = os.path.join(_ADDON_DIR, "ai_engines", "booster", "booster_runner.py")
-
-
-def _get_python():
-    import platform
-    return ("py", ["-3.12"]) if platform.system() == "Windows" else ("python3", [])
-
 
 # ---------------------------------------------------------------------------
 # Active jobs
@@ -50,11 +34,40 @@ def is_processing(rack_idx):
     return t is not None and t.is_alive()
 
 
+def _dsp_db(lin):
+    import math
+    return 20.0 * math.log10(lin) if lin > 1e-9 else -180.0
+
+
 # ---------------------------------------------------------------------------
 # Audio extraction
 # ---------------------------------------------------------------------------
-def _extract_channel_wav(channel_idx, out_path):
-    """Extract all audio from VSE channel to a WAV file using aud."""
+def _strip_gain_envelope(strip, vis_start, vis_end, fps, n):
+    """Per-sample gain [n, 1] for a strip's volume (static or keyframed)."""
+    import numpy as np
+    try:
+        vol = float(strip.volume)
+    except Exception:
+        return np.float32(1.0)
+    try:
+        from core import strip_volume as _sv
+        if _sv.is_animated(strip) and n > 1:
+            f0, f1 = vis_start * fps, vis_end * fps
+            pts = _sv.volume_polyline(strip, f0, f1)
+            if pts and len(pts) >= 2:
+                xs = np.array([p[0] for p in pts], dtype=np.float64)
+                ys = np.array([p[1] for p in pts], dtype=np.float64)
+                fr = f0 + (np.arange(n, dtype=np.float64) / n) * (f1 - f0)
+                return np.interp(fr, xs, ys).astype(np.float32)[:, None]
+    except Exception as e:
+        print(f"[BOOSTER] volume envelope failed for '{strip.name}': {e}")
+    return np.float32(vol)
+
+
+def _extract_channel_audio(channel_idx):
+    """Mix all audio on a VSE channel into one float32 array using aud.
+    Returns (data[n, channels], sample_rate). Nothing is clipped or rounded to
+    16-bit here - the booster must see the exact signal."""
     import aud
     import numpy as np
 
@@ -110,6 +123,12 @@ def _extract_channel_wav(channel_idx, out_path):
                 if TARGET_NCH == 2:
                     data = np.repeat(data, 2, axis=1)
 
+            # Bake in the clip's own volume (including the desk fader/gain, which
+            # live in strip.volume, and any volume keyframes) so the boost is
+            # applied to what you actually hear. Not clipped: a clip pushed past
+            # 1.0 can be driven into the limiter - or past it with LIMIT: OFF.
+            data = data * _strip_gain_envelope(strip, vis_start, vis_end, fps, len(data))
+
             buf_start = int((vis_start - seq_start) * TARGET_SR)
             buf_end   = min(buf_start + len(data), total_samples)
             data      = data[:buf_end - buf_start]
@@ -118,24 +137,15 @@ def _extract_channel_wav(channel_idx, out_path):
         except Exception as e:
             print(f"[BOOSTER] strip '{strip.name}' extract failed: {e}")
 
-    audio_clip = np.clip(audio_out, -1.0, 1.0)
-    s16        = (audio_clip * 32767.0).astype(np.int16)
-
-    with wave.open(out_path, 'wb') as wf:
-        wf.setnchannels(TARGET_NCH)
-        wf.setsampwidth(2)
-        wf.setframerate(TARGET_SR)
-        wf.writeframes(s16.tobytes())
-
     print(f"[BOOSTER] extracted ch{channel_idx+1}: "
-          f"{len(s16)} frames @ {TARGET_SR}Hz {TARGET_NCH}ch")
-    return TARGET_SR, TARGET_NCH
+          f"{len(audio_out)} frames @ {TARGET_SR}Hz {TARGET_NCH}ch")
+    return audio_out, TARGET_SR
 
 
 # ---------------------------------------------------------------------------
 # VSE output placement
 # ---------------------------------------------------------------------------
-def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack):
+def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack, strip_volume=1.0):
     """Place boosted WAV on next free VSE channel, mute original."""
     try:
         if not scene.sequence_editor:
@@ -178,7 +188,7 @@ def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack):
             frame_start = int(first_frame),
         )
         new_strip.frame_final_end = int(last_frame)
-        new_strip.volume          = 1.0
+        new_strip.volume          = float(strip_volume)
 
         # Mute originals
         for s in orig_strips:
@@ -199,7 +209,7 @@ def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack):
         except Exception as e:
             print(f"[BOOSTER] volume update error: {e}")
 
-        print(f"[BOOSTER] placed boosted strip on VSE ch{target_ch}, vol=1.0")
+        print(f"[BOOSTER] placed boosted strip on VSE ch{target_ch}, vol={float(strip_volume):.2f}")
         print(f"[BOOSTER] original ch{ch_idx+1} muted — mute/unmute to A/B compare")
 
         for window in bpy.context.window_manager.windows:
@@ -216,13 +226,14 @@ def _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack):
 # Finish / timer
 # ---------------------------------------------------------------------------
 def _finish(rack_idx, scene_name, status, output_wav=None,
-            ch_idx=None, error_msg=None):
+            ch_idx=None, error_msg=None, strip_volume=1.0):
     _pending_finish[rack_idx] = {
         'status':     status,
         'output_wav': output_wav,
         'ch_idx':     ch_idx,
         'error_msg':  error_msg,
         'scene_name': scene_name,
+        'strip_volume': strip_volume,
     }
 
 
@@ -263,7 +274,8 @@ def _apply_finish(rack_idx, info):
             output_wav = info.get('output_wav')
             ch_idx     = info.get('ch_idx')
             if output_wav and ch_idx is not None:
-                _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack)
+                _place_output_in_vse(scene, ch_idx, rack_idx, output_wav, rack,
+                                     info.get('strip_volume', 1.0))
     except Exception as e:
         print(f"[BOOSTER] _apply_finish error: {e}")
 
@@ -307,7 +319,6 @@ def process_booster(rack_idx, context):
     _cancel_flags[rack_idx] = False
 
     tmp_dir   = tempfile.gettempdir()
-    input_wav = os.path.join(tmp_dir, f"pb_boost_in_{rack_idx}.wav")
 
     # Build output path alongside original file
     try:
@@ -318,9 +329,16 @@ def process_booster(rack_idx, context):
         if orig_strips:
             orig_path = bpy.path.abspath(orig_strips[0].sound.filepath)
             base, ext = os.path.splitext(orig_path)
-            db_tag    = f"+{boost_db:.0f}dB"
+            db_tag    = f"+{boost_db:.0f}dB" + ("" if limiter_on else "_raw")
             out_ext   = ext if ext.lower() == '.wav' else '.wav'
             output_wav = f"{base}_boosted_{db_tag}{out_ext}"
+            # Never reuse a name: Blender keeps one cached sound (and timeline
+            # waveform) per file path, so overwriting an earlier boost leaves the
+            # old waveform on screen even though the audio has changed.
+            n = 2
+            while os.path.exists(output_wav):
+                output_wav = f"{base}_boosted_{db_tag}_{n}{out_ext}"
+                n += 1
         else:
             output_wav = os.path.join(tmp_dir, f"pb_boost_out_{rack_idx}.wav")
     except Exception:
@@ -330,10 +348,13 @@ def process_booster(rack_idx, context):
 
     def _worker():
         try:
-            # Step 1: extract
+            from core import booster_dsp as _dsp
+            import numpy as np
+
+            # Step 1: extract (float32, unclipped)
             print(f"[BOOSTER] rack {rack_idx}: extracting ch{ch_idx+1}...")
             try:
-                _extract_channel_wav(ch_idx, input_wav)
+                audio, sr = _extract_channel_audio(ch_idx)
             except Exception as e:
                 _finish(rack_idx, scene_name, "ERROR",
                         error_msg=f"Audio extraction failed: {e}")
@@ -342,56 +363,43 @@ def process_booster(rack_idx, context):
             if _cancel_flags.get(rack_idx):
                 _finish(rack_idx, scene_name, "READY"); return
 
-            # Step 2: build args and run subprocess
-            args_path = os.path.join(tmp_dir, f"pb_boost_args_{rack_idx}.json")
-            with open(args_path, "w") as f:
-                json.dump({
-                    "src":      input_wav,
-                    "output":   output_wav,
-                    "boost_db": boost_db,
-                    "limiter":  limiter_on,
-                }, f)
-
-            py_exe, py_flags = _get_python()
-            cmd = [py_exe] + py_flags + [_RUNNER, "--args", args_path]
+            # Step 2: gain + limiter
+            in_peak = float(np.max(np.abs(audio))) if audio.size else 0.0
             print(f"[BOOSTER] rack {rack_idx}: boost={boost_db:.1f}dB "
-                  f"limiter={'on' if limiter_on else 'off'}")
-
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-            )
-            from core.proc_util import StderrDrain
-            _drain = StderrDrain(proc)
-
-            for line in proc.stdout:
-                line = line.strip()
-                if line.startswith("PROGRESS:"):
-                    try:
-                        pct = int(line.split(":")[1])
-                        print(f"[BOOSTER] rack {rack_idx}: {pct}%")
-                    except Exception:
-                        pass
-                elif line.startswith("ERROR:"):
-                    print(f"[BOOSTER] runner: {line}")
-
-                if _cancel_flags.get(rack_idx):
-                    proc.terminate()
-                    _finish(rack_idx, scene_name, "READY"); return
-
-            proc.wait()
-            stderr_txt = _drain.text()
-            if stderr_txt.strip():
-                print(f"[BOOSTER] stderr: {stderr_txt[:400]}")
-
-            if proc.returncode != 0:
+                  f"limiter={'on' if limiter_on else 'off'} "
+                  f"input peak={_dsp_db(in_peak):.1f}dBFS")
+            try:
+                out = _dsp.boost_and_limit(audio, sr, boost_db, limiter=limiter_on)
+            except Exception as e:
                 _finish(rack_idx, scene_name, "ERROR",
-                        error_msg=f"Runner exited rc={proc.returncode}")
+                        error_msg=f"Boost failed: {e}")
+                return
+            out_peak = float(np.max(np.abs(out))) if out.size else 0.0
+            print(f"[BOOSTER] rack {rack_idx}: output peak={_dsp_db(out_peak):.1f}dBFS")
+
+            if _cancel_flags.get(rack_idx):
+                _finish(rack_idx, scene_name, "READY"); return
+
+            # Blender draws a strip's waveform from the file, but re-normalises any
+            # file whose peak is above full scale, so a file holding +40 dB looks
+            # exactly like the quiet original. Keep the FILE at or below full scale
+            # and carry the overshoot on the strip's own volume instead: the sound
+            # is identical (file x strip volume), and the timeline waveform now
+            # shows the boost, with Blender's red overshoot marking, just like
+            # raising the volume by hand.
+            strip_vol = 1.0
+            if out_peak > 1.0:
+                strip_vol = min(out_peak, 100.0)       # Blender's strip volume limit
+                out = (out / np.float32(strip_vol)).astype(np.float32)
+                print(f"[BOOSTER] rack {rack_idx}: file saved at full scale, "
+                      f"strip volume set to {strip_vol:.2f} (= +{_dsp_db(strip_vol):.1f} dB)")
+
+            # Step 3: write a real 32-bit float WAV
+            try:
+                _dsp.write_wav_float32(output_wav, out, sr)
+            except Exception as e:
+                _finish(rack_idx, scene_name, "ERROR",
+                        error_msg=f"Could not write {output_wav}: {e}")
                 return
 
             if not os.path.exists(output_wav) or os.path.getsize(output_wav) < 44:
@@ -400,15 +408,11 @@ def process_booster(rack_idx, context):
                 return
 
             _finish(rack_idx, scene_name, "DONE",
-                    output_wav=output_wav, ch_idx=ch_idx)
+                    output_wav=output_wav, ch_idx=ch_idx, strip_volume=strip_vol)
 
         except Exception as e:
             import traceback; traceback.print_exc()
             _finish(rack_idx, scene_name, "ERROR", error_msg=str(e))
-        finally:
-            for f in (input_wav, args_path):
-                try: os.remove(f)
-                except Exception: pass
 
     t = threading.Thread(target=_worker,
                          name=f"BOOSTER_rack{rack_idx}", daemon=True)
