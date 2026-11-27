@@ -263,6 +263,25 @@ def _ensure_redraw_timer():
 # Install
 # ---------------------------------------------------------------------------
 
+def _pick_error_line(tail, fallback):
+    """pip's last line is often boilerplate ("note: This error originates from a
+    subprocess..."). Prefer the most recent real "ERROR:" line, or a known
+    helpful hint, so the rack shows something a person can act on."""
+    import re as _re
+    hint = None
+    for ln in reversed(tail):
+        t = ln.strip()
+        if not t:
+            continue
+        if hint is None and ("pkg-config is required" in t or "No matching distribution" in t
+                             or "Could not find a version" in t):
+            hint = t
+        m = _re.match(r"^ERROR:\s*(.+)$", t)
+        if m and "subprocess-exited-with-error" not in m.group(1):
+            return (m.group(1) + ("  (" + hint + ")" if hint and hint not in m.group(1) else ""))[:400]
+    return (hint or fallback)[:400]
+
+
 def start_install(group, pip_specs, check_module=None, on_done=None, extra_pip_specs=None):
     """Kick off a background install of `pip_specs` into the managed venv
     for `group` (e.g. "demucs"). No-op if already installing. `on_done` is
@@ -660,7 +679,7 @@ def _install_worker_locked(group, pip_specs, check_module, on_done, extra_pip_sp
             print(f"[AI PYDEPS] {group}: pip install failed:\n{_detail}")
             _state[group] = {
                 "status": _STATUS_ERROR,
-                "message": f"pip install failed: {last_line}",
+                "message": f"pip install failed: {_pick_error_line(_tail, last_line)}",
                 "detail": f"pip install failed ({group}):\n{_detail}",
                 "started": time.time()}
             if on_done:

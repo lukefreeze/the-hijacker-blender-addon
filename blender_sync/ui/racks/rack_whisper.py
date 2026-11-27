@@ -433,7 +433,11 @@ def _start_whisper_install():
 
     _pydeps.start_install(
         "whisper",
-        pip_specs=["faster-whisper"],
+        # PyAV 19 requires Python 3.12+ and ships no Python 3.11 wheels. Normally pip
+        # reads that and picks PyAV 18, but some package mirrors drop that metadata
+        # and pip then tries (and fails) to build 19 from source. Blender 4.5 uses
+        # Python 3.11, so cap it there; 3.12+ keeps the newest.
+        pip_specs=["faster-whisper", "av<19; python_version < '3.12'"],
         check_module="faster_whisper",
         on_done=_on_done,
     )
