@@ -7,14 +7,14 @@ A professional audio mixing and processing suite for Blender's Video Sequence Ed
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Blender-4.5%20%7C%205.2-orange" alt="Blender 4.5 and 5.2">
-  <img src="https://img.shields.io/badge/Tested%20on-Windows-blue" alt="Tested on Windows">
+  <img src="https://img.shields.io/badge/Blender-4.5%20and%20newer-orange" alt="Blender 4.5 and newer">
+  <img src="https://img.shields.io/badge/Tested%20on-Windows%20%7C%20macOS-blue" alt="Tested on Windows and macOS">
   <img src="https://img.shields.io/badge/Python-3.11%20%7C%203.13-green" alt="Python 3.11 and 3.13">
   <img src="https://img.shields.io/badge/Status-Pre--release-yellow" alt="Status Pre-release">
   <img src="https://img.shields.io/badge/License-GPL--3.0--or--later-blue" alt="License GPL-3.0-or-later">
 </p>
 
-> **Pre-release:** Every feature is in and working, and it has been tested by hand on Windows with Blender 4.5 and 5.2. The macOS and Linux engines are built but haven't been tried inside Blender yet. If something breaks, please [open an issue](https://github.com/lukefreeze/the-hijacker-blender-addon/issues) with the Blender console log.
+> **Pre-release:** Every feature is in and working. It has been tested by hand on Windows (Blender 4.5, 5.2 and 5.3) and on macOS (Blender 4.5 and 5.1), including all the AI racks. On Linux the engine and mixing desk load and play in Blender 4.5, but the AI racks haven't been tried there yet. If something breaks, please [open an issue](https://github.com/lukefreeze/the-hijacker-blender-addon/issues) with the Blender console log.
 
 <p align="center">
   <strong><a href="https://github.com/lukefreeze/the-hijacker-blender-addon/releases">⬇ Download the latest release</a></strong>
@@ -65,7 +65,7 @@ In addition to the effect racks above:
 
 | Rack | What It Does |
 |------|-------------|
-| **Booster** | Volume amplification beyond Blender's strip volume cap — with soft limiter |
+| **Booster** | Volume amplification far beyond Blender's strip volume cap (up to +40 dB). A look-ahead limiter keeps loud passages clean, so a very quiet clip can be brought up without the crunch. Switch **LIMIT: OFF** to push it into distortion on purpose. The result is saved as a new strip next to the original, and the timeline waveform shows the boost |
 
 ### Skins
 The mixing desk and every rack are fully skinnable PNGs. Besides the default look there is a **PACK-A-PUNCH** skin mode, with its own rack artwork and a short intro transition the first time you switch to it.
@@ -133,7 +133,7 @@ blender_sync/
     demucs/                     ← Demucs runner
     knnvc/                      ← KNNVC runner + voice models
     piper/                      ← Piper runner glue (the engine and voices are downloaded, not shipped)
-    booster/                    ← Booster runner
+    booster/                    ← (retired — the Booster now runs in core/booster.py + core/booster_dsp.py)
     hj_download.py              ← Resumable downloader shared by the AI racks
     voicefixer/                 ← Voicefixer runner
     whisper/                    ← Whisper runner
@@ -153,8 +153,8 @@ build.bat                       ← Windows build script (MSVC + vcpkg PortAudio
 ## Installation
 
 ### Requirements
-- Blender 4.5 or newer (4.5 and 5.2 are tested). Older versions aren't supported: for example Blender 4.1's built-in Python lacks a file (`python3.dll`) that the Whisper package needs.
-- Windows x64. macOS and Linux engines are included but haven't been tested inside Blender yet.
+- Blender 4.5 or newer. Tested on 4.5, 5.2 and 5.3 (Windows) and 4.5 and 5.1 (macOS). Older versions aren't supported: for example Blender 4.1's built-in Python lacks a file (`python3.dll`) that the Whisper package needs, and Blender 4.3 isn't supported either.
+- Windows x64, macOS on Apple Silicon, or Linux x64 (see [Platform Support](#platform-support) for what has been tested where).
 - An internet connection the first time you install an AI rack (the engines and models are downloaded, not bundled). Everything works offline afterwards.
 
 ### Install the release
@@ -189,8 +189,21 @@ Cross-platform builds (Windows / macOS / Linux) run automatically on every push 
 
 ## Platform Support
 
-| Platform | Engine Build | Tested in Blender |
+| Platform | Engine build | Tested in Blender |
 |----------|-------------|-------------------|
+| Windows x64 | ✅ | ✅ Blender 4.5, 5.2 and 5.3 — everything, including all AI racks |
+| macOS (Apple Silicon) | ✅ | ✅ Blender 4.5 and 5.1 — everything, including all AI racks |
+| Linux x64 | ✅ | Engine and mixing desk load and play in Blender 4.5. The AI racks are untested on Linux |
+
+### Known limits
+
+- **Piper on Apple Silicon** runs under Rosetta, because Piper only publishes an Intel build for macOS. If macOS says the engine can't start, install Rosetta (`softwareupdate --install-rosetta`).
+- **Whisper is for speech.** It transcribes spoken words well, but it isn't built for singing or heavily layered music.
+- **First downloads can be slow to start.** The first time you install an AI rack, the model download can sit near 0% for a few minutes before it speeds up. It is resumable if your connection drops.
+- **Blender's timeline waveform** can't draw anything above full scale, so when the Booster pushes a clip past 0 dBFS (LIMIT: OFF) it saves the file at full scale and puts the extra gain on the strip's volume. The sound is identical, and the waveform shows the boost with Blender's red overshoot marks.
+- **Linux AI racks** (Demucs, Whisper, VoiceFixer, kNN-VC, Piper) haven't been tested. They may work; if they don't, please open an issue with the console log.
+
+----------|-------------|-------------------|
 | Windows x64 | ✅ | ✅ Blender 4.5 and 5.2 |
 | macOS (Apple Silicon) | ✅ | Not yet tested |
 | Linux x64 | ✅ | Not yet tested |
@@ -203,10 +216,10 @@ The AI racks are only tested on Windows so far. The Piper TTS rack has the code 
 
 See [ROADMAP.md](ROADMAP.md) for the full development plan.
 
-**Done:** the mixing desk, all DSP racks, the Mixdown rack, the five AI racks, the PACK-A-PUNCH skins, and a single zip that picks the right engine for your OS and Blender at load time.
+**Done:** the mixing desk, all DSP racks, the Mixdown rack, the Booster, the five AI racks, the PACK-A-PUNCH skins, tested on Windows and macOS, and a single zip that picks the right engine for your OS and Blender at load time.
 
 **Still to come:**
-- [ ] macOS and Linux real-world testing
+- [ ] Linux testing of the AI racks
 - [ ] Undo support and save trigger
 
 ---
