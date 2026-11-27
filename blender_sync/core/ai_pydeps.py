@@ -564,8 +564,15 @@ def _install_worker_locked(group, pip_specs, check_module, on_done, extra_pip_sp
                 _raw_args = ["--progress-bar", "raw"]
         except Exception:
             pass
+        # --prefer-binary: take a ready-made wheel for this Python even if a newer
+        # version exists only as a source package. Some package mirrors drop the
+        # "requires Python 3.12+" metadata, so pip picks a brand-new release that
+        # has no wheel for Blender 4.5's Python 3.11 and then fails trying to
+        # build it (NumPy, PyAV...). Packages that only ship source (demucs)
+        # still install from source as before.
         proc = subprocess.Popen(
-            [vp, "-m", "pip", "install", "--disable-pip-version-check"] + _raw_args + all_specs,
+            [vp, "-m", "pip", "install", "--disable-pip-version-check", "--prefer-binary"]
+            + _raw_args + all_specs,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", bufsize=1)
         _proc_handles[group] = proc
